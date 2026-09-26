@@ -97,8 +97,8 @@ fn raw_fact(item: &Value) -> Option<RawFact> {
 /// it is one end of (`5–10 %`, `grounding::extend_number_span`), even when the model put them into
 /// the qualifiers or left them out — the crawler's text around it as evidence (with the value's
 /// place in it), the block's heading path (or header/footer label) and page set, and the value's
-/// comparison key read with `lang` and `site_country` (the model's `normalized` form is only a
-/// hint). An unknown `attribute_key` becomes `Other`; `subject`, `attribute` and `qualifiers` get
+/// comparison key read with `lang` and `site_country` (never from the model's `normalized` form).
+/// An unknown `attribute_key` becomes `Other`; `subject`, `attribute` and `qualifiers` get
 /// their whitespace collapsed and are cut to 120, 120 and 200 characters. At most
 /// `MAX_FACTS_PER_SOURCE` facts are kept (the first grounded ones); a repeat of a kept fact (the
 /// same value span with the same key for the same subject) is skipped. Returns the occurrences

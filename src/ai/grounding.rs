@@ -542,14 +542,15 @@ pub enum ValueKey {
 /// - Text: `text:` + the value lowercased with whitespace collapsed; digits, operators and
 ///   punctuation are kept, so `<18` ≠ `>18`.
 ///
-/// `llm_normalized` (the model's machine-readable form of the value) is a hint only: it is used
-/// when the value itself does not parse as a Number or Date, and only when its digits occur in
-/// order in the value (for a Number: are exactly the digits of one number written in the value).
-/// It never overrides the verbatim reading, and it never resolves an `Uncertain` one.
+/// A Number or Date value that does not parse as a whole (`cena 1 290 Kč`, `2026/12/31`) is
+/// `Uncertain`. `llm_normalized` (the model's machine-readable form of the value) is never used
+/// for the key: its digits prove neither the unit, nor a bound, nor the date the value states
+/// (`price: 10 EUR` is no `10 USD`, `minimum price: 10 EUR` no `10 EUR`, `2026-01-01 to
+/// 2026-12-31` no `2026-01-31`), so it can neither override nor replace the verbatim reading.
 pub fn value_key(
     hint: ValueHint,
     value: &str,
-    llm_normalized: &str,
+    _llm_normalized: &str,
     lang: &str,
     site_country: Option<&str>,
 ) -> ValueKey {
@@ -562,29 +563,8 @@ pub fn value_key(
     if let Some(key) = verbatim {
         return key;
     }
-    if hint_fits(hint, llm_normalized, value) {
-        let from_hint = match hint {
-            ValueHint::Number => parse_number(llm_normalized, "en"),
-            _ => parse_date(llm_normalized).map(date_key),
-        };
-        if let Some(key @ ValueKey::Exact(_)) = from_hint {
-            return key;
-        }
-    }
     let prefix = if hint == ValueHint::Number { "num" } else { "date" };
     ValueKey::Uncertain(format!("{prefix}?:{}", collapse_lower(value)))
-}
-
-fn hint_fits(hint: ValueHint, llm_normalized: &str, value: &str) -> bool {
-    let wanted = digit_string(llm_normalized);
-    if wanted.is_empty() {
-        return false;
-    }
-    if hint == ValueHint::Number {
-        return numerals(value).any(|token| digit_string(token) == wanted);
-    }
-    let mut have = digit_string(value).into_bytes().into_iter();
-    wanted.bytes().all(|digit| have.any(|d| d == digit))
 }
 
 fn text_key(value: &str) -> ValueKey {
@@ -1870,16 +1850,21 @@ mod tests {
         );
         // An ambiguous value is not resolved by the hint either.
         assert!(!exact(&value_key(ValueHint::Number, "5,000 %", "5 %", "", None)));
-        // When the value does not parse, a hint whose digits are those of the value is used...
-        assert_eq!(
-            value_key(ValueHint::Number, "cena 1 290 Kč", "1290 CZK", "cs", None),
-            ValueKey::Exact("num:1290:CZK:".to_string())
-        );
-        assert_eq!(
-            value_key(ValueHint::Date, "2026/12/31", "2026-12-31", "", None),
-            ValueKey::Exact("date:2026-12-31".to_string())
-        );
-        // ...and one with other digits is not.
+        // A value that does not parse stays uncertain whatever the hint says: the words around the
+        // number may change its meaning, and the digits of a hint prove neither its unit nor its
+        // bound nor its date.
+        let promoted: Vec<ValueKey> = [
+            (ValueHint::Number, "cena 1 290 Kč", "1290 CZK"),
+            (ValueHint::Number, "price: 10 EUR", "10 USD"),
+            (ValueHint::Number, "minimum price: 10 EUR", "10 EUR"),
+            (ValueHint::Date, "2026/12/31", "2026-12-31"),
+            (ValueHint::Date, "2026-01-01 to 2026-12-31", "2026-01-31"),
+        ]
+        .into_iter()
+        .map(|(hint, value, normalized)| value_key(hint, value, normalized, "en", None))
+        .filter(exact)
+        .collect();
+        assert_eq!(promoted, Vec::<ValueKey>::new(), "a hint made these exact");
         assert!(!exact(&value_key(
             ValueHint::Number,
             "cena 1 290 Kč",
