@@ -7134,3 +7134,203 @@ fn consistency_corpus_scoring_counts_found_missed_and_false_positives() {
     );
     assert_eq!(score.recall(), (2, 5));
 }
+
+// ---------------------------------------------------------------------------
+// AI search readiness (`--ai-geo`)
+// ---------------------------------------------------------------------------
+
+/// OAI-SearchBot is blocked, and the file ends with a group that has no rules yet.
+const GEO_ROBOTS: &str = "User-agent: OAI-SearchBot\nDisallow: /\n\nUser-agent: Example\n";
+
+/// The homepage: invalid JSON-LD, a logo in the site header, a footer with a phone number, the
+/// brand's LinkedIn page and the founder's personal LinkedIn profile.
+const GEO_HOME: &str = r#"<!DOCTYPE html>
+<html lang="en"><head><title>Acme garden tools</title>
+<meta property="og:site_name" content="Acme">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "Organization", "name": "Acme",</script>
+</head><body>
+<header><a href="/"><img src="/logo.png" alt="Acme logo"></a>
+<nav><a href="/faq">FAQ</a> <a href="/blog/first-post">Blog</a> <a href="/private">Members</a> <a href="/hidden">Archive</a> <a href="/app">App</a></nav></header>
+<main><h1>Acme garden tools</h1><p>Acme makes spades, rakes and hoes for small gardens.</p></main>
+<footer><p>Call us: <a href="tel:+420800123456">+420 800 123 456</a></p>
+<p><a href="https://www.linkedin.com/company/acme">Acme on LinkedIn</a> <a href="https://www.linkedin.com/in/jane-founder">Our founder</a></p></footer>
+</body></html>"#;
+
+/// Visible questions, each followed by its answer.
+const GEO_FAQ: &str = r#"<!DOCTYPE html>
+<html lang="en"><head><title>FAQ | Acme</title></head><body><main>
+<h1>Frequently asked questions</h1>
+<h2>How long does delivery take?</h2><p>Delivery takes 3 working days.</p>
+<h2>Can I return a tool?</h2><p>Yes, within 30 days of purchase.</p>
+</main></body></html>"#;
+
+/// An article with its author and date right below the title.
+const GEO_ARTICLE: &str = r#"<!DOCTYPE html>
+<html lang="en"><head><title>How to sharpen a spade | Acme</title></head><body><main><article>
+<h1>How to sharpen a spade</h1><p>Jane Smith</p><p>1 September 2026</p>
+<p>A sharp spade cuts roots easily. File the edge at a 45 degree angle.</p>
+</article></main></body></html>"#;
+
+const GEO_NOINDEX: &str = r#"<!DOCTYPE html>
+<html lang="en"><head><title>Archive | Acme</title><meta name="robots" content="noindex"></head><body><main>
+<h1>Archive</h1><p>Old catalogues of Acme garden tools from 2019 to 2024.</p>
+</main></body></html>"#;
+
+/// A client-rendered page: an empty mount point and a JavaScript notice.
+const GEO_APP_SHELL: &str = r#"<!DOCTYPE html>
+<html lang="en"><head><title>App | Acme</title></head><body><div id="root"></div>
+<noscript>You need to enable JavaScript to run this app.</noscript></body></html>"#;
+
+/// The fixture site of the GEO plan (Design §10): robots.txt blocking OAI-SearchBot with a
+/// trailing ruleless group, a key page answering 403, a `noindex` page, invalid JSON-LD, an app
+/// shell, a visible FAQ, an article with a byline and a footer with a brand and a founder
+/// LinkedIn.
+fn geo_site() -> RecordingServer {
+    let html = |path: &'static str, status: Option<&str>, body: &str| {
+        let mut headers = vec![("Content-Type", "text/html; charset=utf-8".to_string())];
+        if let Some(status) = status {
+            headers.push(("Status", status.to_string()));
+        }
+        Route {
+            path,
+            headers,
+            body: body.as_bytes().to_vec(),
+        }
+    };
+    RecordingServer::start(vec![
+        Route {
+            path: "/robots.txt",
+            headers: vec![("Content-Type", "text/plain".to_string())],
+            body: GEO_ROBOTS.as_bytes().to_vec(),
+        },
+        html("/", None, GEO_HOME),
+        html("/faq", None, GEO_FAQ),
+        html("/blog/first-post", None, GEO_ARTICLE),
+        html(
+            "/private",
+            Some("403 Forbidden"),
+            "<html><head><title>Forbidden</title></head><body><p>Forbidden</p></body></html>",
+        ),
+        html("/hidden", None, GEO_NOINDEX),
+        html("/app", None, GEO_APP_SHELL),
+    ])
+}
+
+/// Crawls the GEO fixture site with `extra`; returns the process output.
+fn crawl_geo(server: &RecordingServer, extra: &[&str]) -> std::process::Output {
+    let mut args = vec![
+        "--config-file=/dev/null".to_string(),
+        format!("--url={}", server.url()),
+        LOCAL_ANALYZERS.to_string(),
+        "--http-cache-dir=".to_string(),
+        "--no-color".to_string(),
+        "--ai-cache-dir=".to_string(),
+    ];
+    args.extend(extra.iter().map(|arg| arg.to_string()));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_crawler(&args)
+}
+
+/// The names of the GEO report files and kit directories in `dir`.
+fn geo_outputs(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("ai-geo"))
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+#[test]
+fn ai_geo_dry_run_prints_the_plan() {
+    let tmp = TempDir::new("ai-geo-dry-run");
+    let server = geo_site();
+    let mock = MockLlm::start(vec![chat_response(500, "{}".to_string())]);
+    let endpoint = format!("--ai-endpoint={}", mock.url());
+    let report_dir = format!("--ai-report-dir={}", tmp.path.display());
+    let output = crawl_geo(
+        &server,
+        &[
+            "--ai-provider=openai-compatible",
+            endpoint.as_str(),
+            "--ai-model=m",
+            "--ai-geo",
+            "--ai-dry-run",
+            "--ai-input-cost-per-million=1",
+            "--ai-output-cost-per-million=4",
+            report_dir.as_str(),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert_line(
+        &stderr,
+        r"AI search readiness dry-run: 5 page\(s\) → 5 analysis call\(s\), plus the deterministic checks of 6 key page\(s\); est\. input ~[1-9]\d* tokens, output [1-9]\d*–[1-9]\d* tokens, cost \$\d+\.\d{4}–\$\d+\.\d{4}; ctx 128000 tok\. No API calls made\.",
+    );
+    assert!(stderr.contains("--ai-cache-dir"), "the cache note: {stderr}");
+    assert!(
+        stderr.contains("1. http://127.0.0.1:"),
+        "the pages are listed: {stderr}"
+    );
+    assert!(mock.request_bodies().is_empty(), "no request reaches the model");
+    assert!(geo_outputs(&tmp.path).is_empty(), "a dry run writes no report");
+}
+
+#[test]
+fn ai_geo_without_a_model_still_reports_policy_and_access() {
+    let tmp = TempDir::new("ai-geo-no-model");
+    let server = geo_site();
+    let events_path = tmp.path.join("events.ndjson");
+    let report_dir = format!("--ai-report-dir={}", tmp.path.join("reports").display());
+    let events = format!("--events-file={}", events_path.display());
+    // A hosted provider without a key: the AI configuration cannot be built.
+    let output = crawl_geo(
+        &server,
+        &[
+            "--ai-provider=openai",
+            "--ai-model=gpt-test",
+            "--ai-api-key-env=SITEONE_GEO_TEST_KEY_THAT_IS_NOT_SET",
+            "--ai-geo",
+            report_dir.as_str(),
+            events.as_str(),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    // The deterministic categories are assessed, the per-page analysis is not.
+    for line in [
+        "  Crawler policy: Problem",
+        "  Observed access: Problem",
+        "  Indexing & snippet controls: Problem",
+        "  Rendering: Attention",
+        "  Structured data: Problem",
+        "  Answer extractability: Not assessed (AI not available)",
+        "  Entity clarity: Not assessed (AI not available)",
+    ] {
+        assert!(
+            stderr.lines().any(|l| l == line),
+            "no line {line:?} in stderr:\n{stderr}"
+        );
+    }
+    assert_line(
+        &stderr,
+        r"AI search readiness done: \d+ problem\(s\) and \d+ point\(s\) to review on 6 key pages\..*",
+    );
+    assert!(stderr.contains("no API key resolved"), "the reason: {stderr}");
+    let text = std::fs::read_to_string(&events_path).expect("the event file");
+    let events: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("one JSON object per line"))
+        .collect();
+    let issue = events_of(&events, "issue")
+        .into_iter()
+        .find(|issue| issue["label"] == "AI search readiness failed")
+        .unwrap_or_else(|| panic!("no GEO issue in {text}"));
+    assert_eq!(issue["kind"], "ai");
+    assert!(events_of(&events, "aiRequest").is_empty(), "no request was sent");
+}

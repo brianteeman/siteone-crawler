@@ -276,8 +276,11 @@ impl Manager {
         // One `ai` event phase brackets every AI pipeline below, so a host sees the whole wait.
         // The per-request lines are progress output (this also covers the later summary action).
         crate::ai::telemetry::set_console_enabled(!options.hide_progress_bar);
-        let runs_ai =
-            !options.ai_actions.is_empty() || options.ai_elaborate || options.ai_profile || options.ai_consistency;
+        let runs_ai = !options.ai_actions.is_empty()
+            || options.ai_elaborate
+            || options.ai_profile
+            || options.ai_consistency
+            || options.ai_geo;
         if options.ai_enabled && runs_ai {
             crate::events::phase("ai", crate::events::PhaseState::Started);
         }
@@ -295,6 +298,11 @@ impl Manager {
         // Fact consistency is its own pipeline (may run alongside the others, or alone).
         if options.ai_consistency {
             crate::ai::consistency::run(options.as_ref(), crawler.get_status(), crawler.get_output()).await;
+        }
+        // AI search readiness is its own pipeline (may run alongside the others, or alone); its
+        // deterministic checks run even when the AI configuration fails.
+        if options.ai_geo {
+            crate::ai::geo::run(options.as_ref(), crawler.get_status(), crawler.get_output()).await;
         }
         if options.ai_enabled && runs_ai {
             crate::events::phase("ai", crate::events::PhaseState::Finished);
@@ -393,7 +401,8 @@ impl Manager {
         let runs_ai = !self.options.ai_actions.is_empty()
             || self.options.ai_elaborate
             || self.options.ai_profile
-            || self.options.ai_consistency;
+            || self.options.ai_consistency
+            || self.options.ai_geo;
         if self.options.ai_enabled && runs_ai {
             let provider = crate::ai::provider::Provider::parse(&self.options.ai_provider)
                 .unwrap_or(crate::ai::provider::Provider::OpenAiCompatible);

@@ -326,6 +326,9 @@ pub struct CoreOptions {
     // ai consistency (fact consistency across pages; nothing runs unless ai_consistency)
     #[serde(skip)]
     pub ai_consistency: bool,
+    // ai geo (AI search readiness report and kit; nothing runs unless ai_geo)
+    #[serde(skip)]
+    pub ai_geo: bool,
     /// Model context window in tokens; input budgets are calibrated at 128000 and scale from this.
     pub ai_context_window: i64,
 
@@ -620,6 +623,7 @@ impl CoreOptions {
             ai_profile_template: None,
             ai_profile_correct: true,
             ai_consistency: false,
+            ai_geo: false,
             ai_context_window: 128000,
 
             // browser rendering settings
@@ -711,6 +715,7 @@ impl CoreOptions {
             "aiElaborate",
             "aiProfile",
             "aiConsistency",
+            "aiGeo",
         ]
         .iter()
         .any(|p| options.is_explicitly_set(p));
@@ -750,6 +755,11 @@ impl CoreOptions {
 
         // --ai-consistency is its own pipeline (not an action), cleared the same way as --ai-profile.
         if core.ai_consistency && !options.is_explicitly_set("aiActions") && core.ai_report.is_none() {
+            core.ai_actions.clear();
+        }
+
+        // --ai-geo is its own pipeline (not an action), cleared the same way as --ai-profile.
+        if core.ai_geo && !options.is_explicitly_set("aiActions") && core.ai_report.is_none() {
             core.ai_actions.clear();
         }
 
@@ -2226,6 +2236,11 @@ impl CoreOptions {
             "aiConsistency" => {
                 if let Some(b) = value.as_bool() {
                     self.ai_consistency = b;
+                }
+            }
+            "aiGeo" => {
+                if let Some(b) = value.as_bool() {
+                    self.ai_geo = b;
                 }
             }
             "aiContextWindow" => {
@@ -3883,6 +3898,11 @@ pub fn get_options() -> Options {
                 Some("false"), false, false, None,
             ),
             CrawlerOption::new(
+                "--ai-geo", None, "aiGeo", OptionType::Bool, false,
+                "Assess readiness for AI search and answer engines (GEO): crawler policy in robots.txt, observed access, indexing and snippet controls, rendering risk, per-page answer extractability and entity clarity, structured data and discovery. Writes a report (Markdown + JSON + HTML) and a deployable kit (JSON-LD built from verified page content, answer-first drafts, llms.txt, an optional robots.txt block for AI-training crawlers) to --ai-report-dir.",
+                Some("false"), false, false, None,
+            ),
+            CrawlerOption::new(
                 "--ai-context-window", None, "aiContextWindow", OptionType::Int, false,
                 "Model context window in tokens. Profile input budgets are calibrated at 128000 and scale proportionally, so small local models get smaller prompts instead of overflowing.",
                 Some("128000"), false, false, Some(vec!["8000".to_string(), "2000000".to_string()]),
@@ -4580,6 +4600,7 @@ mod tests {
             ai_profile_template: None,
             ai_profile_correct: true,
             ai_consistency: false,
+            ai_geo: false,
             ai_context_window: 128000,
 
             // browser rendering settings
@@ -4951,6 +4972,66 @@ mod tests {
     }
 
     #[test]
+    fn ai_geo_enables_ai_and_clears_the_default_actions_unless_explicit() {
+        let argv = |extra: &[&str]| -> Vec<String> {
+            let mut argv: Vec<String> = [
+                "bin",
+                "--url=https://example.com",
+                "--ai-provider=openai-compatible",
+                "--ai-endpoint=http://localhost:8000/v1",
+                "--ai-model=test-model",
+            ]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+            argv.extend(extra.iter().map(|arg| arg.to_string()));
+            argv
+        };
+        let core = parse_argv(&argv(&[])).expect("should parse");
+        assert!(!core.ai_geo, "off by default");
+
+        let core = parse_argv(&argv(&["--ai-geo"])).expect("should parse");
+        assert!(core.ai_geo);
+        assert!(core.ai_enabled, "the flag enables AI");
+        assert!(core.ai_actions.is_empty(), "a GEO-only run does no per-page actions");
+
+        let core = parse_argv(&argv(&["--ai-geo", "--ai-actions=seo"])).expect("should parse");
+        assert_eq!(core.ai_actions, vec!["seo".to_string()], "explicit actions are kept");
+
+        let core = parse_argv(&argv(&["--ai-geo", "--ai-report=ia"])).expect("should parse");
+        assert_eq!(core.ai_actions, vec!["extract".to_string()], "the report is kept");
+
+        let core = parse_argv(&argv(&["--ai-geo", "--ai-consistency"])).expect("should parse");
+        assert!(core.ai_geo && core.ai_consistency, "both pipelines run");
+        assert!(core.ai_actions.is_empty());
+    }
+
+    #[test]
+    fn ai_geo_option_has_the_designed_help_text() {
+        let options = get_options();
+        let group = options.get_group(GROUP_AI_SETTINGS).expect("the AI group");
+        let option = group
+            .options
+            .values()
+            .find(|option| option.name == "--ai-geo")
+            .expect("the --ai-geo option");
+        assert_eq!(option.property_to_fill, "aiGeo");
+        assert_eq!(option.default_value.as_deref(), Some("false"));
+        assert_eq!(
+            option.description,
+            "Assess readiness for AI search and answer engines (GEO): crawler policy in robots.txt, observed access, indexing and snippet controls, rendering risk, per-page answer extractability and entity clarity, structured data and discovery. Writes a report (Markdown + JSON + HTML) and a deployable kit (JSON-LD built from verified page content, answer-first drafts, llms.txt, an optional robots.txt block for AI-training crawlers) to --ai-report-dir."
+        );
+        let names: Vec<&str> = group.options.values().map(|option| option.name.as_str()).collect();
+        let at = names.iter().position(|name| *name == "--ai-geo");
+        assert_eq!(
+            at.and_then(|at| at.checked_sub(1)).map(|before| names[before]),
+            Some("--ai-consistency"),
+            "listed after --ai-consistency"
+        );
+        assert!(get_help_text().contains("--ai-geo"), "the help lists the option");
+    }
+
+    #[test]
     fn ai_elaborate_keeps_the_ai_report_extract_action() {
         let argv = vec![
             "bin".to_string(),
@@ -5086,7 +5167,7 @@ mod tests {
                 .values()
                 .map(|group| group.options.len())
                 .sum::<usize>(),
-            225
+            226
         );
     }
 

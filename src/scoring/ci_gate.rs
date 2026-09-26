@@ -519,6 +519,7 @@ mod tests {
             ai_profile_template: None,
             ai_profile_correct: true,
             ai_consistency: false,
+            ai_geo: false,
             ai_context_window: 128000,
 
             // browser rendering settings

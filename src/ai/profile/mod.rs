@@ -83,7 +83,7 @@ fn path_hint(url: &str) -> String {
 /// or "Slogan | Brand"; we split on the common separators and PREFER the segment whose letters match
 /// the domain's second-level label (the brand, e.g. "Air Bank" ~ airbank.cz) — which reliably picks
 /// the brand out of a leading slogan. Falls back to the first segment, then the host.
-fn subject_name_from(title: &str, host: &str) -> String {
+pub(crate) fn subject_name_from(title: &str, host: &str) -> String {
     let t = title.trim();
     if t.is_empty() {
         return host.to_string();

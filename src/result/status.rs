@@ -75,6 +75,9 @@ pub struct Status {
     /// The optional fact-consistency document (`--ai-consistency`).
     ai_consistency_doc: Mutex<Option<crate::ai::consistency::doc::ConsistencyDoc>>,
 
+    /// The optional AI search readiness document (`--ai-geo`).
+    ai_geo_doc: Mutex<Option<crate::ai::geo::doc::GeoDoc>>,
+
     /// Per-URL browser-rendering diagnostics, keyed by uq_id (only populated in --browser mode).
     browser_diagnostics: Mutex<HashMap<String, crate::browser::diagnostics::BrowserDiagnostics>>,
 }
@@ -144,6 +147,7 @@ impl Status {
             ai_elaborate_doc: Mutex::new(None),
             ai_profile_doc: Mutex::new(None),
             ai_consistency_doc: Mutex::new(None),
+            ai_geo_doc: Mutex::new(None),
             browser_diagnostics: Mutex::new(HashMap::new()),
         }
     }
@@ -218,6 +222,18 @@ impl Status {
     /// Get a clone of the fact-consistency document, if `--ai-consistency` produced one.
     pub fn get_ai_consistency_doc(&self) -> Option<crate::ai::consistency::doc::ConsistencyDoc> {
         self.ai_consistency_doc.lock().ok().and_then(|s| s.clone())
+    }
+
+    /// Store the AI search readiness document (consumed by the GEO exporter).
+    pub fn set_ai_geo_doc(&self, doc: crate::ai::geo::doc::GeoDoc) {
+        if let Ok(mut slot) = self.ai_geo_doc.lock() {
+            *slot = Some(doc);
+        }
+    }
+
+    /// Get a clone of the AI search readiness document, if `--ai-geo` produced one.
+    pub fn get_ai_geo_doc(&self) -> Option<crate::ai::geo::doc::GeoDoc> {
+        self.ai_geo_doc.lock().ok().and_then(|s| s.clone())
     }
 
     pub fn add_visited_url(
