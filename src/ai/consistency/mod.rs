@@ -53,8 +53,8 @@ use self::doc::{
 use self::extract::{CAT_EXTRACT, build_extract_request, parse_facts, verify_facts};
 use self::judge::{
     CAT_REVIEW, Candidate, CandidateValue, ReviewResult, ValidatedResult, allocate, build_review_request, cohorts,
-    groups_message, pack_batches, parse_reviews, render_group_within, review_call_max_tokens, review_groups_per_call,
-    split_keys, validate_with_date,
+    covered_values, groups_message, pack_batches, parse_reviews, render_group_within, review_call_max_tokens,
+    review_groups_per_call, split_keys, uncovered_values, validate_with_date, with_values_first,
 };
 use self::keys::{
     CAT_GROUP, GroupOutcome, LabelItem, build_group_request, group_key, label_items, max_items_by_output, parse_groups,
@@ -532,13 +532,16 @@ pub async fn run(options: &CoreOptions, status: &Arc<Mutex<Status>>, output: &Ar
         keys: keys.len(),
         candidates: candidate_count,
         reviewed,
-        comparisons_done: to_review
+        comparisons_done: review_results
             .iter()
-            .zip(&review_results)
-            .filter(|(_, results)| !results.is_empty())
-            .map(|(c, _)| c.values.len().saturating_sub(1))
+            .map(|results| covered_values(results).len().saturating_sub(1))
             .sum(),
         reviews_capped: over_cap.len(),
+        reviews_partial: to_review
+            .iter()
+            .zip(&review_results)
+            .filter(|(c, results)| !uncovered_values(c, results).is_empty())
+            .count(),
         reviews_failed: failed_reviews,
         reviews_skipped_budget: if per_call == 0 { to_review.len() } else { 0 },
         grouping_incomplete,
@@ -934,8 +937,17 @@ async fn review_all(
         .map(|(i, c)| render_group_within(i + 1, c, occurrences, sources, pages, room))
         .collect();
     let batches = pack_batches(&rendered, budgets.review_batch_bytes, per_call);
-    let rendered = Arc::new(rendered);
-    let shared = Arc::new(groups.to_vec());
+    let context = Arc::new(ReviewContext {
+        groups: groups.to_vec(),
+        rendered,
+        occurrences: occurrences.to_vec(),
+        sources: sources.to_vec(),
+        pages: pages.to_vec(),
+        language: language.to_string(),
+        crawl_date: crawl_date.to_string(),
+        max_tokens: budgets.review_max_tokens,
+        room,
+    });
     progress::start(TASK_REVIEW, "Consistency: review", batches.len() as u64);
     let mut handles = Vec::with_capacity(batches.len());
     for range in batches {
@@ -943,15 +955,7 @@ async fn review_all(
         handles.push(tokio::spawn(progress::unit(
             TASK_REVIEW,
             subject,
-            review_batch(
-                client.clone(),
-                sem.clone(),
-                shared.clone(),
-                rendered.clone(),
-                range,
-                (language.to_string(), crawl_date.to_string()),
-                budgets.review_max_tokens,
-            ),
+            review_batch(client.clone(), sem.clone(), context.clone(), range),
         )));
     }
     let mut results: Vec<Vec<ValidatedResult>> = (0..groups.len()).map(|_| Vec::new()).collect();
@@ -966,35 +970,71 @@ async fn review_all(
     results
 }
 
+/// What every review batch shares: the groups under review with their renderings, what renders a
+/// group again (occurrences, sources, pages, the byte room of one group), the language of the
+/// prose, the crawl date and the output budget.
+struct ReviewContext {
+    groups: Vec<Candidate>,
+    rendered: Vec<String>,
+    occurrences: Vec<Occurrence>,
+    sources: Vec<AnalysisSource>,
+    pages: Vec<Page>,
+    language: String,
+    crawl_date: String,
+    max_tokens: u32,
+    room: usize,
+}
+
+/// One group of a review call: its index in the groups under review, the candidate as the call
+/// shows it, its rendering, and for each value id of that candidate (at index id − 1) the value's
+/// id in the group.
+#[derive(Clone)]
+struct Ask {
+    group: usize,
+    candidate: Candidate,
+    text: String,
+    ids: Vec<usize>,
+}
+
 /// One review batch. An answer cut at the output limit splits the batch in half and asks again
-/// for each half (at most `MAX_SPLIT_DEPTH` times); the groups a usable answer left out (live: a
-/// broken quote ended the JSON early) are asked for once more, in a call of their own. Each call
-/// asks for `review_call_max_tokens` of its groups. Returns the valid results with the index of
-/// their group in `groups`.
+/// for each half (at most `MAX_SPLIT_DEPTH` times). Once, a call asks again for what a usable
+/// answer left out: the groups it did not answer (live: a broken quote ended the JSON early), and
+/// the values of a group that none of its results judged — that group shown again with those
+/// values first. Each call asks for `review_call_max_tokens` of its groups. Returns the valid
+/// results with the index of their group in `groups`, their value ids those of the group.
 async fn review_batch(
     client: Arc<AiClient>,
     sem: Arc<Semaphore>,
-    groups: Arc<Vec<Candidate>>,
-    rendered: Arc<Vec<String>>,
+    ctx: Arc<ReviewContext>,
     range: Range<usize>,
-    (language, crawl_date): (String, String),
-    max_tokens: u32,
 ) -> Vec<(usize, ValidatedResult)> {
-    let mut out = Vec::new();
-    // The groups of a call (indexes into `groups`), its split depth, and whether it asks again
-    // for groups an answer left out.
-    let mut queue: Vec<(Vec<usize>, usize, bool)> = vec![(range.collect(), 0, false)];
-    while let Some((ids, depth, again)) = queue.pop() {
-        let batch: Vec<Candidate> = ids.iter().filter_map(|&i| groups.get(i).cloned()).collect();
-        let texts: Vec<String> = ids.iter().filter_map(|&i| rendered.get(i).cloned()).collect();
-        if ids.is_empty() || batch.len() != ids.len() || texts.len() != ids.len() {
+    let (groups, rendered) = (&ctx.groups, &ctx.rendered);
+    let mut out: Vec<(usize, ValidatedResult)> = Vec::new();
+    let asks: Vec<Ask> = range
+        .filter_map(|i| {
+            let candidate = groups.get(i)?.clone();
+            let ids = (1..=candidate.values.len()).collect();
+            Some(Ask {
+                group: i,
+                candidate,
+                text: rendered.get(i)?.clone(),
+                ids,
+            })
+        })
+        .collect();
+    // The groups of a call, its split depth, and whether it asks again for what an answer left out.
+    let mut queue: Vec<(Vec<Ask>, usize, bool)> = vec![(asks, 0, false)];
+    while let Some((asks, depth, again)) = queue.pop() {
+        if asks.is_empty() {
             continue;
         }
+        let batch: Vec<Candidate> = asks.iter().map(|a| a.candidate.clone()).collect();
+        let texts: Vec<String> = asks.iter().map(|a| a.text.clone()).collect();
         let req = build_review_request(
             &groups_message(&texts),
-            &language,
-            &crawl_date,
-            review_call_max_tokens(ids.len(), max_tokens),
+            &ctx.language,
+            &ctx.crawl_date,
+            review_call_max_tokens(asks.len(), ctx.max_tokens),
         );
         let answer = {
             let _permit = sem.clone().acquire_owned().await.ok();
@@ -1004,28 +1044,64 @@ async fn review_batch(
         };
         match answer {
             Ok((results, _)) => {
-                let mut answered = vec![false; ids.len()];
                 for result in results {
-                    if let Some(valid) = validate_with_date(result, &batch, &texts, &crawl_date) {
-                        answered[valid.0] = true;
-                        out.push((ids[valid.0], valid));
+                    if let Some(mut valid) = validate_with_date(result, &batch, &texts, &ctx.crawl_date) {
+                        let ask = &asks[valid.0];
+                        valid.4.values = valid
+                            .4
+                            .values
+                            .iter()
+                            .filter_map(|&id| ask.ids.get(id - 1).copied())
+                            .collect();
+                        out.push((ask.group, valid));
                     }
                 }
-                let left_out: Vec<usize> = ids
-                    .iter()
-                    .zip(&answered)
-                    .filter(|(_, answered)| !**answered)
-                    .map(|(&id, _)| id)
-                    .collect();
-                // Asking for all of them again would repeat the same (cached) request.
-                if !again && !left_out.is_empty() && left_out.len() < ids.len() {
+                if again {
+                    continue;
+                }
+                // What the answers so far left out: whole groups, and values of answered groups.
+                let (mut left_out, mut partly) = (Vec::new(), false);
+                for ask in &asks {
+                    let results: Vec<ValidatedResult> = out
+                        .iter()
+                        .filter(|(group, _)| *group == ask.group)
+                        .map(|(_, result)| result.clone())
+                        .collect();
+                    let group = &groups[ask.group];
+                    if results.is_empty() {
+                        left_out.push(ask.clone());
+                        continue;
+                    }
+                    let missing = uncovered_values(group, &results);
+                    if !missing.is_empty() {
+                        let (candidate, ids) = with_values_first(group, &missing);
+                        let text = render_group_within(
+                            ask.group + 1,
+                            &candidate,
+                            &ctx.occurrences,
+                            &ctx.sources,
+                            &ctx.pages,
+                            ctx.room,
+                        );
+                        left_out.push(Ask {
+                            group: ask.group,
+                            candidate,
+                            text,
+                            ids,
+                        });
+                        partly = true;
+                    }
+                }
+                // Asking for all of the same groups again would repeat the same (cached) request.
+                if partly || (!left_out.is_empty() && left_out.len() < asks.len()) {
                     queue.push((left_out, depth, true));
                 }
             }
-            Err(error) if ids.len() > 1 && depth < MAX_SPLIT_DEPTH && error.to_string().contains(TRUNCATED) => {
-                let (first, second) = ids.split_at(ids.len() / 2);
-                queue.push((second.to_vec(), depth + 1, again));
-                queue.push((first.to_vec(), depth + 1, again));
+            Err(error) if asks.len() > 1 && depth < MAX_SPLIT_DEPTH && error.to_string().contains(TRUNCATED) => {
+                let mut first = asks;
+                let second = first.split_off(first.len() / 2);
+                queue.push((second, depth + 1, again));
+                queue.push((first, depth + 1, again));
             }
             Err(_) => {}
         }
@@ -1175,6 +1251,18 @@ fn assemble(locale: &ReportLocale, meta: Meta, a: Assembly) -> ConsistencyDoc {
                     });
                 }
             }
+        }
+        // Values no result judged, even when asked again.
+        let left_out = uncovered_values(candidate, results);
+        if !left_out.is_empty() {
+            counts.not_reviewed += 1;
+            not_judged.push(NotJudgedGroup {
+                key: candidate.name.clone(),
+                attribute_key: candidate.attribute_key,
+                status: "not_reviewed_left_out",
+                reason: String::new(),
+                values: values_of(candidate, &left_out),
+            });
         }
     }
     for candidate in a.over_cap {

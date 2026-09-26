@@ -100,6 +100,8 @@ pub struct Meta {
     pub reviews_capped: usize,
     pub reviews_failed: usize,
     pub reviews_skipped_budget: usize,
+    /// Reviewed groups with values that no result judged, even when asked again.
+    pub reviews_partial: usize,
     pub grouping_incomplete: bool,
     pub items_not_cross_compared: usize,
     pub llm_calls: usize,
@@ -227,7 +229,8 @@ pub struct ExplainedGroup {
 }
 
 /// A difference that could not be judged: `insufficient_context`, or not reviewed
-/// (`not_reviewed_cap`, `not_reviewed_call_failed`, `not_reviewed_output_budget`).
+/// (`not_reviewed_cap`, `not_reviewed_call_failed`, `not_reviewed_output_budget`, and
+/// `not_reviewed_left_out` for the values of a reviewed group that no result judged).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NotJudgedGroup {
@@ -382,6 +385,11 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "status_not_reviewed_output_budget",
         "Not reviewed: --ai-max-tokens is too low for a review",
         "Neposouzeno: --ai-max-tokens je na posouzení příliš nízké",
+    ),
+    (
+        "status_not_reviewed_left_out",
+        "Not reviewed: the review left these values out",
+        "Neposouzeno: posouzení tyto hodnoty vynechalo",
     ),
     (
         "show_items",
@@ -587,6 +595,11 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "{n} rozdíl se nepodařilo posoudit (dotaz selhal)|{n} rozdíly se nepodařilo posoudit (dotaz selhal)|{n} rozdílů se nepodařilo posoudit (dotaz selhal)",
     ),
     (
+        "reason_not_reviewed_left_out",
+        "{n} difference was reviewed only in part: the review left some of its values out|{n} differences were reviewed only in part: the review left some of their values out",
+        "{n} rozdíl byl posouzen jen zčásti: posouzení vynechalo některé jeho hodnoty|{n} rozdíly byly posouzeny jen zčásti: posouzení vynechalo některé jejich hodnoty|{n} rozdílů bylo posouzeno jen zčásti: posouzení vynechalo některé jejich hodnoty",
+    ),
+    (
         "reason_not_reviewed_output_budget",
         "the review was skipped for {n} difference: --ai-max-tokens is too low|the review was skipped for {n} differences: --ai-max-tokens is too low",
         "posouzení {n} rozdílu bylo vynecháno: --ai-max-tokens je příliš nízké|posouzení {n} rozdílů bylo vynecháno: --ai-max-tokens je příliš nízké",
@@ -730,8 +743,9 @@ pub fn summary(locale: &ReportLocale, meta: &Meta, counts: &Counts, completeness
 /// half of the `sources` failed; `Complete` when every selected source was extracted, grouping
 /// finished and every candidate was reviewed; `Partial` otherwise. The reasons, in a fixed
 /// order: too few sources with facts, failed sources, pages without HTML, reduced pages,
-/// excluded header/footer lines, incomplete grouping, and reviews capped, failed or skipped. A
-/// not-reviewed count in `counts` beyond the capped and skipped ones counts as failed.
+/// excluded header/footer lines, incomplete grouping, and reviews capped, failed, skipped or
+/// left partly undone. A not-reviewed count in `counts` beyond the capped, skipped and partly
+/// undone ones counts as failed.
 pub fn completeness(meta: &Meta, counts: &Counts, failed_sources: usize, sources: usize) -> Completeness {
     let reason = |code: &'static str, count: usize| CompletenessReason { code, count };
     let mut reasons = Vec::new();
@@ -743,7 +757,7 @@ pub fn completeness(meta: &Meta, counts: &Counts, failed_sources: usize, sources
     let failed_reviews = meta.reviews_failed.max(
         counts
             .not_reviewed
-            .saturating_sub(meta.reviews_capped + meta.reviews_skipped_budget),
+            .saturating_sub(meta.reviews_capped + meta.reviews_skipped_budget + meta.reviews_partial),
     );
     let counted = [
         ("failed_sources", failed_sources),
@@ -754,6 +768,7 @@ pub fn completeness(meta: &Meta, counts: &Counts, failed_sources: usize, sources
         ("not_reviewed_cap", meta.reviews_capped),
         ("not_reviewed_call_failed", failed_reviews),
         ("not_reviewed_output_budget", meta.reviews_skipped_budget),
+        ("not_reviewed_left_out", meta.reviews_partial),
     ];
     for (code, count) in counted {
         if count > 0 {
@@ -1886,6 +1901,7 @@ mod tests {
             reviews_capped: 0,
             reviews_failed: 0,
             reviews_skipped_budget: 0,
+            reviews_partial: 0,
             grouping_incomplete: false,
             items_not_cross_compared: 0,
             llm_calls: 14,

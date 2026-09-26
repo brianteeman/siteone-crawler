@@ -348,6 +348,45 @@ pub fn cohorts(c: Candidate) -> Vec<Candidate> {
         .collect()
 }
 
+/// The values (ids) of a group that its valid review results judge.
+pub fn covered_values(results: &[ValidatedResult]) -> BTreeSet<usize> {
+    results
+        .iter()
+        .flat_map(|result| result.4.values.iter().copied())
+        .collect()
+}
+
+/// The values (ids, ascending) of `c` that no valid review result judges: the review left them
+/// out. None when the group has no result at all (then the whole group is not reviewed).
+pub fn uncovered_values(c: &Candidate, results: &[ValidatedResult]) -> Vec<usize> {
+    if results.is_empty() {
+        return Vec::new();
+    }
+    let covered = covered_values(results);
+    (1..=c.values.len()).filter(|id| !covered.contains(id)).collect()
+}
+
+/// `c` with the values `first` (ids) moved to the front, renumbered `1…`, and for each new id
+/// (at index id − 1) the value's id in `c`: a group asked again for the values an answer left
+/// out shows them first, so the request differs from the one that left them out.
+pub fn with_values_first(c: &Candidate, first: &[usize]) -> (Candidate, Vec<usize>) {
+    let order: Vec<usize> = first
+        .iter()
+        .copied()
+        .filter(|id| (1..=c.values.len()).contains(id))
+        .chain((1..=c.values.len()).filter(|id| !first.contains(id)))
+        .collect();
+    let values = order
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| CandidateValue {
+            id: i + 1,
+            ..c.values[id - 1].clone()
+        })
+        .collect();
+    (Candidate { values, ..c.clone() }, order)
+}
+
 /// Choose the groups to review, at most `MAX_REVIEWED_GROUPS`, fairly across the attribute
 /// buckets: the buckets (by attribute importance, then key) take turns, one group each per round,
 /// so a large bucket never starves a small one. Within a bucket, differences without stated
@@ -1506,6 +1545,35 @@ mod tests {
             let (_, replaced) = validate_prose(result(title), "Linka", input);
             assert_eq!(replaced, foreign, "{title}");
         }
+    }
+
+    #[test]
+    fn a_group_asked_again_shows_the_values_left_out_first() {
+        let (batch, _) = batch();
+        let group = &batch[0];
+        assert_eq!(group.values.len(), 3);
+        let (again, ids) = with_values_first(group, &[3]);
+        assert_eq!(ids, vec![3, 1, 2], "value 1 of the call is value 3 of the group");
+        assert_eq!(again.values.iter().map(|v| v.id).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(again.values[0].text, group.values[2].text);
+        assert_eq!(again.values[1].key, group.values[0].key);
+
+        let judged = |values: &[usize]| {
+            let mut r = result(7, &[1, 2], "explainable", "none");
+            r.values = values.to_vec();
+            validate(r, &batch, &batch_rendered()).expect("valid")
+        };
+        assert_eq!(uncovered_values(group, &[judged(&[1, 2])]), vec![3]);
+        assert!(uncovered_values(group, &[judged(&[1, 2]), judged(&[1, 3])]).is_empty());
+        assert!(
+            uncovered_values(group, &[]).is_empty(),
+            "a group without results is not reviewed"
+        );
+        assert_eq!(covered_values(&[judged(&[1, 3])]).len(), 2);
+    }
+
+    fn batch_rendered() -> Vec<String> {
+        batch().1
     }
 
     /// Two reviewed groups: the phone case as group 7 (a third value from /reklamace again), and
