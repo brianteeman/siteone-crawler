@@ -10,6 +10,7 @@ pub mod blocks;
 pub mod client;
 pub mod config;
 pub mod elaborate;
+pub mod geo;
 pub mod grounding;
 pub mod normalize;
 pub mod page;
