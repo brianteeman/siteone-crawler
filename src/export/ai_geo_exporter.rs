@@ -129,20 +129,23 @@ fn write_kit_tracked(dir: &Path, files: &[KitFile]) -> std::io::Result<Vec<PathB
     Ok(created)
 }
 
-/// Create the missing parent directories of `path` below `dir` and the file itself, recording
-/// every directory and the file in `created` (in creation order).
+/// Create the parent directories of `path` below `dir` that this call has not created yet, and
+/// the file itself, recording every directory and the file in `created` (in creation order). A
+/// directory is only used when this call created it: anything already there (a symlink planted in
+/// the new kit directory, say) makes `create_dir` fail instead of being written through.
 fn write_new(path: &Path, bytes: &[u8], dir: &Path, created: &mut Vec<PathBuf>) -> std::io::Result<()> {
     use std::io::Write;
-    let mut missing: Vec<&Path> = path
+    let mut parents: Vec<&Path> = path
         .ancestors()
         .skip(1)
         .take_while(|ancestor| *ancestor != dir)
-        .filter(|ancestor| !ancestor.is_dir())
         .collect();
-    missing.reverse();
-    for ancestor in missing {
-        std::fs::create_dir(ancestor)?;
-        created.push(ancestor.to_path_buf());
+    parents.reverse();
+    for parent in parents {
+        if !created.iter().any(|known| known == parent) {
+            std::fs::create_dir(parent)?;
+            created.push(parent.to_path_buf());
+        }
     }
     let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
     created.push(path.to_path_buf());
@@ -342,6 +345,25 @@ mod tests {
         assert!(error.to_string().contains("site-website.json"), "{error}");
         assert_eq!(tree(dir.path()), vec!["other.txt"]);
         assert_eq!(std::fs::read_to_string(dir.path().join("other.txt")).unwrap(), "keep");
+    }
+
+    /// A subdirectory this call did not create — here a symlink planted after the kit directory
+    /// was made — is never written through.
+    #[cfg(unix)]
+    #[test]
+    fn a_subdirectory_this_call_did_not_create_is_not_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let kit_dir = dir.path().join("kit");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&kit_dir).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, kit_dir.join("jsonld")).unwrap();
+        let mut created = Vec::new();
+        let error = write_new(&kit_dir.join("jsonld/site-website.json"), b"{}", &kit_dir, &mut created)
+            .expect_err("the planted directory is refused");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists, "{error}");
+        assert!(tree(&outside).is_empty(), "nothing written outside the kit");
+        assert!(created.is_empty());
     }
 
     #[test]
