@@ -197,7 +197,7 @@ pub fn proposed_robots(
             if !valid_utf8 {
                 return Err("robots.txt is not valid UTF-8, so it cannot be reproduced byte for byte".to_string());
             }
-            if content.trim_start().starts_with('<') {
+            if content.trim_start_matches('\u{feff}').trim_start().starts_with('<') {
                 return Err("robots.txt answered with an HTML page instead of robots.txt rules".to_string());
             }
             let before = robots.cloned().unwrap_or_else(|| AiRobots::parse(content));
@@ -847,8 +847,8 @@ fn manifest(markup: &[KitEntry], possible_profiles: &[String], today: &str) -> S
     format!("{}\n", serde_json::to_string_pretty(&manifest).unwrap_or_default())
 }
 
-/// Every file of the kit, README first: the training snippet, the proposed robots.txt when it is
-/// safe (otherwise the README says why not), the JSON-LD with its manifest, the entity drafts, the
+/// Every file of the kit, README first: the training snippet when it adds a group, the proposed
+/// robots.txt when it is safe (otherwise the README says why not), the JSON-LD with its manifest, the entity drafts, the
 /// lead drafts and the llms.txt — each only when it has content.
 pub fn build(
     input: &KitInput,
@@ -858,13 +858,18 @@ pub fn build(
 ) -> Vec<KitFile> {
     let mut files: Vec<KitFile> = Vec::new();
     let snippet = training_snippet(robots, input.agents, today);
-    files.push(KitFile::text(SNIPPET_PATH, &snippet));
-    let withheld = match proposed_robots(robots_state, robots, &snippet, input.key_paths, input.sitemaps) {
-        Ok(proposed) => {
-            files.push(KitFile::text(PROPOSED_PATH, &proposed));
-            None
+    // A block that adds no group (every training crawler has one already) is left out.
+    let withheld = if AiRobots::parse(&snippet).named_tokens().is_empty() {
+        None
+    } else {
+        files.push(KitFile::text(SNIPPET_PATH, &snippet));
+        match proposed_robots(robots_state, robots, &snippet, input.key_paths, input.sitemaps) {
+            Ok(proposed) => {
+                files.push(KitFile::text(PROPOSED_PATH, &proposed));
+                None
+            }
+            Err(why) => Some(why),
         }
-        Err(why) => Some(why),
     };
     if !input.markup.is_empty() {
         files.push(KitFile::text(
@@ -1116,6 +1121,10 @@ mod tests {
         };
         assert!(refuse(latin1, &snippet).contains("UTF-8"));
         assert!(refuse(ok("<!DOCTYPE html><html><body>App</body></html>"), &snippet).contains("HTML"));
+        assert!(
+            refuse(ok("\u{feff}<!DOCTYPE html><html><body>App</body></html>"), &snippet).contains("HTML"),
+            "an HTML page behind a byte-order mark"
+        );
 
         let huge = format!("User-agent: *\nDisallow: /admin\n#{}\n", "x".repeat(600 * 1024));
         assert!(refuse(ok(&huge), &snippet).contains("would not take effect"));
@@ -1427,6 +1436,34 @@ mod tests {
             let lower = text.to_lowercase();
             assert!(!lower.contains("guarantee") && !lower.contains("garant"));
         }
+    }
+
+    #[test]
+    fn build_leaves_out_a_robots_block_that_adds_nothing() {
+        let everyone = "User-agent: GPTBot\nUser-agent: ClaudeBot\nUser-agent: Applebot-Extended\n\
+                        User-agent: meta-externalagent\nUser-agent: CCBot\nDisallow: /\n";
+        let state = ok(everyone);
+        let robots = robots_of(&state);
+        let agents = verdicts(robots.as_ref());
+        let locale = ReportLocale::new("en");
+        let titles = HashMap::new();
+        let input = KitInput {
+            locale: &locale,
+            site_name: "Example",
+            markup: &[],
+            possible_profiles: &[],
+            analyses: &[],
+            titles: &titles,
+            agents: &agents,
+            key_paths: &paths(&["/"]),
+            sitemaps: &[],
+        };
+        let files = build(&input, &state, robots.as_ref(), TODAY);
+        let names: Vec<&str> = files.iter().map(|file| file.relative_path.as_str()).collect();
+        assert_eq!(names, ["README.md"], "every training crawler already has a group");
+        let readme = String::from_utf8(files[0].bytes.clone()).unwrap();
+        assert!(!readme.contains("was not generated"), "nothing was withheld: {readme}");
+        assert!(!readme.contains(SNIPPET_PATH));
     }
 
     #[test]
