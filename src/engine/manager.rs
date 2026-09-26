@@ -22,6 +22,7 @@ use crate::engine::crawler::{Crawler, compile_domain_patterns};
 use crate::engine::http_client::HttpClient;
 use crate::engine::parsed_url::ParsedUrl;
 use crate::error::{CrawlerError, CrawlerResult};
+use crate::export::ai_consistency_exporter::AiConsistencyExporter;
 use crate::export::ai_elaborate_exporter::AiElaborateExporter;
 use crate::export::ai_profile_exporter::AiProfileExporter;
 use crate::export::ai_report_exporter::AiReportExporter;
@@ -643,6 +644,35 @@ impl Manager {
                 crate::events::emit_ai_issue("AI profile export failed", &msg);
                 if let Ok(st) = status.lock() {
                     st.add_critical_to_summary(profile_exporter.get_name(), &msg);
+                }
+            }
+        }
+
+        // The fact-consistency report (Markdown + JSON + HTML + CSV), written the same way, when the
+        // `--ai-consistency` pipeline produced a document.
+        let has_consistency_doc = status
+            .lock()
+            .ok()
+            .is_some_and(|st| st.get_ai_consistency_doc().is_some());
+        if has_consistency_doc {
+            let run_id = format!(
+                "{}-{}",
+                chrono::Local::now().format("%Y-%m-%d.%H-%M-%S.%3f"),
+                std::process::id()
+            );
+            let paths = AiConsistencyExporter::paths(&options.ai_report_dir, &options.get_initial_host(false), &run_id);
+            let mut consistency_exporter = AiConsistencyExporter::new(paths);
+            let export_result = match (status.lock(), output.lock()) {
+                (Ok(st), Ok(out)) => consistency_exporter.export(&st, &**out),
+                _ => Err(crate::error::CrawlerError::Export(
+                    "Cannot lock crawler state for AI-consistency export".to_string(),
+                )),
+            };
+            if let Err(error) = export_result {
+                let msg = format!("AI-consistency export failed: {}", error);
+                crate::events::emit_ai_issue("AI consistency export failed", &msg);
+                if let Ok(st) = status.lock() {
+                    st.add_critical_to_summary(consistency_exporter.get_name(), &msg);
                 }
             }
         }

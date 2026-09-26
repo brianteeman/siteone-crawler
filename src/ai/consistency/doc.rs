@@ -869,11 +869,13 @@ fn state_code(state: CompletenessState) -> &'static str {
     }
 }
 
-/// Human duration: "6 min 3 s" for a minute or more, else "12.4 s".
-fn fmt_duration(ms: u64) -> String {
+/// Human duration: "6 min 3 s" for a minute or more, else "12.4 s" ("12,4 s" in Czech).
+fn fmt_duration(locale: &ReportLocale, ms: u64) -> String {
     let secs = ms as f64 / 1000.0;
     if secs >= 60.0 {
         format!("{} min {} s", (secs as u64) / 60, (secs as u64) % 60)
+    } else if locale.is_czech() {
+        format!("{secs:.1} s").replace('.', ",")
     } else {
         format!("{secs:.1} s")
     }
@@ -943,7 +945,7 @@ impl ConsistencyDoc {
             ),
             (
                 text(locale, "cov_calls"),
-                format!("{} / {}", n(m.llm_calls), fmt_duration(m.duration_ms)),
+                format!("{} / {}", n(m.llm_calls), fmt_duration(locale, m.duration_ms)),
             ),
         ]
     }
@@ -973,7 +975,8 @@ impl ConsistencyDoc {
 
     /// One row per finding × value × affected URL:
     /// `finding_id,priority,confidence,attribute,subject,value,qualifiers,url,region,heading_path`,
-    /// with the qualifiers, region and heading path of the value's occurrence on that page. Cells
+    /// with the qualifiers, region and heading path of the value's occurrence on that page (the
+    /// page's own content first, else a header/footer line). Cells
     /// are quoted when they hold a comma, a quote or a line break; a cell a spreadsheet would run
     /// as a formula gets a leading `'`. UTF-8 with a byte-order mark, for spreadsheets.
     pub fn to_csv(&self) -> String {
@@ -983,7 +986,13 @@ impl ConsistencyDoc {
         for finding in &self.findings {
             for value in &finding.values {
                 for url in &value.urls {
-                    let occurrence = value.occurrences.iter().find(|o| o.urls.contains(url));
+                    let on_page = |o: &&OccurrenceRef| o.urls.contains(url);
+                    let occurrence = value
+                        .occurrences
+                        .iter()
+                        .filter(on_page)
+                        .find(|o| o.region == SourceKind::Page)
+                        .or_else(|| value.occurrences.iter().find(on_page));
                     let row = [
                         finding.id.as_str(),
                         priority_code(finding.priority),
@@ -1641,8 +1650,8 @@ fn code_spans(text: &str) -> String {
         .collect()
 }
 
-/// Website or model text for Markdown: on one line, with the characters Markdown or HTML would
-/// interpret escaped.
+/// Website or model text for Markdown: on one line, with `<` (which could open an HTML tag) and
+/// the characters Markdown would interpret escaped.
 fn md(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 8);
     for (i, word) in text.split_whitespace().enumerate() {
@@ -1651,9 +1660,7 @@ fn md(text: &str) -> String {
         }
         for c in word.chars() {
             match c {
-                '&' => out.push_str("&amp;"),
                 '<' => out.push_str("&lt;"),
-                '>' => out.push_str("&gt;"),
                 '\\' | '`' | '*' | '_' | '[' | ']' | '|' | '#' => {
                     out.push('\\');
                     out.push(c);
