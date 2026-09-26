@@ -7338,6 +7338,125 @@ fn ai_geo_without_a_model_still_reports_policy_and_access() {
         .unwrap_or_else(|| panic!("no GEO issue in {text}"));
     assert_eq!(issue["kind"], "ai");
     assert!(events_of(&events, "aiRequest").is_empty(), "no request was sent");
+
+    // The report and the deterministic kit are still written, the reason in the report.
+    let reports = tmp.path.join("reports");
+    let names = geo_outputs(&reports);
+    assert_eq!(names.len(), 4, "{names:?}");
+    let json_name = names
+        .iter()
+        .find(|name| name.ends_with(".json"))
+        .expect("the JSON report");
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(reports.join(json_name)).expect("the report")).expect("JSON");
+    assert!(
+        json["meta"]["analysisUnavailable"]
+            .as_str()
+            .is_some_and(|why| why.contains("no API key resolved")),
+        "{}",
+        json["meta"]
+    );
+    assert_eq!(json["pages"].as_array().map(Vec::len), Some(0));
+    let kit = names
+        .iter()
+        .find(|name| name.starts_with("ai-geo-kit."))
+        .expect("the kit");
+    for file in [
+        "README.md",
+        "jsonld/site-organization.json",
+        "robots/block-ai-training.snippet.txt",
+    ] {
+        assert!(reports.join(kit).join(file).is_file(), "{file}");
+    }
+    assert!(
+        !reports.join(kit).join("leads.md").exists(),
+        "no drafts without a model"
+    );
+    let artifacts = events_of(&events, "artifact")
+        .into_iter()
+        .filter(|artifact| artifact["kind"].as_str().is_some_and(|kind| kind.starts_with("ai-geo")))
+        .count();
+    assert_eq!(artifacts, 4);
+}
+
+/// An answer cut at the output limit is asked again unchanged (the client's retry), then once
+/// with a 30 % smaller block selection; the verification uses what that smaller request showed.
+#[test]
+fn ai_geo_retries_a_truncated_answer_with_fewer_blocks() {
+    let tmp = TempDir::new("ai-geo-truncated");
+    let server = geo_site();
+    let mut truncated: serde_json::Value =
+        serde_json::from_str(&chat_answer(r#"{"page_type":"faq","main_topic":"Deliv"#)).expect("JSON");
+    truncated["choices"][0]["finish_reason"] = serde_json::json!("length");
+    let answer = serde_json::json!({
+        "page_type": "faq",
+        "main_topic": "Delivery and returns of Acme garden tools",
+        "states_offer_early": true,
+        "questions": []
+    });
+    let routes = vec![
+        // The smaller request of /faq (5 blocks offered, fewer shown) is answered in full…
+        MockRoute {
+            envelope: "<page_data>",
+            marker: Some(" of 5 blocks included"),
+            response: chat_response(200, chat_answer(&answer.to_string())),
+        },
+        // …the full one is always cut at the output limit.
+        MockRoute {
+            envelope: "<page_data>",
+            marker: Some("/faq</url>"),
+            response: chat_response(200, truncated.to_string()),
+        },
+    ];
+    let (_, fallback) = geo_routes();
+    let mock = MockLlm::start_routed(routes, fallback);
+    let endpoint = format!("--ai-endpoint={}", mock.url());
+    let report_dir = tmp.path.join("reports");
+    let report = format!("--ai-report-dir={}", report_dir.display());
+    let output = crawl_geo(
+        &server,
+        &[
+            "--ai-provider=openai-compatible",
+            endpoint.as_str(),
+            "--ai-model=m",
+            "--ai-geo",
+            report.as_str(),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    let faq_requests: Vec<String> = mock
+        .request_bodies()
+        .into_iter()
+        .filter(|body| body.contains("/faq</url>"))
+        .collect();
+    assert_eq!(faq_requests.len(), 3, "twice in full, once smaller");
+    assert!(
+        faq_requests[..2]
+            .iter()
+            .all(|body| body.contains("all blocks included"))
+    );
+    assert!(faq_requests[2].contains(" of 5 blocks included"));
+    let json_name = geo_outputs(&report_dir)
+        .into_iter()
+        .find(|name| name.ends_with(".json"))
+        .expect("the JSON report");
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(report_dir.join(json_name)).expect("the report")).expect("JSON");
+    let faq = json["pages"]
+        .as_array()
+        .expect("pages")
+        .iter()
+        .find(|page| page["url"] == format!("{}faq", server.url()))
+        .unwrap_or_else(|| panic!("the FAQ page was analyzed: {}", json["failedPages"]));
+    let coverage = &faq["coverage"];
+    assert_eq!(coverage["total"], 5, "{coverage}");
+    assert!(
+        coverage["included"]
+            .as_array()
+            .is_some_and(|included| included.len() < 5),
+        "{coverage}"
+    );
 }
 
 /// The prompt id (`B12`) of the block of `html` whose text is `text`.
