@@ -54,6 +54,9 @@ const AUTHOR_LABELS: &[&str] = &[
 /// Separators after which a byline continues with a date or a reading time.
 const BYLINE_SEPARATORS: &[&str] = &[",", "|", "·", "•", " – ", " — ", " - "];
 
+/// A cleaned byline with more words than this is no bare name.
+const MAX_AUTHOR_WORDS: usize = 5;
+
 /// Separators of a title's site suffix (`Pricing | Example`).
 const TITLE_SEPARATORS: &[&str] = &[" | ", " - ", " – ", " — ", " · ", " :: ", " » "];
 
@@ -302,8 +305,9 @@ pub fn website(site_name: &str, origin: &str) -> Value {
     })
 }
 
-/// The kit's Organization entity from the homepage's site chrome: a `logo` (the first chrome
-/// image whose `src`, `alt` or `class` says "logo"), a `contactPoint` from the first `tel:` and
+/// The kit's Organization entity from the homepage's site chrome: a `logo` (the first image of
+/// the site header, or linking to the homepage, whose `src`, `alt` or `class` says "logo" — not a
+/// partner's or a payment logo in the footer), a `contactPoint` from the first `tel:` and
 /// `mailto:` links whose values the chrome blocks show, and `sameAs` with the social profiles
 /// named after the brand (the site name or the domain's second-level label). The other social
 /// profiles of the chrome — a founder's LinkedIn, a profile under another name — are returned as
@@ -325,7 +329,7 @@ pub fn organization(
 
     let logo = homepage
         .select(&IMG_SELECTOR)
-        .filter(|img| in_site_chrome(*img))
+        .filter(|img| in_site_chrome(*img) && (in_site_header(*img) || links_home(*img, base)))
         .filter(|img| {
             ["src", "alt", "class"].iter().any(|attr| {
                 img.value()
@@ -400,6 +404,40 @@ pub fn organization(
         entity.insert("sameAs".to_string(), json!(same_as));
     }
     (Value::Object(entity), possible)
+}
+
+/// Inside the site header: a `header` outside `article` and `main`, or `[role=banner]`.
+fn in_site_header(element: ElementRef) -> bool {
+    let chain: Vec<ElementRef> = element.ancestors().filter_map(ElementRef::wrap).collect();
+    let is_content = |el: &ElementRef| {
+        matches!(el.value().name(), "article" | "main")
+            || el
+                .value()
+                .attr("role")
+                .is_some_and(|role| role.trim().eq_ignore_ascii_case("main"))
+    };
+    chain.iter().enumerate().any(|(at, el)| {
+        let banner = el
+            .value()
+            .attr("role")
+            .is_some_and(|role| role.trim().eq_ignore_ascii_case("banner"));
+        banner || (el.value().name() == "header" && !chain[at + 1..].iter().any(is_content))
+    })
+}
+
+/// Inside a link to the homepage (the site's root, with or without `www.`).
+fn links_home(element: ElementRef, base: &url::Url) -> bool {
+    let site = base.host_str().map(|host| host.trim_start_matches("www."));
+    element
+        .ancestors()
+        .filter_map(ElementRef::wrap)
+        .find(|el| el.value().name() == "a")
+        .and_then(|link| base.join(link.value().attr("href")?.trim()).ok())
+        .is_some_and(|target| {
+            target.path() == "/"
+                && target.query().is_none()
+                && target.host_str().map(|host| host.trim_start_matches("www.")) == site
+        })
 }
 
 /// `href` without a case-insensitive scheme prefix such as `tel:`.
@@ -641,7 +679,9 @@ pub fn article(page_url: &str, h1: &Block, author: Option<&Block>, date: Option<
 }
 
 /// The author's name in a byline block: without a leading label (`By`, `Autor:`, `Napsala`, …)
-/// and without a date or reading time after a separator (`Jan Novák, 25. 9. 2026`).
+/// and without a date or reading time after a separator (`Jan Novák, 25. 9. 2026`). `None` when
+/// what is left is no bare name — it has a digit or a colon, or more than `MAX_AUTHOR_WORDS`
+/// words (`Posted on September 25, 2026 by …`): a missing author is better than a wrong one.
 fn author_name(text: &str) -> Option<String> {
     let mut name = text.trim();
     for label in AUTHOR_LABELS {
@@ -664,7 +704,9 @@ fn author_name(text: &str) -> Option<String> {
         })
         .min();
     let name = cut.and_then(|at| name.get(..at)).unwrap_or(name).trim();
-    (!name.is_empty()).then(|| name.to_string())
+    let words = name.split_whitespace().count();
+    let bare = (1..=MAX_AUTHOR_WORDS).contains(&words) && !name.chars().any(|c| c.is_ascii_digit() || c == ':');
+    bare.then(|| name.to_string())
 }
 
 /// A ready-to-paste `<script type="application/ld+json">` element with the pretty JSON. `<`, `>`
@@ -862,6 +904,47 @@ mod tests {
     }
 
     #[test]
+    fn the_logo_is_the_site_header_image_or_one_linking_home() {
+        let base = url::Url::parse("https://example.com/").unwrap();
+        let logo = |html: &str| {
+            let (organization, _) = organization(
+                "Example",
+                "https://example.com",
+                &Html::parse_document(html),
+                &[],
+                &base,
+            );
+            organization.get("logo").and_then(Value::as_str).map(str::to_string)
+        };
+        // A payment or partner logo in the footer is not the organization's logo.
+        assert_eq!(
+            logo(
+                r#"<body><header><a href="/"><img src="/img/brand.svg" alt="Example"></a></header>
+                <footer><img src="/img/logos/visa.svg" alt="Visa"><img class="partner-logo" src="/p.png"></footer></body>"#
+            ),
+            None
+        );
+        // A logo image that links to the homepage is, wherever it sits in the chrome.
+        assert_eq!(
+            logo(
+                r#"<body><footer><img src="/img/logos/visa.svg" alt="Visa">
+                <a href="https://example.com/"><img src="/img/logo-white.svg" alt="Example"></a></footer></body>"#
+            )
+            .as_deref(),
+            Some("https://example.com/img/logo-white.svg")
+        );
+        // An article header is content, not the site header.
+        assert_eq!(
+            logo(r#"<body><main><article><header><img src="/logo-of-a-client.png"></header></article></main></body>"#),
+            None
+        );
+        assert_eq!(
+            logo(r#"<body><div role="banner"><img src="/assets/logo.png"></div></body>"#).as_deref(),
+            Some("https://example.com/assets/logo.png")
+        );
+    }
+
+    #[test]
     fn organization_without_chrome_signals_has_no_optional_properties() {
         let html = r#"<html><body><main><img src="/logo.png"><a href="tel:+420800123456">+420 800 123 456</a>
             <a href="https://www.linkedin.com/company/example">LinkedIn</a></main></body></html>"#;
@@ -1031,6 +1114,19 @@ mod tests {
                 name,
                 "{text}"
             );
+        }
+        // A byline the rules cannot reduce to a bare name leaves the author out rather than
+        // publishing a wrong one.
+        for text in [
+            "Posted on September 25, 2026 by Jan Novák",
+            "By Jan Novák on September 25, 2026",
+            "Autor článku: Jan Novák",
+            "25. 9. 2026 | Jan Novák",
+            "Jan Novák and the whole editorial team of Example",
+        ] {
+            let author = block(1, BlockKind::Paragraph, text);
+            let entity = article(url, &h1, Some(&author), None, false);
+            assert!(entity.get("author").is_none(), "{text} gave {entity}");
         }
     }
 
