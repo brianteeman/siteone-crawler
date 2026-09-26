@@ -342,7 +342,7 @@ fn inside_nosnippet(element: ElementRef) -> bool {
 
 /// The same site-chrome rule as `crate::ai::blocks`: a `header` / `footer` inside `article` or
 /// `main` belongs to the content.
-fn in_site_chrome(element: ElementRef) -> bool {
+pub(crate) fn in_site_chrome(element: ElementRef) -> bool {
     let mut chain: Vec<ElementRef> = element.ancestors().filter_map(ElementRef::wrap).collect();
     chain.reverse();
     chain.push(element);

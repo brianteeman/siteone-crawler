@@ -65,3 +65,12 @@ pub(crate) fn page(
 pub(crate) fn add(status: &mut Status, visited: VisitedUrl, body: Option<&str>) {
     status.add_visited_url(visited, body.map(str::as_bytes), None);
 }
+
+/// Like `add`, with response headers (lowercase names, as the HTTP client stores them).
+pub(crate) fn add_with_headers(status: &mut Status, visited: VisitedUrl, body: Option<&str>, headers: &[(&str, &str)]) {
+    let headers: std::collections::HashMap<String, String> = headers
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+    status.add_visited_url(visited, body.map(str::as_bytes), Some(&headers));
+}

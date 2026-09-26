@@ -241,7 +241,7 @@ impl Exporter for SitemapExporter {
 /// most a minute before the response `Date` (or after it), or — without a `Date` — more than a day
 /// after `crawled_at`: dynamic pages stamp "now", which says nothing about when the content
 /// changed, and search engines ignore a `lastmod` that is not accurate.
-fn lastmod_from_headers(
+pub(crate) fn lastmod_from_headers(
     headers: &HashMap<String, String>,
     crawled_at: chrono::DateTime<chrono::Utc>,
 ) -> Option<String> {

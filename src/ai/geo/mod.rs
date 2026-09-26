@@ -8,6 +8,8 @@ pub mod access;
 pub mod agents;
 pub mod controls;
 pub mod keys;
+pub mod render;
 pub mod robots_ai;
+pub mod signals;
 #[cfg(test)]
 pub(crate) mod test_support;
