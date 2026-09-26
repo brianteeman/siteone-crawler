@@ -21,6 +21,11 @@ use crate::types::ContentTypeId;
 /// A page with less text of its own (Main region, in characters) than this may be an app shell.
 pub const APP_SHELL_MAX_TEXT_CHARS: usize = 250;
 
+/// With a JavaScript notice in `noscript` as its only sign, a page is an app shell only below
+/// this much text of its own (a "Loading…" at most): server-rendering frameworks such as Gatsby
+/// add the notice to every page.
+pub const NOSCRIPT_ONLY_MAX_TEXT_CHARS: usize = 25;
+
 /// The mount points of JavaScript frameworks (React, Vue, Next.js, Nuxt; Angular's `app-root`),
 /// as CSS selectors, which are also the markers the report shows.
 const MOUNT_POINTS: &[&str] = &["div#root", "div#app", "div#__next", "div#__nuxt", "app-root"];
@@ -57,13 +62,17 @@ pub struct RenderCheck {
 
 /// The raw HTML of a page is an app shell when its own content (Main region, collapsed blocks
 /// included, since they are in the HTML) has fewer than `APP_SHELL_MAX_TEXT_CHARS` characters
-/// and it has an empty framework mount point or a `noscript` that mentions JavaScript.
+/// and it has an empty framework mount point, or a `noscript` that mentions JavaScript — the
+/// latter alone only below `NOSCRIPT_ONLY_MAX_TEXT_CHARS`.
 pub fn plain_render_risk(url: &str, html: &str) -> Option<RenderRisk> {
     let (main_text_chars, _) = main_text_chars(&blocks_from_html(html));
     if main_text_chars >= APP_SHELL_MAX_TEXT_CHARS {
         return None;
     }
     let markers = app_shell_markers(&Html::parse_document(html));
+    if markers == ["noscript"] && main_text_chars >= NOSCRIPT_ONLY_MAX_TEXT_CHARS {
+        return None;
+    }
     (!markers.is_empty()).then(|| RenderRisk {
         url: url.to_string(),
         main_text_chars,
@@ -199,6 +208,11 @@ mod tests {
                 .to_string(),
             // A mount point with text of its own is not empty.
             r#"<body><div id="root"><p>Hello</p></div></body>"#.to_string(),
+            // Gatsby renders on the server and still adds this notice to every page: a JavaScript
+            // notice alone means a shell only when the page has next to no text of its own.
+            r#"<body><noscript id="gatsby-noscript">This app works best with JavaScript enabled.</noscript>
+            <div id="___gatsby"><main><h1>Contact</h1><p>Call us or write to us.</p></main></div></body>"#
+                .to_string(),
         ];
         for html in &cases {
             assert_eq!(plain_render_risk(URL, html), None, "{html}");
