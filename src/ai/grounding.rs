@@ -535,7 +535,8 @@ pub enum ValueKey {
 /// The comparison key of `value` as written, read per `hint`:
 /// - Contact: an e-mail → `mail:<lowercase>`; a phone → `tel:+<international digits>` (a national
 ///   number only with a known `site_country`, see `site_country`, else
-///   `Uncertain("tel-national:<digits>")`); a contact with neither → as Text.
+///   `Uncertain("tel-national:<digits>")`), plus `;ext=N` for an extension written after it, and
+///   unresolved with other digits beside it (see `phone_key`); a contact with neither → as Text.
 /// - Number: see `parse_number`.
 /// - Date: `date:YYYY-MM-DD` when the whole value is a date (`D. M. YYYY`, `D.M.YYYY`,
 ///   `YYYY-MM-DD`, English month names, Czech genitive month names).
@@ -595,14 +596,38 @@ fn email_key(value: &str) -> ValueKey {
     }
 }
 
+/// A phone extension right after the number (`ext. 12`, `x12`, `kl. 12`, `linka 12`, …).
+static PHONE_EXTENSION: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)^[\s,;(]*(?:ext\.?|extension|x|kl\.?|klapka|linka|l\.|#)\s*(\d{1,6})\)?").expect("extension regex")
+});
+
+/// The key of a phone number: its international digits (see `value_key`), with `;ext=N` for an
+/// extension written after it. Other digits beside the number — a second number, opening hours —
+/// leave it unresolved (`tel?:`); a label number of at most 2 digits before it (`Tel. 1:`) is
+/// not part of it.
 fn phone_key(value: &str, site_country: Option<&str>) -> ValueKey {
     let cleaned = unify_spaces(value).replace("(0)", " ");
     // The run with the most digits: "Tel. 1: +420 …" must not stop at the "1".
-    let run = PHONE_RUN
+    let Some(found) = PHONE_RUN
         .find_iter(&cleaned)
-        .map(|m| m.as_str())
-        .max_by_key(|run| digit_string(run).len())
-        .unwrap_or_default();
+        .max_by_key(|m| digit_string(m.as_str()).len())
+    else {
+        return ValueKey::Uncertain(format!("tel?:{}", collapse_lower(value)));
+    };
+    let run = found.as_str();
+    let after = cleaned.get(found.end()..).unwrap_or_default();
+    let (extension, rest) = match PHONE_EXTENSION.captures(after) {
+        Some(caps) => (
+            caps.get(1).map(|m| format!(";ext={}", m.as_str())),
+            after.get(caps.get(0).map_or(0, |m| m.end())..).unwrap_or_default(),
+        ),
+        None => (None, after),
+    };
+    let label = cleaned.get(..found.start()).unwrap_or_default();
+    if rest.contains(|c: char| c.is_ascii_digit()) || digit_string(label).len() > 2 {
+        return ValueKey::Uncertain(format!("tel?:{}", collapse_lower(value)));
+    }
+    let extension = extension.unwrap_or_default();
     let digits = digit_string(run);
     if run.starts_with('+') || digits.starts_with("00") {
         let mut digits = if run.starts_with('+') {
@@ -622,9 +647,9 @@ fn phone_key(value: &str, site_country: Option<&str>) -> ValueKey {
         {
             digits.remove(country.dial.len());
         }
-        return ValueKey::Exact(format!("tel:+{digits}"));
+        return ValueKey::Exact(format!("tel:+{digits}{extension}"));
     }
-    let national = || ValueKey::Uncertain(format!("tel-national:{digits}"));
+    let national = || ValueKey::Uncertain(format!("tel-national:{digits}{extension}"));
     let Some(country) = site_country.and_then(country_by_code) else {
         return national();
     };
@@ -634,7 +659,7 @@ fn phone_key(value: &str, site_country: Option<&str>) -> ValueKey {
     if (country.trunk.is_empty() && number.starts_with('0')) || !country.national.contains(&number.len()) {
         return national();
     }
-    ValueKey::Exact(format!("tel:+{}{number}", country.dial))
+    ValueKey::Exact(format!("tel:+{}{number}{extension}", country.dial))
 }
 
 /// Dialling rules of the countries `site_country` can return: the country calling code, the
@@ -1676,6 +1701,49 @@ mod tests {
             key(ValueHint::Contact, "+49 (0)30 1234567", "", None),
             key(ValueHint::Contact, "+49 30 1234567", "", None),
             "the trunk (0) after a country code is dropped"
+        );
+    }
+
+    #[test]
+    fn a_phone_extension_is_part_of_the_number() {
+        let ext12 = key(ValueHint::Contact, "+420 800 123 456 ext. 12", "en", None);
+        assert_eq!(ext12, ValueKey::Exact("tel:+420800123456;ext=12".to_string()));
+        assert_ne!(
+            ext12,
+            key(ValueHint::Contact, "+420 800 123 456 ext. 34", "en", None),
+            "another extension is another destination"
+        );
+        assert_ne!(ext12, key(ValueHint::Contact, "+420 800 123 456", "en", None));
+        for written in [
+            "+420 800 123 456, kl. 12",
+            "+420 800 123 456 (ext. 12)",
+            "+420 800 123 456 x12",
+            "+420 800 123 456 klapka 12",
+        ] {
+            assert_eq!(key(ValueHint::Contact, written, "cs", None), ext12, "{written}");
+        }
+        assert_eq!(
+            key(ValueHint::Contact, "800 123 456 linka 12", "cs", Some("CZ")),
+            ext12,
+            "a national number with its extension"
+        );
+        // Other digits after the number: another number or unknown digits — unresolved.
+        assert!(!exact(&key(
+            ValueHint::Contact,
+            "+420 800 123 456 / +420 800 123 457",
+            "cs",
+            None
+        )));
+        assert!(!exact(&key(
+            ValueHint::Contact,
+            "+420 800 123 456 nebo 800 123 457",
+            "cs",
+            None
+        )));
+        // A label number before the phone number is not part of it.
+        assert_eq!(
+            key(ValueHint::Contact, "Tel. 1: +420 800 123 456", "cs", None),
+            ValueKey::Exact("tel:+420800123456".to_string())
         );
     }
 
