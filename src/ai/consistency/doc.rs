@@ -1235,17 +1235,27 @@ impl ConsistencyDoc {
                 md(&value.text),
                 count_text(locale, "on_pages", value.urls.len())
             ));
-            for occurrence in value.occurrences.iter().take(OCCURRENCES_SHOWN) {
-                out.push_str(&format!("  - {}\n", md(&occurrence_line(locale, occurrence))));
+            let md_occurrence = |out: &mut String, indent: &str, occurrence: &OccurrenceRef| {
+                out.push_str(&format!("{indent}- {}\n", md(&occurrence_line(locale, occurrence))));
                 if !occurrence.evidence.is_empty() {
-                    out.push_str(&format!("    > {}\n", md(&occurrence.evidence)));
+                    out.push_str(&format!("{indent}  > {}\n", md(&occurrence.evidence)));
                 }
+            };
+            for occurrence in value.occurrences.iter().take(OCCURRENCES_SHOWN) {
+                md_occurrence(out, "  ", occurrence);
             }
-            if value.occurrences.len() > OCCURRENCES_SHOWN {
+            // The rest collapsed, with their conditions and evidence too.
+            if let Some(rest) = value.occurrences.get(OCCURRENCES_SHOWN..)
+                && !rest.is_empty()
+            {
                 out.push_str(&format!(
-                    "  - {}\n",
-                    count_text(locale, "more_occurrences", value.occurrences.len() - OCCURRENCES_SHOWN)
+                    "  - <details><summary>{}</summary>\n\n",
+                    count_text(locale, "more_occurrences", rest.len())
                 ));
+                for occurrence in rest {
+                    md_occurrence(out, "    ", occurrence);
+                }
+                out.push_str("\n    </details>\n");
             }
             if !value.urls.is_empty() {
                 let shown: Vec<String> = value.urls.iter().take(URLS_SHOWN).map(|u| md_url(u)).collect();
@@ -1986,6 +1996,44 @@ mod tests {
             ),
             finding("Hypotéka – RPSN", Priority::High, Confidence::Likely, AttributeKey::Apr),
         ]
+    }
+
+    #[test]
+    fn every_occurrence_keeps_its_evidence_and_conditions_in_markdown_and_html() {
+        let mut f = finding(
+            "Tarif – cena",
+            Priority::Medium,
+            Confidence::Possible,
+            AttributeKey::Price,
+        );
+        f.values[0].occurrences = (0..5)
+            .map(|i| {
+                let mut o = occurrence(
+                    i,
+                    SourceKind::Page,
+                    &format!("/p{i}"),
+                    &format!("EVIDENCE{i}: Cena 100 Kč"),
+                    &[&format!("https://example.com/p{i}")],
+                );
+                o.qualifiers = if i == 3 {
+                    "CONDITION3 special offer".to_string()
+                } else {
+                    "standard".to_string()
+                };
+                o
+            })
+            .collect();
+        let doc = sample(&en(), vec![f]);
+        let (md, html) = (doc.to_markdown(), doc.to_html());
+        for i in 0..5 {
+            assert!(md.contains(&format!("EVIDENCE{i}")), "Markdown lost occurrence {i}");
+            assert!(
+                md.contains(&format!("/p{i}")),
+                "Markdown lost the path of occurrence {i}"
+            );
+            assert!(html.contains(&format!("EVIDENCE{i}")), "HTML lost occurrence {i}");
+        }
+        assert!(md.contains("CONDITION3") && html.contains("CONDITION3"));
     }
 
     #[test]
