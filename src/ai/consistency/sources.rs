@@ -38,8 +38,10 @@ const MIN_BLOCK_BYTES: usize = 1024;
 
 /// The unique fact-bearing header/footer lines: `(text, label, pages)`, where the label is the
 /// nearest preceding line without a fact (the most common one across the line's pages) and
-/// `pages` is the exact, sorted set of page indexes that show the line. Ordered by the number of
-/// pages (descending), then by text. `excluded` counts the lines left out by the cap.
+/// `pages` is the exact, sorted set of page indexes that show the line. A text a page repeats
+/// under another label (one number for Sales and for Support) is a line of its own, so each label
+/// keeps its page set. Ordered by the number of pages (descending), then by text and label.
+/// `excluded` counts the lines left out by the cap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChromeLines {
     pub lines: Vec<(String, String, Vec<usize>)>,
@@ -213,13 +215,21 @@ pub fn chrome_lines(pages_blocks: &[(usize, Vec<Block>)]) -> ChromeLines {
         pages: BTreeSet<usize>,
         labels: HashMap<String, usize>,
     }
-    let mut entries: HashMap<String, Entry> = HashMap::new();
+    // A line is its text and, when a page repeats the text under another label (the same number
+    // for Sales and for Support), the rank of that label among the page's labels of the text.
+    let mut entries: HashMap<(String, usize), Entry> = HashMap::new();
     for (page, blocks) in pages_blocks {
         let mut label = String::new();
+        let mut labels_of: HashMap<&str, Vec<String>> = HashMap::new();
         for block in blocks.iter().filter(|b| b.region == Region::Chrome) {
             let text = block.text.trim();
             if is_fact_line(text) {
-                let entry = entries.entry(text.to_string()).or_default();
+                let labels = labels_of.entry(text).or_default();
+                if labels.contains(&label) {
+                    continue;
+                }
+                labels.push(label.clone());
+                let entry = entries.entry((text.to_string(), labels.len() - 1)).or_default();
                 if entry.pages.insert(*page) {
                     *entry.labels.entry(label.clone()).or_default() += 1;
                 }
@@ -231,7 +241,7 @@ pub fn chrome_lines(pages_blocks: &[(usize, Vec<Block>)]) -> ChromeLines {
 
     let mut lines: Vec<(String, String, Vec<usize>)> = entries
         .into_iter()
-        .map(|(text, entry)| {
+        .map(|((text, _), entry)| {
             let label = entry
                 .labels
                 .into_iter()
@@ -241,7 +251,13 @@ pub fn chrome_lines(pages_blocks: &[(usize, Vec<Block>)]) -> ChromeLines {
             (text, label, entry.pages.into_iter().collect())
         })
         .collect();
-    lines.sort_by(|a, b| b.2.len().cmp(&a.2.len()).then_with(|| a.0.cmp(&b.0)));
+    lines.sort_by(|a, b| {
+        b.2.len()
+            .cmp(&a.2.len())
+            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
     if lines.len() <= MAX_CHROME_LINES {
         return ChromeLines { lines, excluded: 0 };
     }
@@ -698,6 +714,31 @@ mod tests {
                 "Zákaznická linka 800 123 456",
                 "Zákaznická linka 800 123 465"
             ]
+        );
+    }
+
+    #[test]
+    fn a_line_repeated_under_another_label_keeps_each_label() {
+        let footer = |support: &str| {
+            blocks_from_html(&format!(
+                "<body><footer><h2>Sales</h2><p>800 123 456</p><h2>Support</h2><p>{support}</p></footer></body>"
+            ))
+        };
+        let pages = vec![
+            (0, footer("800 123 456")),
+            (1, footer("800 123 456")),
+            (2, footer("800 123 465")),
+        ];
+        let lines = chrome_lines(&pages);
+        let expected = |text: &str, label: &str, pages: &[usize]| (text.to_string(), label.to_string(), pages.to_vec());
+        assert_eq!(
+            lines.lines,
+            vec![
+                expected("800 123 456", "Sales", &[0, 1, 2]),
+                expected("800 123 456", "Support", &[0, 1]),
+                expected("800 123 465", "Support", &[2]),
+            ],
+            "the Support line keeps its own page set"
         );
     }
 
