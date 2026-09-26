@@ -18,6 +18,7 @@ use unicode_normalization::char::is_combining_mark;
 use crate::ai::blocks::Block;
 use crate::ai::geo::agents::{AI_AGENTS, AiAgent, Purpose};
 use crate::ai::geo::analyze::{Answered, PageAnalysis, PageType, block_ref};
+use crate::ai::geo::findings::ORGANIZATION_TYPES;
 use crate::ai::geo::jsonld::{self, ExistingMarkup};
 use crate::ai::geo::robots_ai::{AgentAccess, AiRobots, policy_equivalent};
 use crate::ai::report::locale::ReportLocale;
@@ -368,7 +369,7 @@ pub fn markup_entries(
         file_stem: "site-organization".to_string(),
         json: organization.clone(),
         evidence,
-        notes: merge_notes(homepage_existing, &["Organization"]),
+        notes: merge_notes(homepage_existing, ORGANIZATION_TYPES),
     });
 
     let urls: Vec<String> = pages.iter().map(|page| page.url.to_string()).collect();
@@ -1308,6 +1309,16 @@ mod tests {
                 .notes
                 .iter()
                 .any(|note| note.contains("merge with the existing markup"))
+        );
+        let local = ExistingMarkup {
+            jsonld_types: vec!["LocalBusiness".to_string()],
+            ..ExistingMarkup::default()
+        };
+        let with_local = markup_entries(&site, &local, &[], &crawled);
+        assert!(
+            with_local[1].notes.iter().any(|note| note.contains("LocalBusiness")),
+            "a subtype of Organization is existing Organization markup: {:?}",
+            with_local[1].notes
         );
         assert!(
             organization

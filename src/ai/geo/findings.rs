@@ -43,6 +43,90 @@ const OFFER_EARLY_TYPES: &[PageType] = &[
     PageType::Article,
 ];
 
+/// Organization and its common schema.org subtypes (the direct ones, LocalBusiness and its direct
+/// subtypes, and frequent deeper ones): a page that declares one of them already has
+/// Organization markup.
+pub const ORGANIZATION_TYPES: &[&str] = &[
+    "Organization",
+    "Airline",
+    "Consortium",
+    "Cooperative",
+    "Corporation",
+    "EducationalOrganization",
+    "CollegeOrUniversity",
+    "School",
+    "FundingScheme",
+    "GovernmentOrganization",
+    "LibrarySystem",
+    "MedicalOrganization",
+    "Hospital",
+    "Pharmacy",
+    "Physician",
+    "NGO",
+    "NewsMediaOrganization",
+    "OnlineBusiness",
+    "OnlineStore",
+    "PerformingGroup",
+    "MusicGroup",
+    "PoliticalParty",
+    "Project",
+    "ResearchOrganization",
+    "SearchRescueOrganization",
+    "SportsOrganization",
+    "SportsTeam",
+    "WorkersUnion",
+    "LocalBusiness",
+    "AnimalShelter",
+    "ArchiveOrganization",
+    "AutomotiveBusiness",
+    "ChildCare",
+    "Dentist",
+    "DryCleaningOrLaundry",
+    "EmergencyService",
+    "EmploymentAgency",
+    "EntertainmentBusiness",
+    "FinancialService",
+    "FoodEstablishment",
+    "GovernmentOffice",
+    "HealthAndBeautyBusiness",
+    "HomeAndConstructionBusiness",
+    "InternetCafe",
+    "LegalService",
+    "Library",
+    "LodgingBusiness",
+    "MedicalBusiness",
+    "ProfessionalService",
+    "RadioStation",
+    "RealEstateAgent",
+    "RecyclingCenter",
+    "SelfStorage",
+    "ShoppingCenter",
+    "SportsActivityLocation",
+    "Store",
+    "TelevisionStation",
+    "TouristInformationCenter",
+    "TravelAgency",
+    "Restaurant",
+    "CafeOrCoffeeShop",
+    "BarOrPub",
+    "Bakery",
+    "Hotel",
+    "Attorney",
+    "AccountingService",
+    "BankOrCreditUnion",
+    "InsuranceAgency",
+    "AutoDealer",
+    "AutoRepair",
+    "ClothingStore",
+    "ElectronicsStore",
+    "Plumber",
+    "Electrician",
+    "GeneralContractor",
+    "HairSalon",
+    "BeautySalon",
+    "ExerciseGym",
+];
+
 /// A source of a recommendation: its URL and the date it was published or last checked.
 pub type SourceRef = (&'static str, &'static str);
 
@@ -1100,11 +1184,14 @@ fn structured_data(checks: &Checks, found: &mut Found) -> Counts {
     grouped.set_args("jsonld_values_not_checked", vec![not_checked.to_string()]);
     grouped.emit(found, Evidence::Strong);
     if let Some(home) = checks.markup.iter().find(|page| page.is_homepage) {
-        let missing: Vec<String> = ["Organization", "WebSite"]
-            .iter()
-            .filter(|kind| !home.markup.declares(kind))
-            .map(|kind| kind.to_string())
-            .collect();
+        let has_organization = ORGANIZATION_TYPES.iter().any(|kind| home.markup.declares(kind));
+        let mut missing: Vec<String> = Vec::new();
+        if !has_organization {
+            missing.push("Organization".to_string());
+        }
+        if !home.markup.declares("WebSite") {
+            missing.push("WebSite".to_string());
+        }
         if !missing.is_empty() {
             found.add(
                 "no_site_markup",
@@ -1790,6 +1877,11 @@ mod tests {
         // Microdata counts as existing markup.
         bare.markup[0].markup.other_types = vec!["Organization".to_string()];
         assert!(issues(&bare, CategoryId::StructuredData).is_empty());
+        // So does a subtype of Organization.
+        for kind in ["LocalBusiness", "Corporation", "Restaurant", "NGO"] {
+            bare.markup[0].markup.other_types = vec![kind.to_string()];
+            assert!(issues(&bare, CategoryId::StructuredData).is_empty(), "{kind}");
+        }
     }
 
     #[test]
