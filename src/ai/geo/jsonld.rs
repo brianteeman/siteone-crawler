@@ -25,6 +25,10 @@ use crate::ai::grounding::{find_token_bounded, numbers_in};
 
 const SCHEMA_ORG: &str = "https://schema.org";
 
+/// At most this many key values of a page are checked for visibility; the rest are counted in
+/// `ExistingMarkup::values_not_checked`, so a huge catalog in JSON-LD cannot stall the report.
+pub const MAX_CHECKED_VALUES: usize = 200;
+
 /// Properties whose values must be visible on the page (Google: structured data must match the
 /// visible content). `author` as a plain string counts as `author.name`, and `price` only inside
 /// `offers`.
@@ -91,6 +95,8 @@ static LINK_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse("a[href]").u
 static IMG_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse("img[src]").unwrap());
 static H1_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse("h1").unwrap());
 static TITLE_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse("title").unwrap());
+static SITE_NAME_SELECTOR: Lazy<Selector> =
+    Lazy::new(|| Selector::parse(r#"meta[property="og:site_name"][content]"#).unwrap());
 
 /// The structured data a page already has.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -108,17 +114,52 @@ pub struct ExistingMarkup {
     pub has_rdfa: bool,
     /// The types declared by Microdata `itemtype` and RDFa `typeof`, as short names, each once.
     pub other_types: Vec<String>,
+    /// The types of objects nested in the JSON-LD entities (a `publisher` Organization, an
+    /// `offers` Offer, …) that are not entity types too, each once.
+    pub nested_types: Vec<String>,
+    /// Key values left unchecked above `MAX_CHECKED_VALUES`.
+    pub values_not_checked: usize,
+}
+
+impl ExistingMarkup {
+    /// The page already declares this type somewhere: as a JSON-LD entity, nested in one, or in
+    /// Microdata or RDFa (for "merge with the existing markup" notes).
+    pub fn declares(&self, kind: &str) -> bool {
+        self.jsonld_types
+            .iter()
+            .chain(&self.nested_types)
+            .chain(&self.other_types)
+            .any(|known| known == kind)
+    }
 }
 
 /// The structured data of a page: its JSON-LD blocks, checked against `visible_text` (the text of
-/// the page's visible blocks, Main and Chrome), and the presence of Microdata and RDFa.
+/// the page's visible blocks, Main and Chrome) together with the page title and its declared
+/// `og:site_name` (SEO plugins name the WebPage by its title and the WebSite by the site name),
+/// and the presence of Microdata and RDFa. An empty JSON-LD block is ignored.
 pub fn existing(document: &Html, visible_text: &str) -> ExistingMarkup {
     let lang = document
         .select(&HTML_SELECTOR)
         .next()
         .and_then(|html| html.value().attr("lang"))
         .unwrap_or_default();
-    let visible = Visible::new(visible_text, lang);
+    let title: String = document
+        .select(&TITLE_SELECTOR)
+        .next()
+        .map(|title| title.text().collect())
+        .unwrap_or_default();
+    let site_name = document
+        .select(&SITE_NAME_SELECTOR)
+        .next()
+        .and_then(|meta| meta.value().attr("content"))
+        .unwrap_or_default();
+    let shown = format!("{visible_text}\n{title}\n{site_name}");
+    let mut check = ValueCheck {
+        visible: Visible::new(&shown, lang),
+        invisible: Vec::new(),
+        checked: 0,
+        not_checked: 0,
+    };
     let mut markup = ExistingMarkup::default();
     let scripts = document.select(&SCRIPT_SELECTOR).filter(|script| {
         script
@@ -128,6 +169,9 @@ pub fn existing(document: &Html, visible_text: &str) -> ExistingMarkup {
     });
     for (index, script) in scripts.enumerate() {
         let text: String = script.text().collect();
+        if text.trim().is_empty() {
+            continue;
+        }
         match serde_json::from_str::<Value>(text.trim()) {
             Ok(value) => {
                 for entity in entities(&value) {
@@ -135,8 +179,11 @@ pub fn existing(document: &Html, visible_text: &str) -> ExistingMarkup {
                     for kind in &types {
                         push_unique(&mut markup.jsonld_types, kind);
                     }
+                    for nested in entity.values().flat_map(nested_objects) {
+                        collect_types(nested, &mut markup.nested_types);
+                    }
                     let label = types.first().map_or("entity", String::as_str);
-                    check_values(entity, label, false, &visible, &mut markup.invisible_values);
+                    check.values(entity, label, false);
                 }
             }
             Err(error) => markup
@@ -144,6 +191,10 @@ pub fn existing(document: &Html, visible_text: &str) -> ExistingMarkup {
                 .push(format!("JSON-LD block {}: {}", index + 1, error)),
         }
     }
+    let entity_types = markup.jsonld_types.clone();
+    markup.nested_types.retain(|kind| !entity_types.contains(kind));
+    markup.invisible_values = check.invisible;
+    markup.values_not_checked = check.not_checked;
     for element in document.select(&MARKUP_SELECTOR) {
         let el = element.value();
         markup.has_microdata |= el.attr("itemscope").is_some() || el.attr("itemtype").is_some();
@@ -196,34 +247,54 @@ fn push_unique(list: &mut Vec<String>, value: &str) {
     }
 }
 
-/// Walks an entity (and the objects nested in it) and records the key values that are not
-/// visible. `in_offers` is true below an `offers` property.
-fn check_values(
-    object: &Map<String, Value>,
-    path: &str,
-    in_offers: bool,
-    visible: &Visible,
-    invisible: &mut Vec<(String, String)>,
-) {
-    for (key, value) in object.iter().filter(|(key, _)| !key.starts_with('@')) {
-        let key_path = format!("{path}.{key}");
-        let checked = if KEY_PROPERTIES.contains(&key.as_str()) || (key == "price" && in_offers) {
-            Some((key.as_str(), key_path.clone()))
-        } else if key == "author" && value.is_string() {
-            Some(("name", format!("{key_path}.name")))
-        } else {
-            None
-        };
-        if let Some((property, label)) = checked {
-            for leaf in leaves(value) {
-                if !visible.contains(property, &leaf) {
-                    invisible.push((label.clone(), leaf));
+/// The types of an object and of the objects nested in it.
+fn collect_types(object: &Map<String, Value>, found: &mut Vec<String>) {
+    for kind in types_of(object) {
+        push_unique(found, &kind);
+    }
+    for nested in object.values().flat_map(nested_objects) {
+        collect_types(nested, found);
+    }
+}
+
+/// The visibility check of the key values of a page's JSON-LD.
+struct ValueCheck<'a> {
+    visible: Visible<'a>,
+    /// (`Type.property.path`, value) of the values not visible.
+    invisible: Vec<(String, String)>,
+    checked: usize,
+    not_checked: usize,
+}
+
+impl ValueCheck<'_> {
+    /// Walks an entity (and the objects nested in it) and records the key values that are not
+    /// visible, up to `MAX_CHECKED_VALUES`. `in_offers` is true below an `offers` property.
+    fn values(&mut self, object: &Map<String, Value>, path: &str, in_offers: bool) {
+        for (key, value) in object.iter().filter(|(key, _)| !key.starts_with('@')) {
+            let key_path = format!("{path}.{key}");
+            let checked = if KEY_PROPERTIES.contains(&key.as_str()) || (key == "price" && in_offers) {
+                Some((key.as_str(), key_path.clone()))
+            } else if key == "author" && value.is_string() {
+                Some(("name", format!("{key_path}.name")))
+            } else {
+                None
+            };
+            if let Some((property, label)) = checked {
+                for leaf in leaves(value) {
+                    if self.checked >= MAX_CHECKED_VALUES {
+                        self.not_checked += 1;
+                        continue;
+                    }
+                    self.checked += 1;
+                    if !self.visible.contains(property, &leaf) {
+                        self.invisible.push((label.clone(), leaf));
+                    }
                 }
             }
-        }
-        let nested_in_offers = in_offers || key == "offers";
-        for nested in nested_objects(value) {
-            check_values(nested, &key_path, nested_in_offers, visible, invisible);
+            let nested_in_offers = in_offers || key == "offers";
+            for nested in nested_objects(value) {
+                self.values(nested, &key_path, nested_in_offers);
+            }
         }
     }
 }
@@ -807,6 +878,53 @@ mod tests {
             ],
             "the phone and postal code match by their digits, the price as a number; properties in key order"
         );
+    }
+
+    #[test]
+    fn the_title_and_the_declared_site_name_count_as_shown() {
+        // What SEO plugins emit on every page: the WebPage is named by the title, the WebSite by
+        // the site name, and neither has to be in the body text.
+        let document = Html::parse_document(
+            r#"<html><head><title>Pricing - Example</title><meta property="og:site_name" content="Example Ltd">
+            <script type="application/ld+json">{"@context":"https://schema.org","@graph":[
+              {"@type":"WebPage","name":"Pricing - Example"},{"@type":"WebSite","name":"Example Ltd"},
+              {"@type":"Product","name":"Hidden product"}]}</script></head><body><h1>Pricing</h1></body></html>"#,
+        );
+        assert_eq!(
+            existing(&document, "Pricing").invisible_values,
+            [("Product.name".to_string(), "Hidden product".to_string())]
+        );
+    }
+
+    #[test]
+    fn nested_types_count_for_duplicates_and_empty_blocks_are_no_errors() {
+        let markup = existing(
+            &jsonld_page(&[
+                r#"{"@type":"WebSite","name":"Text","publisher":{"@type":"Organization","name":"Text","logo":{"@type":"ImageObject"}}}"#,
+                "  ",
+            ]),
+            "Text",
+        );
+        assert_eq!(markup.jsonld_types, ["WebSite"]);
+        assert_eq!(markup.nested_types, ["Organization", "ImageObject"]);
+        assert!(markup.parse_errors.is_empty(), "{:?}", markup.parse_errors);
+        assert!(markup.declares("Organization") && markup.declares("WebSite"));
+        assert!(!markup.declares("Product"));
+        let microdata = existing(
+            &Html::parse_document(r#"<div itemscope itemtype="https://schema.org/Product"></div>"#),
+            "",
+        );
+        assert!(microdata.declares("Product"));
+    }
+
+    #[test]
+    fn the_number_of_checked_values_is_capped() {
+        let names: Vec<String> = (0..MAX_CHECKED_VALUES + 50)
+            .map(|i| format!(r#"{{"@type":"Product","name":"Hidden {i}"}}"#))
+            .collect();
+        let markup = existing(&jsonld_page(&[&format!("[{}]", names.join(","))]), "Nothing");
+        assert_eq!(markup.invisible_values.len(), MAX_CHECKED_VALUES);
+        assert_eq!(markup.values_not_checked, 50);
     }
 
     #[test]
