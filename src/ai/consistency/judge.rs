@@ -10,14 +10,14 @@
 // replaces prose that mentions a number absent from the group (or a word the report never uses).
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::ai::grounding::{ValueKey, find_token_bounded, numbers_in, snippet_of};
+use crate::ai::grounding::{ValueKey, find_token_bounded, number_strings_in, snippet_of};
 use crate::ai::normalize::json_list;
 use crate::ai::prompt::sanitize_for_prompt;
 use crate::ai::provider::{ChatMessage, ChatRequest};
@@ -849,21 +849,22 @@ fn validate_prose(mut r: ReviewResult, name: &str, input: &str) -> (ReviewResult
         .filter(|b| !b.is_empty())
         .take(MAX_BENIGN)
         .collect();
-    // The numbers of the group, and each group of digits on its own ("+420" of "+420 800 123 456").
-    let mut allowed = numbers_in(input, "");
+    // The numbers of the group, and each group of digits on its own ("+420" of "+420 800 123 456"),
+    // compared exactly: a phone number or an identifier differing in its last digits is foreign.
+    let mut allowed: HashSet<String> = number_strings_in(input, "").into_iter().collect();
     allowed.extend(
         input
             .split(|c: char| !c.is_ascii_digit())
-            .filter_map(|digits| digits.parse::<f64>().ok()),
+            .filter(|digits| !digits.is_empty())
+            .flat_map(|digits| number_strings_in(digits, "")),
     );
-    let known = |n: f64| allowed.iter().any(|a| (a - n).abs() <= 1e-9 * a.abs().max(1.0));
     let prose: Vec<&String> = [&r.title, &r.explanation, &r.check]
         .into_iter()
         .chain(&r.benign)
         .collect();
     let foreign = prose
         .iter()
-        .any(|text| numbers_in(text, "").into_iter().any(|n| !known(n)));
+        .any(|text| number_strings_in(text, "").iter().any(|n| !allowed.contains(n)));
     let missing = r.title.is_empty() || r.explanation.is_empty() || r.check.is_empty();
     if missing || foreign || prose.iter().any(|text| has_forbidden_word(text)) {
         r.title = default_title(name);
@@ -1467,6 +1468,32 @@ mod tests {
         assert!(replaced, "421 is in no value");
         let (_, replaced) = validate_prose(result("Linka 999 je jiná."), "Linka", input);
         assert!(replaced, "999 is in no value");
+    }
+
+    #[test]
+    fn a_long_number_in_the_prose_must_be_exactly_one_of_the_group() {
+        let input = "<group id=\"1\">\n<value id=\"1\">\n<text>+420800123456</text>\n</value>\n<value id=\"2\">\n<text>+420800123465</text>\n</value>\n<value id=\"3\">\n<text>123456789012</text>\n</value>\n<value id=\"4\">\n<text>12345678901234567890</text>\n</value>\n</group>";
+        let result = |title: &str| ReviewResult {
+            group: 1,
+            values: vec![1, 2],
+            confidence: "possibly_inconsistent".to_string(),
+            priority: "medium".to_string(),
+            title: title.to_string(),
+            explanation: "The listed numbers differ.".to_string(),
+            benign: Vec::new(),
+            check: "Verify the numbers on the contact pages.".to_string(),
+        };
+        for (title, foreign) in [
+            ("Customer line +420800123499 differs", true),
+            ("Company ID 123456789013 differs", true),
+            ("Account 12345678901234567891 differs", true),
+            ("Customer line +420800123465 differs", false),
+            ("Company ID 123456789012 differs", false),
+            ("Account 12345678901234567890 differs", false),
+        ] {
+            let (_, replaced) = validate_prose(result(title), "Linka", input);
+            assert_eq!(replaced, foreign, "{title}");
+        }
     }
 
     /// Two reviewed groups: the phone case as group 7 (a third value from /reklamace again), and

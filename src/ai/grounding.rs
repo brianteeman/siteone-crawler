@@ -1028,20 +1028,30 @@ pub fn parse_number(value: &str, lang: &str) -> Option<ValueKey> {
 /// `parse_number`). An ambiguous number (`1.290` without a language) yields both readings;
 /// a malformed one (`25.9.2026`) yields its digit groups. Signs are not read.
 pub fn numbers_in(text: &str, lang: &str) -> Vec<f64> {
+    number_strings_in(text, lang)
+        .iter()
+        .filter_map(|number| number.parse::<f64>().ok())
+        .collect()
+}
+
+/// `numbers_in` as canonical decimal strings (`1 290,50` → `1290.5` with `cs`, `0800` → `800`):
+/// exact, so two long numbers (a phone number, an identifier) that differ in their last digits
+/// never compare equal, as they may as `f64`.
+pub fn number_strings_in(text: &str, lang: &str) -> Vec<String> {
     let decimal = decimal_separator(lang);
     let mut out = Vec::new();
     for token in numerals(text) {
         match parse_numeral(token, decimal) {
-            Numeral::Value(value) => out.extend(value.parse::<f64>().ok()),
+            Numeral::Value(value) => out.push(value),
             Numeral::Ambiguous(decimal_reading, thousands_reading) => {
-                out.extend(decimal_reading.parse::<f64>().ok());
-                out.extend(thousands_reading.parse::<f64>().ok());
+                out.push(decimal_reading);
+                out.push(thousands_reading);
             }
             Numeral::Invalid => out.extend(
                 token
                     .split(|c: char| !c.is_ascii_digit())
                     .filter(|run| !run.is_empty())
-                    .filter_map(|run| run.parse::<f64>().ok()),
+                    .map(|run| canonical(run, "")),
             ),
         }
     }
@@ -2013,6 +2023,19 @@ mod tests {
             "{ambiguous:?}"
         );
         assert!(numbers_in("no numbers here", "en").is_empty());
+    }
+
+    #[test]
+    fn number_strings_are_exact_and_canonical() {
+        assert_eq!(number_strings_in("1 290,50 Kč a 4,59 %", "cs"), ["1290.5", "4.59"]);
+        assert_eq!(number_strings_in("0800 a 25.9.2026", "cs"), ["800", "25", "9", "2026"]);
+        assert_eq!(number_strings_in("1.290 Kč", ""), ["1.29", "1290"]);
+        // Long numbers keep every digit.
+        assert_ne!(
+            number_strings_in("+420800123456", ""),
+            number_strings_in("+420800123499", "")
+        );
+        assert_eq!(number_strings_in("12345678901234567891", ""), ["12345678901234567891"]);
     }
 
     #[test]
