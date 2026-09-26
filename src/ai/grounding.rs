@@ -196,6 +196,118 @@ pub fn extend_over_operator(text: &str, span: (usize, usize)) -> (usize, usize) 
     extended
 }
 
+/// The span of a number value in `text`, widened so that the value keeps the meaning the page
+/// gives it: over a sign joined to it (`-5 %`, `−5 %`), over the other end of a range it is one
+/// end of (`10 %` or `5` of `5–10 %` → `5–10 %`, `20 EUR` of `10 EUR – 20 EUR`), and then over an
+/// operator before it (`extend_over_operator`). A dash is a sign only when it touches the number
+/// and follows no letter or digit (`COVID-19` has no `-19`, `Sleva – 5 %` no `-5 %`); a dash
+/// between two numbers is a range unless the two ends name different units (`290 Kč – 10 GB` is
+/// no range). A span that is not a range of `text` is returned as it is.
+pub fn extend_number_span(text: &str, span: (usize, usize)) -> (usize, usize) {
+    let (Some(before), Some(value), Some(after)) = (text.get(..span.0), text.get(span.0..span.1), text.get(span.1..))
+    else {
+        return span;
+    };
+    let (mut start, mut end) = span;
+    let value_unit = unit_suffix(value).map(|(_, unit)| unit);
+
+    // Left: the lower end of a range, or a sign.
+    let left = before.trim_end_matches(char::is_whitespace);
+    if let Some(dash) = left.chars().next_back().filter(|&c| is_dash(c)) {
+        let pre = left.get(..left.len() - dash.len_utf8()).unwrap_or_default();
+        let low = pre.trim_end_matches(char::is_whitespace);
+        let (body, low_unit) = match unit_suffix(low) {
+            Some((at, unit)) => (low.get(..at).unwrap_or_default().trim_end(), Some(unit)),
+            None => (low, None),
+        };
+        let low_start = numeral_spans(body).find(|r| r.end == body.len()).map(|r| r.start);
+        match low_start {
+            Some(at) if units_agree(value_unit, low_unit) => {
+                start = at
+                    - body
+                        .get(..at)
+                        .and_then(|head| head.chars().next_back())
+                        .filter(|c| matches!(c, '€' | '$' | '£'))
+                        .map_or(0, char::len_utf8);
+            }
+            Some(_) => {}
+            None if left.len() == before.len()
+                && value.starts_with(|c: char| c.is_ascii_digit())
+                && !pre.chars().next_back().is_some_and(char::is_alphanumeric) =>
+            {
+                start = pre.len();
+            }
+            None => {}
+        }
+    }
+
+    // Right: the upper end of a range.
+    let right = after.trim_start_matches(char::is_whitespace);
+    if let Some(dash) = right.chars().next().filter(|&c| is_dash(c)) {
+        let rest = right.get(dash.len_utf8()..).unwrap_or_default().trim_start();
+        let rest = rest.strip_prefix(['€', '$', '£']).unwrap_or(rest);
+        if rest.starts_with(|c: char| c.is_ascii_digit()) {
+            let high_end = text.len() - rest.len() + scan_numeral(rest, 0);
+            let tail = text.get(high_end..).unwrap_or_default();
+            let spaced = tail.trim_start_matches(char::is_whitespace);
+            let high_unit = unit_prefix(spaced);
+            let agree = match (value_unit, high_unit) {
+                (Some(a), Some((_, b))) => a == b,
+                (Some(_), None) => false,
+                (None, _) => true,
+            };
+            if agree {
+                end = high_end + high_unit.map_or(0, |(len, _)| tail.len() - spaced.len() + len);
+            }
+        }
+    }
+    extend_over_operator(text, (start, end))
+}
+
+fn is_dash(c: char) -> bool {
+    matches!(c, '-' | '–' | '—' | '−')
+}
+
+/// The two ends of a range agree on their units unless both name one and they differ.
+fn units_agree(a: Option<&str>, b: Option<&str>) -> bool {
+    a.zip(b).is_none_or(|(a, b)| a == b)
+}
+
+/// A currency or `%` (`UNITS`) that `s` ends with, as a whole word: where it starts, and its
+/// canonical unit. The longest one wins.
+fn unit_suffix(s: &str) -> Option<(usize, &'static str)> {
+    UNITS
+        .iter()
+        .filter_map(|(word, unit)| {
+            let chars = word.chars().count();
+            let (at, _) = s.char_indices().rev().nth(chars.checked_sub(1)?)?;
+            let tail = s.get(at..)?;
+            let joined = s
+                .get(..at)
+                .and_then(|head| head.chars().next_back())
+                .is_some_and(char::is_alphabetic);
+            (tail.to_lowercase() == *word && !(word.starts_with(char::is_alphabetic) && joined))
+                .then_some((at, *unit, chars))
+        })
+        .max_by_key(|(_, _, chars)| *chars)
+        .map(|(at, unit, _)| (at, unit))
+}
+
+/// A currency or `%` (`UNITS`) that `s` starts with, as a whole word: its length in bytes, and
+/// its canonical unit.
+fn unit_prefix(s: &str) -> Option<(usize, &'static str)> {
+    UNITS.iter().find_map(|(word, unit)| {
+        let chars = word.chars().count();
+        let len = s.char_indices().nth(chars).map_or(s.len(), |(at, _)| at);
+        let head = s.get(..len)?;
+        let runs_on = s.get(len..).is_some_and(|rest| rest.starts_with(char::is_alphabetic));
+        (head.chars().count() == chars
+            && head.to_lowercase() == *word
+            && !(word.ends_with(char::is_alphabetic) && runs_on))
+            .then_some((len, *unit))
+    })
+}
+
 /// Locate a value the model quoted from a block: `value` as a whole token of `block` (see
 /// `find_token_bounded`, checked against the block's text, not the quote's edges) inside an
 /// occurrence of `quote` in `block`, both compared after `normalize_for_match`. Returns the
@@ -941,13 +1053,18 @@ enum Numeral {
 
 /// The numerals of `text` (digits with their thousands and decimal separators), in order.
 fn numerals(text: &str) -> impl Iterator<Item = &str> {
+    numeral_spans(text).filter_map(|span| text.get(span))
+}
+
+/// The byte ranges of the numerals of `text`, in order.
+fn numeral_spans(text: &str) -> impl Iterator<Item = Range<usize>> + '_ {
     let mut next = 0;
     text.char_indices().filter_map(move |(at, ch)| {
         if at < next || !ch.is_ascii_digit() {
             return None;
         }
         next = scan_numeral(text, at);
-        text.get(at..next)
+        Some(at..next)
     })
 }
 
@@ -1449,6 +1566,43 @@ mod tests {
         );
         // An out-of-range span is returned as it is.
         assert_eq!(extend_over_operator("abc", (2, 9)), (2, 9));
+    }
+
+    #[test]
+    fn a_sign_and_the_other_end_of_a_range_are_part_of_a_number() {
+        let extended = |text: &str, value: &str| {
+            let start = text.rfind(value).expect("value");
+            let (a, b) = extend_number_span(text, (start, start + value.len()));
+            text[a..b].to_string()
+        };
+        // A sign joined to the number.
+        assert_eq!(extended("Annual return -5 %", "5 %"), "-5 %");
+        assert_eq!(extended("Annual return −5 %", "5 %"), "−5 %");
+        assert_eq!(extended("(-5 %)", "5 %"), "-5 %");
+        // The other end of a range, with or without spaces and units.
+        assert_eq!(extended("Interest 5–10 %", "10 %"), "5–10 %");
+        assert_eq!(extended("Interest 1 290 - 1 490 Kč", "1 490 Kč"), "1 290 - 1 490 Kč");
+        assert_eq!(extended("Price 10 EUR – 20 EUR", "20 EUR"), "10 EUR – 20 EUR");
+        assert_eq!(extended("Interest 5–10 % p.a.", "5"), "5–10 %");
+        assert_eq!(extended("Doručení 1–2 dny", "1"), "1–2");
+        // An operator before the range still belongs to it.
+        assert_eq!(extended("Úrok od 5–10 %", "10 %"), "od 5–10 %");
+        // Not a sign or a range: a dash between words, a separating dash, a hyphenated word.
+        assert_eq!(extended("Sleva – 5 %", "5 %"), "5 %");
+        assert_eq!(extended("COVID-19", "19"), "19");
+        assert_eq!(extended("Wi-Fi 6", "6"), "6");
+        assert_eq!(extended("Cena 290 Kč", "290 Kč"), "290 Kč");
+        // The extended values read with their meaning.
+        assert_eq!(
+            parse_number(&extended("Annual return -5 %", "5 %"), "en"),
+            Some(ValueKey::Exact("num:-5:%:".to_string()))
+        );
+        assert_eq!(
+            parse_number(&extended("Interest 5–10 %", "10 %"), "en"),
+            Some(ValueKey::Exact("range:5-10:%:".to_string()))
+        );
+        // An out-of-range span is returned as it is.
+        assert_eq!(extend_number_span("abc", (2, 9)), (2, 9));
     }
 
     #[test]
