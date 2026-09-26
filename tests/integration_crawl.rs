@@ -7334,3 +7334,361 @@ fn ai_geo_without_a_model_still_reports_policy_and_access() {
     assert_eq!(issue["kind"], "ai");
     assert!(events_of(&events, "aiRequest").is_empty(), "no request was sent");
 }
+
+/// The prompt id (`B12`) of the block of `html` whose text is `text`.
+fn geo_block(html: &str, text: &str) -> String {
+    let blocks = siteone_crawler::ai::blocks::blocks_from_html(html);
+    let block = blocks
+        .iter()
+        .find(|block| block.text == text)
+        .unwrap_or_else(|| panic!("no block {text:?} in {blocks:?}"));
+    format!("B{}", block.id + 1)
+}
+
+/// The routed model answers for the GEO fixture site: the FAQ page with its question and answer
+/// blocks, the article with its byline blocks, and a plain answer for every other page.
+fn geo_routes() -> (Vec<MockRoute>, Vec<MockResponse>) {
+    let answer = |content: serde_json::Value| chat_response(200, chat_answer(&content.to_string()));
+    let faq = |text: &str| geo_block(GEO_FAQ, text);
+    let article = |text: &str| geo_block(GEO_ARTICLE, text);
+    let routes = vec![
+        MockRoute {
+            envelope: "<page_data>",
+            marker: Some("/faq</url>"),
+            response: answer(serde_json::json!({
+                "page_type": "faq",
+                "main_topic": "Delivery and returns of Acme garden tools",
+                "states_offer_early": true,
+                "questions": [
+                    {"question": "How long does delivery take?", "answered": "yes",
+                     "blocks": [faq("Delivery takes 3 working days.")]},
+                    {"question": "Do you ship abroad?", "answered": "no", "blocks": []}
+                ],
+                "vague_references": [],
+                "improvements": [],
+                "lead": "",
+                "lead_blocks": [],
+                "faq_pairs": [
+                    {"question": faq("How long does delivery take?"), "answer": [faq("Delivery takes 3 working days.")]},
+                    {"question": faq("Can I return a tool?"), "answer": [faq("Yes, within 30 days of purchase.")]}
+                ],
+                "byline": {"author": "", "date": ""},
+                "entity_drafts": []
+            })),
+        },
+        MockRoute {
+            envelope: "<page_data>",
+            marker: Some("/blog/first-post</url>"),
+            response: answer(serde_json::json!({
+                "page_type": "article",
+                "main_topic": "How to sharpen a garden spade",
+                "states_offer_early": true,
+                "questions": [{"question": "Which file should I use?", "answered": "partly",
+                               "blocks": [article("A sharp spade cuts roots easily. File the edge at a 45 degree angle.")]}],
+                "vague_references": [],
+                "improvements": [],
+                "lead": "File the edge of a spade at a 45 degree angle.",
+                "lead_blocks": [article("A sharp spade cuts roots easily. File the edge at a 45 degree angle.")],
+                "faq_pairs": [],
+                "byline": {"author": article("Jane Smith"), "date": article("1 September 2026")},
+                "entity_drafts": []
+            })),
+        },
+    ];
+    let fallback = vec![answer(serde_json::json!({
+        "page_type": "other",
+        "main_topic": "A page of Acme garden tools",
+        "states_offer_early": "not_applicable",
+        "questions": []
+    }))];
+    (routes, fallback)
+}
+
+#[test]
+fn ai_geo_end_to_end() {
+    const KEY: &str = "sk-SENTINEL-geo-0123456789";
+    let tmp = TempDir::new("ai-geo-e2e");
+    let server = geo_site();
+    let (routes, fallback) = geo_routes();
+    let mock = MockLlm::start_routed(routes, fallback);
+    let report_dir = tmp.path.join("reports");
+    let events_path = tmp.path.join("events.ndjson");
+    let endpoint = format!("--ai-endpoint={}", mock.url());
+    let key = format!("--ai-api-key={KEY}");
+    let report = format!("--ai-report-dir={}", report_dir.display());
+    let events = format!("--events-file={}", events_path.display());
+    let output = crawl_geo(
+        &server,
+        &[
+            "--ai-provider=openai-compatible",
+            endpoint.as_str(),
+            "--ai-model=m",
+            key.as_str(),
+            "--ai-geo",
+            report.as_str(),
+            events.as_str(),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+
+    // The report triple and the kit directory, one stem.
+    let names = geo_outputs(&report_dir);
+    assert_eq!(names.len(), 4, "{names:?}\n{stderr}");
+    let stem = names
+        .iter()
+        .find(|name| name.ends_with(".md"))
+        .and_then(|name| name.strip_suffix(".md"))
+        .expect("the Markdown report")
+        .to_string();
+    let run = stem.strip_prefix("ai-geo.").expect("the stem");
+    let kit_name = format!("ai-geo-kit.{run}");
+    assert_eq!(
+        names,
+        vec![
+            kit_name.clone(),
+            format!("{stem}.html"),
+            format!("{stem}.json"),
+            format!("{stem}.md")
+        ]
+    );
+    let kit = report_dir.join(&kit_name);
+    assert!(kit.is_dir(), "the kit is a directory");
+    let read =
+        |path: std::path::PathBuf| std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let md = read(report_dir.join(format!("{stem}.md")));
+    let html = read(report_dir.join(format!("{stem}.html")));
+    let json_text = read(report_dir.join(format!("{stem}.json")));
+    let json: serde_json::Value = serde_json::from_str(&json_text).expect("the JSON report");
+    assert_eq!(json["schema"], "siteone-crawler/ai-geo/2");
+    let category = |id: &str| -> serde_json::Value {
+        json["categories"]
+            .as_array()
+            .expect("categories")
+            .iter()
+            .find(|category| category["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no category {id}"))
+    };
+    let issues = json["issues"].as_array().expect("issues");
+    let issue_pages = |category: &str, status: &str| -> Vec<String> {
+        issues
+            .iter()
+            .filter(|issue| issue["category"] == category && issue["status"] == status)
+            .flat_map(|issue| issue["pages"].as_array().cloned().unwrap_or_default())
+            .filter_map(|page| page.as_str().map(str::to_string))
+            .collect()
+    };
+    let url = |path: &str| format!("{}{}", server.url(), path.trim_start_matches('/'));
+
+    // Crawler policy: OAI-SearchBot is blocked, with the deciding rule.
+    assert_eq!(category("crawlerPolicy")["status"], "problem");
+    let agents = json["policy"][0]["agents"].as_array().expect("agents");
+    let oai = agents
+        .iter()
+        .find(|agent| agent["token"] == "OAI-SearchBot")
+        .expect("OAI-SearchBot");
+    assert_eq!(oai["access"], "blocked");
+    assert_eq!(oai["rule"], "User-agent: OAI-SearchBot → Disallow: /");
+    assert!(
+        md.contains("User-agent: OAI-SearchBot → Disallow: /"),
+        "the rule in the Markdown"
+    );
+
+    // Observed access: the key page answering 403.
+    assert_eq!(category("observedAccess")["status"], "problem");
+    let denied = json["access"]["issues"]
+        .as_array()
+        .expect("access issues")
+        .iter()
+        .find(|issue| issue["kind"] == "denied")
+        .expect("a denied key page");
+    assert_eq!(denied["url"], url("/private"));
+
+    // Indexing controls: the noindex page.
+    assert_eq!(category("indexingControls")["status"], "problem");
+    assert!(
+        issue_pages("indexingControls", "problem").contains(&url("/hidden")),
+        "{json_text}"
+    );
+    let hidden = json["controls"]["pages"]
+        .as_array()
+        .expect("controls")
+        .iter()
+        .find(|page| page["url"] == url("/hidden"))
+        .expect("the controls of /hidden");
+    assert_eq!(hidden["google"]["noindex"], true);
+
+    // Structured data: the invalid JSON-LD of the homepage.
+    assert_eq!(category("structuredData")["status"], "problem");
+    let homepage = json["structured"]
+        .as_array()
+        .expect("structured")
+        .iter()
+        .find(|page| page["isHomepage"] == true)
+        .expect("the homepage markup");
+    assert_eq!(homepage["parseErrors"].as_array().map(Vec::len), Some(1), "{homepage}");
+
+    // Rendering: the app shell.
+    assert_eq!(category("rendering")["status"], "attention");
+    let risks: Vec<&str> = json["render"]["risks"]
+        .as_array()
+        .expect("risks")
+        .iter()
+        .filter_map(|risk| risk["url"].as_str())
+        .collect();
+    assert_eq!(risks, vec![url("/app")]);
+
+    // The per-page analysis ran on every HTML page.
+    assert_eq!(
+        category("answerExtractability")["status"]
+            .as_str()
+            .map(|s| s != "notAssessed"),
+        Some(true)
+    );
+    assert_eq!(json["meta"]["analyzedPages"], 5, "{json_text}");
+    assert_eq!(json["failedPages"].as_array().map(Vec::len), Some(0), "{json_text}");
+
+    // The kit: the training block without Allow, no proposal (the trailing ruleless group), and
+    // the README saying why.
+    let snippet = read(kit.join("robots/block-ai-training.snippet.txt"));
+    assert!(snippet.contains("User-agent: GPTBot\nDisallow: /"), "{snippet}");
+    assert!(
+        !snippet
+            .lines()
+            .any(|line| line.trim_start().to_ascii_lowercase().starts_with("allow")),
+        "{snippet}"
+    );
+    assert!(
+        !kit.join("robots/robots.proposed.txt").exists(),
+        "the proposal is withheld"
+    );
+    let readme = read(kit.join("README.md"));
+    assert!(
+        readme.contains("robots.proposed.txt was not generated: robots.txt ends with a group without rules"),
+        "{readme}"
+    );
+
+    // The FAQ markup from the page's blocks.
+    let faq: serde_json::Value =
+        serde_json::from_str(&read(kit.join("jsonld/page-faq-faq.json"))).expect("the FAQ JSON-LD");
+    assert_eq!(faq["@type"], "FAQPage");
+    let questions: Vec<(&str, &str)> = faq["mainEntity"]
+        .as_array()
+        .expect("mainEntity")
+        .iter()
+        .map(|q| {
+            (
+                q["name"].as_str().unwrap_or_default(),
+                q["acceptedAnswer"]["text"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        questions,
+        vec![
+            ("How long does delivery take?", "Delivery takes 3 working days."),
+            ("Can I return a tool?", "Yes, within 30 days of purchase."),
+        ]
+    );
+    assert!(read(kit.join("jsonld/page-faq-faq.html")).starts_with("<script type=\"application/ld+json\">"));
+
+    // The article with its verified author and date.
+    let article: serde_json::Value =
+        serde_json::from_str(&read(kit.join("jsonld/page-blog-first-post-article.json"))).expect("the Article JSON-LD");
+    assert_eq!(article["@type"], "BlogPosting");
+    assert_eq!(article["headline"], "How to sharpen a spade");
+    assert_eq!(article["author"]["name"], "Jane Smith");
+    assert_eq!(article["datePublished"], "2026-09-01");
+
+    // The Organization claims the brand's LinkedIn page, not the founder's profile, which the
+    // manifest lists as a possible profile.
+    let organization: serde_json::Value =
+        serde_json::from_str(&read(kit.join("jsonld/site-organization.json"))).expect("the Organization");
+    assert_eq!(organization["name"], "Acme");
+    assert_eq!(
+        organization["sameAs"],
+        serde_json::json!(["https://www.linkedin.com/company/acme"])
+    );
+    let manifest = read(kit.join("jsonld/_manifest.json"));
+    assert!(
+        manifest.contains("https://www.linkedin.com/in/jane-founder"),
+        "{manifest}"
+    );
+    assert!(!organization.to_string().contains("jane-founder"));
+
+    // Every kit file the report lists exists, and the report links into the kit directory.
+    let kit_files: Vec<&str> = json["kitFiles"]
+        .as_array()
+        .expect("kitFiles")
+        .iter()
+        .filter_map(|file| file.as_str())
+        .collect();
+    assert!(
+        kit_files.contains(&"llms.txt") && kit_files.contains(&"leads.md"),
+        "{kit_files:?}"
+    );
+    for file in &kit_files {
+        assert!(kit.join(file).is_file(), "{file}");
+    }
+    assert!(
+        md.contains(&format!("{kit_name}/README.md")),
+        "the report links the kit"
+    );
+
+    // The events announce the three report files and the kit directory; the page analysis runs to
+    // its end.
+    let text = std::fs::read_to_string(&events_path).expect("the event file");
+    let events: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("one JSON object per line"))
+        .collect();
+    assert_no_nulls(&events);
+    let artifacts: Vec<&serde_json::Value> = events_of(&events, "artifact")
+        .into_iter()
+        .filter(|artifact| artifact["kind"].as_str().is_some_and(|kind| kind.starts_with("ai-geo")))
+        .collect();
+    assert_eq!(artifacts.len(), 4, "{artifacts:?}");
+    for (kind, directory) in [
+        ("ai-geo-md", false),
+        ("ai-geo-json", false),
+        ("ai-geo-html", false),
+        ("ai-geo-kit", true),
+    ] {
+        let artifact = artifacts
+            .iter()
+            .find(|artifact| artifact["kind"] == kind)
+            .unwrap_or_else(|| panic!("no {kind}"));
+        let path = Path::new(artifact["path"].as_str().expect("a path"));
+        assert_eq!(path.is_dir(), directory, "{artifact}");
+        assert!(path.exists(), "{artifact}");
+    }
+    assert_eq!(
+        artifacts
+            .iter()
+            .find(|a| a["kind"] == "ai-geo-kit")
+            .map(|a| a["label"].clone()),
+        Some(serde_json::json!("AI search readiness kit"))
+    );
+    assert_eq!(assert_progress_runs_to_the_end(&events, "geo:pages"), 5);
+    for request in events_of(&events, "aiRequest") {
+        assert_eq!(request["task"], "geo:pages", "{request}");
+    }
+
+    // The configured key appears nowhere.
+    let mut texts: Vec<(String, String)> = vec![
+        ("stdout".to_string(), stdout),
+        ("stderr".to_string(), stderr),
+        ("events".to_string(), text),
+        ("md".to_string(), md),
+        ("json".to_string(), json_text),
+        ("html".to_string(), html),
+    ];
+    for file in &kit_files {
+        texts.push((file.to_string(), read(kit.join(file))));
+    }
+    for (name, text) in &texts {
+        assert!(!text.contains(KEY), "the key in {name}");
+    }
+}

@@ -24,6 +24,7 @@ use crate::engine::parsed_url::ParsedUrl;
 use crate::error::{CrawlerError, CrawlerResult};
 use crate::export::ai_consistency_exporter::AiConsistencyExporter;
 use crate::export::ai_elaborate_exporter::AiElaborateExporter;
+use crate::export::ai_geo_exporter::AiGeoExporter;
 use crate::export::ai_profile_exporter::AiProfileExporter;
 use crate::export::ai_report_exporter::AiReportExporter;
 #[cfg(feature = "browser")]
@@ -682,6 +683,33 @@ impl Manager {
                 crate::events::emit_ai_issue("AI consistency export failed", &msg);
                 if let Ok(st) = status.lock() {
                     st.add_critical_to_summary(consistency_exporter.get_name(), &msg);
+                }
+            }
+        }
+
+        // The AI search readiness report (Markdown + JSON + HTML) and its kit directory, published
+        // together, when the `--ai-geo` pipeline produced a document.
+        let has_geo_doc = status.lock().ok().is_some_and(|st| st.get_ai_geo_doc().is_some());
+        if has_geo_doc {
+            let run_id = format!(
+                "{}-{}",
+                chrono::Local::now().format("%Y-%m-%d.%H-%M-%S.%3f"),
+                std::process::id()
+            );
+            let (report, kit_dir) =
+                AiGeoExporter::paths(&options.ai_report_dir, &options.get_initial_host(false), &run_id);
+            let mut geo_exporter = AiGeoExporter::new(report, kit_dir);
+            let export_result = match (status.lock(), output.lock()) {
+                (Ok(st), Ok(out)) => geo_exporter.export(&st, &**out),
+                _ => Err(crate::error::CrawlerError::Export(
+                    "Cannot lock crawler state for AI search readiness export".to_string(),
+                )),
+            };
+            if let Err(error) = export_result {
+                let msg = format!("AI search readiness export failed: {}", error);
+                crate::events::emit_ai_issue("AI search readiness export failed", &msg);
+                if let Ok(st) = status.lock() {
+                    st.add_critical_to_summary(geo_exporter.get_name(), &msg);
                 }
             }
         }
