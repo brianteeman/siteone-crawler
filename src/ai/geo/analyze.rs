@@ -9,6 +9,7 @@
 // and an entity value must occur in its block on token boundaries. What fails a check is dropped
 // and counted, never repaired.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::NaiveDate;
@@ -712,12 +713,13 @@ fn choose_blocks(
     }
     let offered_ids: HashSet<usize> = offered.iter().map(|block| block.id).collect();
     let mut order: Vec<&Block> = offered.to_vec();
-    order.sort_by(|a, b| {
-        let first = |block: &Block| Some(block.id) == h1;
-        first(b)
-            .cmp(&first(a))
-            .then_with(|| block_score(b, first_after_h1).cmp(&block_score(a, first_after_h1)))
-            .then_with(|| a.id.cmp(&b.id))
+    // The H1 first, then by score (each block scored once), then in document order.
+    order.sort_by_cached_key(|block| {
+        (
+            Reverse(Some(block.id) == h1),
+            Reverse(block_score(block, first_after_h1)),
+            block.id,
+        )
     });
     let cap = room / 4;
     let mut chosen: BTreeMap<usize, (String, bool)> = BTreeMap::new();
@@ -1419,6 +1421,29 @@ mod tests {
         let analysis = verify_analysis(raw, &page, &blocks, &coverage);
         assert_eq!(analysis.vague_references.len(), 1);
         assert_eq!(analysis.rejected.block_ids, 1);
+    }
+
+    #[test]
+    fn a_large_page_over_the_budget_is_selected_quickly() {
+        let mut html = String::from("<html lang=\"cs\"><body><main><h1>Velká stránka</h1>");
+        for i in 0..3_000 {
+            // Scores in no particular order, so that a comparison sort compares ~n·log n times.
+            if (i * 7_919) % 5 < 2 {
+                html.push_str(&format!("<p>Tarif {i} stojí 1 290 Kč měsíčně.</p>"));
+            } else {
+                html.push_str(&format!("<p>Odstavec {} o službě bez cen.</p>", "x".repeat(i % 50)));
+            }
+        }
+        html.push_str("</main></body></html>");
+        let (page, blocks) = page_of(&html);
+        let started = std::time::Instant::now();
+        let (req, coverage) = request(&page, &blocks, false, 12 * 1024);
+        let elapsed = started.elapsed();
+        assert!(user(&req).len() <= 12 * 1024);
+        assert!(!coverage.is_complete());
+        // Each block is scored once: a comparison sort that re-scores both sides of every
+        // comparison runs the fact-signal regexes tens of thousands of times here.
+        assert!(elapsed.as_secs_f64() < 3.0, "{elapsed:?}");
     }
 
     #[test]
