@@ -9,6 +9,7 @@ pub mod agents;
 pub mod analyze;
 pub mod controls;
 pub mod discovery;
+pub mod findings;
 pub mod jsonld;
 pub mod keys;
 pub mod prompts;
