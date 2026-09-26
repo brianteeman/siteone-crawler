@@ -81,8 +81,14 @@ pub struct Status {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "state", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum RobotsFetchState {
-    /// A 2xx answer (after redirects), with its body.
-    Ok { status: i32, content: String },
+    /// A 2xx answer (after redirects), with its body decoded as UTF-8. When `valid_utf8` is false
+    /// the file is not UTF-8 as RFC 9309 requires: the invalid bytes became U+FFFD, so rules with
+    /// them cannot be evaluated exactly and `content` is not the served file byte for byte.
+    Ok {
+        status: i32,
+        content: String,
+        valid_utf8: bool,
+    },
     /// A 4xx answer other than 429: there is no robots.txt.
     NotFound { status: i32 },
     /// A 429 or 5xx answer, a timeout, a network error or a redirect loop.

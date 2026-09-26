@@ -6004,6 +6004,28 @@ fn robots_txt_fetch_state_is_ok_with_the_content() {
         RobotsFetchState::Ok {
             status: 200,
             content: "User-agent: *\nDisallow: /private/\n".to_string(),
+            valid_utf8: true,
+        }
+    );
+}
+
+#[test]
+fn robots_txt_fetch_state_flags_a_file_that_is_not_utf8() {
+    use siteone_crawler::result::status::RobotsFetchState;
+
+    // Latin-1 "é": RFC 9309 requires UTF-8, so the text cannot be kept byte for byte.
+    let server = RecordingServer::start(vec![Route {
+        path: "/robots.txt",
+        headers: vec![("Content-Type", "text/plain".to_string())],
+        body: b"User-agent: *\nDisallow: /caf\xe9/\n".to_vec(),
+    }]);
+
+    assert_eq!(
+        robots_fetch_state(&server.url(), &[]),
+        RobotsFetchState::Ok {
+            status: 200,
+            content: "User-agent: *\nDisallow: /caf\u{fffd}/\n".to_string(),
+            valid_utf8: false,
         }
     );
 }
@@ -6083,6 +6105,7 @@ fn robots_txt_fetch_state_follows_redirects_and_reports_a_loop() {
         RobotsFetchState::Ok {
             status: 200,
             content: "User-agent: *\nDisallow: /x/\n".to_string(),
+            valid_utf8: true,
         }
     );
 

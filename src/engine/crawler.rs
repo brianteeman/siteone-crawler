@@ -1579,6 +1579,7 @@ impl Crawler {
                         RobotsFetchState::Ok {
                             status: 200,
                             content: body_str.into_owned(),
+                            valid_utf8: std::str::from_utf8(body_bytes).is_ok(),
                         },
                     );
                 }
@@ -1622,6 +1623,10 @@ impl Crawler {
                     return RobotsFetchState::Ok {
                         status: code,
                         content: resp.body_text().unwrap_or_default(),
+                        valid_utf8: resp
+                            .body
+                            .as_deref()
+                            .is_none_or(|body| std::str::from_utf8(body).is_ok()),
                     };
                 }
                 300..=399 => resp.get_header("location").and_then(|location| {

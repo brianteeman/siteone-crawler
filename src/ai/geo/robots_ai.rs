@@ -1156,6 +1156,7 @@ User-agent d\nDisallow: /4\nAllowed: /4/open\nDisallow /5 extra\nsite-map: https
         let ok = RobotsFetchState::Ok {
             status: 200,
             content: "User-agent: *\nDisallow: /x\n".into(),
+            valid_utf8: true,
         };
         assert!(state_is_known(&ok));
         assert!(robots_of(&ok).is_some_and(|robots| !robots.is_allowed("anybot", "/x/1")));
@@ -1206,6 +1207,7 @@ User-agent d\nDisallow: /4\nAllowed: /4/open\nDisallow /5 extra\nsite-map: https
             "example.com" => RobotsFetchState::Ok {
                 status: 200,
                 content: "User-agent: OAI-SearchBot\nDisallow: /\n".into(),
+                valid_utf8: true,
             },
             "blog.example.com" => RobotsFetchState::NotFound { status: 404 },
             _ => RobotsFetchState::NotAttempted,
