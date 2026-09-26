@@ -89,8 +89,14 @@ pub struct RecordingServer {
 
 impl RecordingServer {
     pub fn start(routes: Vec<Route>) -> Self {
+        Self::start_with(|_| routes)
+    }
+
+    /// Like `start`, with routes that need the server's port (e.g. an absolute `Location`).
+    pub fn start_with(routes: impl FnOnce(u16) -> Vec<Route>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a free port");
         let port = listener.local_addr().expect("a bound address").port();
+        let routes = routes(port);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let (recorded, stopped) = (requests.clone(), stop.clone());

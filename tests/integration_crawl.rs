@@ -7692,3 +7692,89 @@ fn ai_geo_end_to_end() {
         assert!(!text.contains(KEY), "the key in {name}");
     }
 }
+
+/// The homepage redirects to its `www` variant, where the key pages are: their robots.txt (which
+/// blocks OAI-SearchBot on `/blog/`) is read and decides the crawler policy, not only the robots.txt
+/// of the initial origin.
+#[test]
+fn ai_geo_reads_the_robots_txt_of_the_origin_the_homepage_redirects_to() {
+    let tmp = TempDir::new("ai-geo-www");
+    let server = RecordingServer::start_with(|port| {
+        let html = |path: &'static str, body: &str| Route {
+            path,
+            headers: vec![("Content-Type", "text/html; charset=utf-8".to_string())],
+            body: body.as_bytes().to_vec(),
+        };
+        vec![
+            Route {
+                path: "/robots.txt",
+                headers: vec![("Content-Type", "text/plain".to_string())],
+                body: b"User-agent: OAI-SearchBot\nDisallow: /blog/\n".to_vec(),
+            },
+            Route {
+                path: "/",
+                headers: vec![
+                    ("Status", "301 Moved Permanently".to_string()),
+                    ("Location", format!("http://www.acme.test:{port}/home")),
+                ],
+                body: Vec::new(),
+            },
+            html(
+                "/home",
+                "<html lang=\"en\"><head><title>Acme</title></head><body><main><h1>Acme</h1><p>Garden tools.</p><a href=\"/blog/post\">Post</a></main></body></html>",
+            ),
+            html(
+                "/blog/post",
+                "<html lang=\"en\"><head><title>Post</title></head><body><main><h1>Post</h1><p>Text of the post.</p></main></body></html>",
+            ),
+        ]
+    });
+    let port = server.port();
+    let report_dir = tmp.path.join("reports");
+    let output = run_crawler(&[
+        "--config-file=/dev/null",
+        &format!("--url=http://acme.test:{port}/"),
+        &format!("--resolve=acme.test:{port}:127.0.0.1"),
+        &format!("--resolve=www.acme.test:{port}:127.0.0.1"),
+        LOCAL_ANALYZERS,
+        "--http-cache-dir=",
+        "--no-color",
+        "--ai-cache-dir=",
+        "--ai-provider=openai",
+        "--ai-model=gpt-test",
+        "--ai-api-key-env=SITEONE_GEO_TEST_KEY_THAT_IS_NOT_SET",
+        "--ai-geo",
+        &format!("--ai-report-dir={}", report_dir.display()),
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    let json_path = geo_outputs(&report_dir)
+        .into_iter()
+        .find(|name| name.ends_with(".json"))
+        .map(|name| report_dir.join(name))
+        .expect("the JSON report");
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(json_path).expect("the report")).expect("JSON");
+    let www = json["policy"]
+        .as_array()
+        .expect("policy")
+        .iter()
+        .find(|origin| origin["origin"] == format!("http://www.acme.test:{port}"))
+        .unwrap_or_else(|| panic!("no policy of the www origin: {}", json["policy"]));
+    assert_eq!(www["robotsTxt"]["state"], "ok", "{www}");
+    let oai = www["agents"]
+        .as_array()
+        .expect("agents")
+        .iter()
+        .find(|agent| agent["token"] == "OAI-SearchBot")
+        .expect("OAI-SearchBot");
+    assert_eq!(oai["access"], "partly", "{oai}");
+    assert_eq!(oai["rule"], "User-agent: OAI-SearchBot → Disallow: /blog/");
+    let policy = json["categories"]
+        .as_array()
+        .expect("categories")
+        .iter()
+        .find(|category| category["id"] == "crawlerPolicy")
+        .expect("crawlerPolicy");
+    assert_eq!(policy["status"], "problem", "{policy}");
+}

@@ -49,7 +49,7 @@ use crate::ai::report::locale::ReportLocale;
 use crate::ai::selection::build_candidates;
 use crate::options::core_options::CoreOptions;
 use crate::output::output::Output;
-use crate::result::status::Status;
+use crate::result::status::{RobotsFetchState, Status};
 use crate::types::ContentTypeId;
 use crate::utils;
 
@@ -80,6 +80,8 @@ const EST_BYTES_PER_TOKEN: f64 = 2.5;
 const EST_PAGE_OUT: (usize, usize) = (400, 1_500);
 /// A homepage `og:site_name` longer than this is not taken for the site's name.
 const MAX_SITE_NAME_CHARS: usize = 60;
+/// At most this many origins get their robots.txt fetched after the crawl.
+const MAX_ROBOTS_FETCHES: usize = 10;
 
 static OG_SITE_NAME_SELECTOR: Lazy<Selector> =
     Lazy::new(|| Selector::parse(r#"meta[property="og:site_name"][content]"#).unwrap());
@@ -144,6 +146,33 @@ fn with_homepage<T>(ranked: &[T], max: usize, is_homepage: impl Fn(&T) -> bool) 
         chosen.insert(0, homepage);
     }
     chosen
+}
+
+/// The origins `(scheme, host, port)` of the key pages whose robots.txt the crawl did not fetch,
+/// homepage first, at most `MAX_ROBOTS_FETCHES`. The crawler reads the robots.txt of the initial
+/// URL only, while the homepage may redirect to its `www` or `https` variant, where the key pages
+/// then are; the manager fetches these before `run`, so each origin is judged by its own file.
+pub fn robots_origins_to_fetch(status: &Status, include: &[String], exclude: &[String]) -> Vec<(String, String, u16)> {
+    let mut origins: Vec<(String, String, u16)> = Vec::new();
+    for page in key_pages(status, include, exclude) {
+        let Ok(url) = url::Url::parse(&page.url) else {
+            continue;
+        };
+        let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
+            continue;
+        };
+        let origin = (url.scheme().to_string(), host.to_string(), port);
+        if origins.contains(&origin)
+            || status.get_robots_txt_state(&origin.0, &origin.1, port) != RobotsFetchState::NotAttempted
+        {
+            continue;
+        }
+        origins.push(origin);
+        if origins.len() == MAX_ROBOTS_FETCHES {
+            break;
+        }
+    }
+    origins
 }
 
 /// `scheme://host[:port]` as `url::Url::origin` writes it (no default port).
@@ -748,6 +777,53 @@ async fn analyze_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::geo::test_support::{add, new_status, page};
+    use crate::result::visited_url::{SOURCE_A_HREF, SOURCE_INIT_URL, SOURCE_REDIRECT};
+
+    #[test]
+    fn the_robots_txt_of_a_key_page_origin_without_a_state_is_to_be_fetched() {
+        let mut status = new_status();
+        add(
+            &mut status,
+            page(
+                "init",
+                "",
+                SOURCE_INIT_URL,
+                "http://example.com/",
+                301,
+                Some("https://www.example.com/"),
+            ),
+            None,
+        );
+        add(
+            &mut status,
+            page("home", "init", SOURCE_REDIRECT, "https://www.example.com/", 200, None),
+            None,
+        );
+        add(
+            &mut status,
+            page(
+                "about",
+                "home",
+                SOURCE_A_HREF,
+                "https://www.example.com/about",
+                200,
+                None,
+            ),
+            None,
+        );
+        // The crawl fetched the robots.txt of the initial origin only.
+        status.set_robots_txt_state("http", "example.com", 80, RobotsFetchState::NotFound { status: 404 });
+        assert_eq!(
+            robots_origins_to_fetch(&status, &[], &[]),
+            vec![("https".to_string(), "www.example.com".to_string(), 443)]
+        );
+        status.set_robots_txt_state("https", "www.example.com", 443, RobotsFetchState::Skipped);
+        assert!(
+            robots_origins_to_fetch(&status, &[], &[]).is_empty(),
+            "every origin has a state"
+        );
+    }
 
     #[test]
     fn the_homepage_is_always_among_the_chosen_pages() {

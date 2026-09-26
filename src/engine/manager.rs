@@ -303,6 +303,18 @@ impl Manager {
         // AI search readiness is its own pipeline (may run alongside the others, or alone); its
         // deterministic checks run even when the AI configuration fails.
         if options.ai_geo {
+            // The crawl reads the robots.txt of the initial origin only; the key pages may lie on
+            // the origin the homepage redirects to (www, https), whose own robots.txt decides.
+            if !options.ai_dry_run {
+                let origins = crawler
+                    .get_status()
+                    .lock()
+                    .map(|st| crate::ai::geo::robots_origins_to_fetch(&st, &options.ai_include, &options.ai_exclude))
+                    .unwrap_or_default();
+                for (scheme, host, port) in origins {
+                    crawler.fetch_robots_txt(&host, port, &scheme).await;
+                }
+            }
             crate::ai::geo::run(options.as_ref(), crawler.get_status(), crawler.get_output()).await;
         }
         if options.ai_enabled && runs_ai {
