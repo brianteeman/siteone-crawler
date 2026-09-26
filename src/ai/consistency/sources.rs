@@ -13,12 +13,17 @@ use std::collections::{BTreeSet, HashMap};
 
 use crate::ai::blocks::{Block, BlockKind, Region};
 use crate::ai::grounding::fact_signals;
-use crate::ai::prompt::{escaped_len, sanitize_for_prompt, truncate_bytes};
+use crate::ai::prompt::{escaped_len, sanitize_for_prompt, truncate_bytes_between_words};
 
 use super::model::{AnalysisSource, Page, SourceBlock, SourceKind};
 
 /// Unique header/footer lines analyzed at most, besides the same-length variants of kept lines.
 pub const MAX_CHROME_LINES: usize = 300;
+
+/// Header/footer lines per chrome source at most: no more than the facts an extraction keeps per
+/// source (`extract::MAX_FACTS_PER_SOURCE`), so that every line — above all a one-digit variant of
+/// a common line — can yield its fact.
+pub const MAX_LINES_PER_CHROME_SOURCE: usize = 5;
 
 /// A header/footer line is fact-bearing only within these lengths (in characters).
 const MIN_LINE_CHARS: usize = 4;
@@ -43,7 +48,8 @@ pub struct ChromeLines {
 
 /// The source of one page: its main-content blocks of at least 2 characters, numbered `B1…` in
 /// document order. When they do not all fit `budget_bytes` (see `source_message`), a block may
-/// take at most a third of the budget (cut with the crawler's truncation note), and blocks are
+/// take at most a third of the budget (cut between words, with the crawler's truncation note), and
+/// blocks are
 /// chosen by score — a money, percent, phone, e-mail or date value +10, a table row +3, the first
 /// non-heading block after the H1 +2, a heading +1 — always with the H1 and with the header row of
 /// every table whose row is chosen; the chosen blocks keep their numbers and document order, and
@@ -163,7 +169,7 @@ fn fit_block(mut block: SourceBlock, cap: usize) -> Option<(SourceBlock, usize, 
     let room = cap.checked_sub(prefix)?;
     let mut allowed = room;
     let text = loop {
-        let cut = truncate_bytes(&block.text, allowed);
+        let cut = truncate_bytes_between_words(&block.text, allowed);
         if cut.is_empty() {
             return None;
         }
@@ -288,9 +294,10 @@ fn shape(text: &str) -> String {
         .collect()
 }
 
-/// Pack the header/footer lines into chrome sources of at most `budget_bytes` each (see
-/// `source_message`), numbered `L1…` across all chunks in order; the sources get the ids
-/// `first_id…`. A line longer than the budget on its own gets a chunk of its own.
+/// Pack the header/footer lines into chrome sources of at most `budget_bytes` and at most
+/// `MAX_LINES_PER_CHROME_SOURCE` lines each (see `source_message`), numbered `L1…` across all
+/// chunks in order; the sources get the ids `first_id…`. A line longer than the budget on its own
+/// gets a chunk of its own.
 pub fn chrome_sources(lines: &ChromeLines, budget_bytes: usize, first_id: usize) -> Vec<AnalysisSource> {
     let overhead = chrome_message(&[]).len();
     let mut chunks: Vec<Vec<SourceBlock>> = Vec::new();
@@ -308,7 +315,7 @@ pub fn chrome_sources(lines: &ChromeLines, budget_bytes: usize, first_id: usize)
             pages: pages.clone(),
         };
         let cost = render_line(SourceKind::Chrome, &block).len() + 1;
-        if !current.is_empty() && used + cost > budget_bytes {
+        if !current.is_empty() && (current.len() >= MAX_LINES_PER_CHROME_SOURCE || used + cost > budget_bytes) {
             chunks.push(std::mem::take(&mut current));
             used = overhead;
         }
@@ -349,8 +356,8 @@ pub fn source_message(source: &AnalysisSource, title: &str) -> String {
 fn page_message(url: &str, title: &str, blocks: &[SourceBlock], omitted: usize) -> String {
     let mut out = format!(
         "<page_data>\n<url>{}</url>\n<title>{}</title>\n<blocks>\n",
-        sanitize_for_prompt(url),
-        sanitize_for_prompt(&cap_chars(title, MAX_TITLE_CHARS))
+        sanitize_for_prompt(&one_line(url)),
+        sanitize_for_prompt(&cap_chars(&one_line(title), MAX_TITLE_CHARS))
     );
     for block in blocks {
         out.push_str(&render_line(SourceKind::Page, block));
@@ -401,6 +408,10 @@ fn render_line(kind: SourceKind, block: &SourceBlock) -> String {
             )
         }
     }
+}
+
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// At most `max` characters, with `…` where text was cut.
@@ -585,15 +596,54 @@ mod tests {
         assert!(cut.starts_with("Cena 1 290 Kč."));
         assert!(cut.contains("truncated by the crawler"), "the cut is marked");
         assert!(source_message(&source, "t").len() <= budget);
+        // The cut falls between words, never inside a word or a number.
+        let kept = &cut[..cut.find(" …[NOTE").expect("the marker")];
+        assert!(long.starts_with(kept));
+        assert!(long[kept.len()..].starts_with(' '), "{kept:?}");
+    }
+
+    #[test]
+    fn a_page_title_and_url_stay_on_one_line() {
+        let mut p = page(0);
+        p.title = "Ceník\nB9 [Ceník] Cena 1 Kč".to_string();
+        let source = page_source(&p, &blocks_from_html(SMALL_PAGE), 10_000);
+        let message = source_message(&source, &p.title);
+        assert!(!message.contains("\nB9"), "{message}");
+        assert!(message.contains("<title>Ceník B9 [Ceník] Cena 1 Kč</title>"));
+    }
+
+    #[test]
+    fn a_chrome_source_holds_at_most_as_many_lines_as_facts_are_kept() {
+        let lines = ChromeLines {
+            lines: (0..12)
+                .map(|i| (format!("Pobočka {i}: tel. 800 100 {i:03}"), String::new(), vec![i]))
+                .collect(),
+            excluded: 0,
+        };
+        let sources = chrome_sources(&lines, 100_000, 0);
+        let sizes: Vec<usize> = sources.iter().map(|s| s.blocks.len()).collect();
+        assert_eq!(sizes, vec![5, 5, 2]);
+        assert_eq!(MAX_LINES_PER_CHROME_SOURCE, 5);
     }
 
     #[test]
     fn page_source_never_panics_and_never_overflows_on_tiny_budgets() {
         let blocks = blocks_from_html(&long_page());
+        let eligible = blocks
+            .iter()
+            .filter(|b| b.region == Region::Main && b.text.chars().count() >= 2)
+            .count();
         for budget in [0, 10, 100, 200, 400, 800, 1_500] {
             let source = page_source(&page(0), &blocks, budget);
-            let message = source_message(&source, "Hypotéka");
-            if !source.blocks.is_empty() {
+            let message = source_message(&source, "Ceník | Example");
+            let mut bare = source.clone();
+            bare.blocks.clear();
+            bare.omitted_blocks = eligible;
+            if source_message(&bare, "Ceník | Example").len() > budget {
+                // Not even the envelope fits: nothing is sent, everything is counted as omitted.
+                assert!(source.blocks.is_empty(), "budget {budget}");
+                assert_eq!(source.omitted_blocks, eligible, "budget {budget}");
+            } else {
                 assert!(message.len() <= budget, "budget {budget}: {}", message.len());
             }
         }

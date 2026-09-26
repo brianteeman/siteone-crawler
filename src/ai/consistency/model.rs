@@ -334,6 +334,8 @@ pub struct Occurrence {
     pub qualifiers: String,
     /// The crawler's text around the value, from the cited block.
     pub evidence: String,
+    /// The byte range of the value within `evidence` (the cited copy of a repeated value).
+    pub value_span: (usize, usize),
     pub heading_path: Vec<String>,
     /// The pages showing this occurrence.
     pub pages: Vec<usize>,

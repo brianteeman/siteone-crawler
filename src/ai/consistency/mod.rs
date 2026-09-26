@@ -177,6 +177,7 @@ mod tests {
                     value_key: ValueKey::Exact(format!("num:{text}")),
                     qualifiers: format!("{} {id}", WORDS.repeat(4)),
                     evidence: format!("{} {text} {}", WORDS.repeat(3), WORDS.repeat(3)),
+                    value_span: (WORDS.repeat(3).len() + 1, WORDS.repeat(3).len() + 1 + text.len()),
                     heading_path: vec![WORDS.repeat(2), format!("{WORDS} {id}")],
                     pages: vec![id],
                 });

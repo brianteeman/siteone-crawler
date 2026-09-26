@@ -490,12 +490,14 @@ impl Components {
         i
     }
 
-    /// Put the labels into one group; a non-empty `name` becomes its name.
+    /// Put the labels into one group; when that merged anything, a non-empty `name` becomes its
+    /// name.
     fn merge(&mut self, labels: &[usize], name: &str) {
         let Some(&first) = labels.first() else {
             return;
         };
         let mut root = self.find(first);
+        let mut merged = false;
         for &label in &labels[1..] {
             let other = self.find(label);
             if other == root {
@@ -507,8 +509,9 @@ impl Components {
                 self.names.entry(keep).or_insert(old);
             }
             root = keep;
+            merged = true;
         }
-        if labels.len() > 1 && !name.trim().is_empty() {
+        if merged && !name.trim().is_empty() {
             self.names.insert(root, name.to_string());
         }
     }
@@ -555,6 +558,7 @@ mod tests {
             value_key: ValueKey::Exact(format!("text:{value}")),
             qualifiers: String::new(),
             evidence: value.to_string(),
+            value_span: (0, value.len()),
             heading_path: Vec::new(),
             pages: vec![id],
         }
@@ -923,6 +927,15 @@ mod tests {
         assert_eq!(outcome.keys.len(), 1);
         assert_eq!(outcome.keys[0].occurrence_ids, vec![9]);
         assert_eq!(outcome.keys[0].name, "Tarif – cena");
+    }
+
+    #[tokio::test]
+    async fn a_group_that_merges_nothing_names_nothing() {
+        let items: Vec<LabelItem> = (0..3).map(|i| item(&format!("Tarif {i}"), "cena", i)).collect();
+        let ask = |_: usize, _: Vec<LabelItem>| std::future::ready(Ok(vec![(vec![2, 2], "Renamed".to_string())]));
+        let outcome = group_key(AttributeKey::Price, items, 100_000, 400, ask).await;
+        let names: Vec<&str> = outcome.keys.iter().map(|k| k.name.as_str()).collect();
+        assert_eq!(names, vec!["Tarif 0 – cena", "Tarif 1 – cena", "Tarif 2 – cena"]);
     }
 
     #[test]

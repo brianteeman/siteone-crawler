@@ -93,6 +93,23 @@ const FORBIDDEN_WORDS: &[&str] = &[
     "špatného",
     "špatnou",
     "špatném",
+    "nesprávně",
+    "nesprávný",
+    "nesprávná",
+    "nesprávné",
+    "nesprávného",
+    "nesprávnou",
+    "nesprávném",
+    "nesprávnému",
+    "nesprávnými",
+    "nesprávných",
+    "mylně",
+    "mylný",
+    "mylná",
+    "mylné",
+    "mylného",
+    "mylnou",
+    "mylném",
     "nepravdivé",
     "nepravdivý",
     "nepravdivá",
@@ -495,7 +512,12 @@ fn render_with(
                 out.push_str(&format!("<path>{}</path>", path.join(" > ")));
             }
             if detail.evidence_chars > 0 {
-                let span = find_token_bounded(&lead.evidence, &lead.value).unwrap_or((0, 0));
+                let (a, b) = lead.value_span;
+                let span = if lead.evidence.get(a..b).is_some_and(|v| !v.is_empty()) {
+                    lead.value_span
+                } else {
+                    find_token_bounded(&lead.evidence, &lead.value).unwrap_or((0, 0))
+                };
                 let evidence = snippet_of(&lead.evidence, span, detail.evidence_chars);
                 out.push_str(&format!("<evidence>{}</evidence>", sanitize_for_prompt(&evidence)));
             }
@@ -869,6 +891,7 @@ mod tests {
             value_key: ValueKey::Exact(format!("tel:{}", value.replace(' ', ""))),
             qualifiers: String::new(),
             evidence: format!("Zákaznická linka {value}"),
+            value_span: ("Zákaznická linka ".len(), "Zákaznická linka ".len() + value.len()),
             heading_path: vec!["Kontakt".to_string()],
             pages: vec![source],
         }
@@ -1242,6 +1265,29 @@ mod tests {
     }
 
     #[test]
+    fn reduced_evidence_still_shows_the_cited_copy_of_a_repeated_value() {
+        let text = format!("Basic 290 Kč. {}Premium 290 Kč měsíčně.", "x ".repeat(40));
+        let mut premium = o(0, 1, "290 Kč");
+        premium.evidence = text.clone();
+        let at = text.rfind("290 Kč").unwrap();
+        premium.value_span = (at, at + "290 Kč".len());
+        let mut other = o(1, 2, "390 Kč");
+        other.value_key = ValueKey::Exact("num:390".to_string());
+        let occ = vec![premium, other];
+        let (candidates, _) = split_keys(&[fact_key(0, AttributeKey::Price, &[0, 1])], &occ);
+        let full = render_group(1, &candidates[0], &occ, &sources(), &pages());
+        let reduced = render_group_within(1, &candidates[0], &occ, &sources(), &pages(), full.len() - 1);
+        assert!(reduced.len() < full.len());
+        let evidence = reduced
+            .split("<evidence>")
+            .nth(1)
+            .and_then(|e| e.split("</evidence>").next())
+            .expect("evidence");
+        assert!(evidence.contains("Premium 290 Kč"), "{evidence}");
+        assert!(!evidence.contains("Basic"), "{evidence}");
+    }
+
+    #[test]
     fn pack_batches_respects_the_byte_and_the_group_limits() {
         let rendered: Vec<String> = (0..30)
             .map(|i| format!("<group id=\"{i}\">\n{}\n</group>", "ž".repeat(50 + i * 20)))
@@ -1487,6 +1533,12 @@ mod tests {
             "The values differ; the terror of errands is correct."
         ));
         assert!(has_forbidden_word("Nepravdivé údaje"));
+        assert!(has_forbidden_word("Nesprávně uvedené číslo"));
+        assert!(has_forbidden_word("Číslo je uvedeno mylně."));
+        assert!(
+            !has_forbidden_word("Rozdíl by mohl zákazníky uvést v omyl."),
+            "an impact, not a verdict"
+        );
     }
 
     #[test]

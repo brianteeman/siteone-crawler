@@ -122,8 +122,9 @@ pub fn find_token_bounded(hay: &str, needle: &str) -> Option<(usize, usize)> {
 }
 
 /// A label (a subject or an attribute of a fact) reduced for comparing names: decomposed (NFKD)
-/// with the diacritics dropped, lowercased, every char that is not a letter or a digit turned into
-/// a space, whitespace collapsed and trimmed. `Zákaznická  linka!` → `zakaznicka linka`.
+/// with the diacritics dropped, lowercased, `+` read as the word `plus`, every other char that is
+/// not a letter or a digit turned into a space, whitespace collapsed and trimmed.
+/// `Zákaznická  linka!` → `zakaznicka linka`, `Tarif S+` → `tarif s plus`.
 pub fn normalize_label(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut gap = false;
@@ -134,11 +135,65 @@ pub fn normalize_label(s: &str) -> String {
             }
             gap = false;
             out.push(c);
+        } else if c == '+' {
+            // `Tarif S+` is another variant than `Tarif S`.
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str("plus");
+            gap = true;
         } else {
             gap = true;
         }
     }
     out
+}
+
+/// The span of a number value in `text`, extended over an operator written right before it (`od`,
+/// `do`, `from`, `up to`, `nad`, `více než`, `<`, `≥`, … — the operators `parse_number` reads) and
+/// over a `+` right after a final digit (`18+`), so that the value keeps the meaning the page gives
+/// it: `od 18 let` is not `do 18 let`. A word operator must stand apart from the word before it
+/// and from the value; a symbol may touch the value (`≥18`). A span that is not a range of `text`
+/// is returned as it is.
+pub fn extend_over_operator(text: &str, span: (usize, usize)) -> (usize, usize) {
+    let (start, end) = span;
+    let (Some(before), Some(value)) = (text.get(..start), text.get(start..end)) else {
+        return span;
+    };
+    let trimmed = before.trim_end();
+    let spaced = trimmed.len() < before.len();
+    let mut extended = (start, end);
+    let mut longest = 0;
+    for (word, _) in OPERATORS {
+        let chars = word.chars().count();
+        let Some((at, _)) = trimmed.char_indices().rev().nth(chars.saturating_sub(1)) else {
+            continue;
+        };
+        let tail = trimmed.get(at..).unwrap_or_default();
+        if tail.to_lowercase() != *word || chars <= longest {
+            continue;
+        }
+        let alphabetic = word.starts_with(char::is_alphabetic);
+        let joined = trimmed
+            .get(..at)
+            .unwrap_or_default()
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric);
+        if alphabetic && (joined || !spaced) {
+            continue;
+        }
+        longest = chars;
+        extended.0 = at;
+    }
+    let after = text.get(end..).unwrap_or_default();
+    if value.ends_with(|c: char| c.is_ascii_digit())
+        && let Some(rest) = after.strip_prefix('+')
+        && !rest.starts_with(char::is_alphanumeric)
+    {
+        extended.1 = end + 1;
+    }
+    extended
 }
 
 /// Locate a value the model quoted from a block: `value` as a whole token of `block` (see
@@ -1159,22 +1214,30 @@ pub fn date_mentions(text: &str) -> HashSet<NaiveDate> {
 /// boundaries where possible and marked with `…` where text was left out. A span that is not a
 /// valid range of `block_text` is treated as the start of the block.
 pub fn snippet_of(block_text: &str, value_span: (usize, usize), max_chars: usize) -> String {
-    if block_text.chars().count() <= max_chars {
-        return block_text.to_string();
-    }
+    snippet_with_span(block_text, value_span, max_chars).0
+}
+
+/// `snippet_of`, together with the byte range of the value within the snippet (`(0, 0)` when the
+/// span was not a valid range of `block_text`), so a later, shorter snippet can be cut around the
+/// same copy of a value that occurs more than once.
+pub fn snippet_with_span(block_text: &str, value_span: (usize, usize), max_chars: usize) -> (String, (usize, usize)) {
     let (start, end) = match value_span {
         (start, end) if start <= end && block_text.get(start..end).is_some() => (start, end),
         _ => (0, 0),
     };
+    if block_text.chars().count() <= max_chars {
+        return (block_text.to_string(), (start, end));
+    }
     let value = block_text.get(start..end).unwrap_or_default();
     let value_chars = value.chars().count();
     // Room for the context and the two ellipses.
     let Some(budget) = max_chars.checked_sub(value_chars + 2) else {
         let kept: String = value.chars().take(max_chars.saturating_sub(1)).collect();
         return if max_chars == 0 {
-            String::new()
+            (String::new(), (0, 0))
         } else {
-            format!("{kept}…")
+            let len = kept.len();
+            (format!("{kept}…"), (0, len))
         };
     };
     let before = block_text.get(..start).unwrap_or_default();
@@ -1208,12 +1271,13 @@ pub fn snippet_of(block_text: &str, value_span: (usize, usize), max_chars: usize
     {
         to = end + space;
     }
-    format!(
-        "{}{}{}",
-        if cut_left { "…" } else { "" },
-        block_text.get(from..to).unwrap_or_default().trim(),
-        if cut_right { "…" } else { "" }
-    )
+    let window = block_text.get(from..to).unwrap_or_default();
+    let kept = window.trim();
+    let kept_from = from + (window.len() - window.trim_start().len());
+    let prefix = if cut_left { "…" } else { "" };
+    let at = prefix.len() + start.saturating_sub(kept_from);
+    let snippet = format!("{prefix}{kept}{}", if cut_right { "…" } else { "" });
+    (snippet, (at, at + (end - start)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1345,6 +1409,64 @@ mod tests {
         assert_eq!(normalize_label("Tarif 2 · cena/měs."), "tarif 2 cena mes");
         assert_eq!(normalize_label("Straße Größe"), "straße große");
         assert_eq!(normalize_label(" -– "), "");
+    }
+
+    #[test]
+    fn labels_keep_a_plus_apart() {
+        assert_eq!(normalize_label("Tarif S+"), "tarif s plus");
+        assert_ne!(normalize_label("Tarif S+"), normalize_label("Tarif S"));
+        assert_eq!(normalize_label("Premium+ plán"), "premium plus plan");
+        assert_eq!(normalize_label("Tarif S plus"), normalize_label("Tarif S+"));
+    }
+
+    #[test]
+    fn an_operator_before_a_value_is_part_of_it() {
+        let extended = |text: &str, value: &str| {
+            let start = text.find(value).expect("value");
+            let (a, b) = extend_over_operator(text, (start, start + value.len()));
+            text[a..b].to_string()
+        };
+        assert_eq!(extended("Půjčka od 18 let.", "18 let"), "od 18 let");
+        assert_eq!(extended("Půjčka do 18 let.", "18 let"), "do 18 let");
+        assert_eq!(extended("Cena Od 290 Kč", "290 Kč"), "Od 290 Kč");
+        assert_eq!(extended("Vyřídíme až do 30 dnů", "30 dnů"), "až do 30 dnů");
+        assert_eq!(
+            extended("Obsloužili jsme více než 1 000 zákazníků", "1 000"),
+            "více než 1 000"
+        );
+        assert_eq!(extended("Věk < 18", "18"), "< 18");
+        assert_eq!(extended("Věk ≥18", "18"), "≥18");
+        assert_eq!(extended("Vstup 18+ let", "18"), "18+");
+        assert_eq!(extended("Starting at $29", "$29"), "Starting at $29");
+        // Not an operator: a word ending like one, or no operator at all.
+        assert_eq!(extended("Metod 290 Kč", "290 Kč"), "290 Kč");
+        assert_eq!(extended("Kód 290 Kč", "290 Kč"), "290 Kč");
+        assert_eq!(extended("290 Kč", "290 Kč"), "290 Kč");
+        // The extended value reads with its operator.
+        assert_ne!(
+            parse_number(&extended("Půjčka od 18 let.", "18 let"), "cs"),
+            parse_number(&extended("Půjčka do 18 let.", "18 let"), "cs")
+        );
+        // An out-of-range span is returned as it is.
+        assert_eq!(extend_over_operator("abc", (2, 9)), (2, 9));
+    }
+
+    #[test]
+    fn a_snippet_reports_where_the_value_is() {
+        let block = format!(
+            "Basic 290 Kč. {} Premium 290 Kč měsíčně. {}",
+            "a ".repeat(200),
+            "b ".repeat(200)
+        );
+        let start = block.rfind("290 Kč").unwrap();
+        let (snippet, (a, b)) = snippet_with_span(&block, (start, start + "290 Kč".len()), 60);
+        assert_eq!(snippet, snippet_of(&block, (start, start + "290 Kč".len()), 60));
+        assert_eq!(&snippet[a..b], "290 Kč");
+        assert!(snippet[..a].contains("Premium"), "{snippet}");
+        let short = "Basic 290 Kč, Premium 290 Kč";
+        let start = short.rfind("290 Kč").unwrap();
+        let (whole, span) = snippet_with_span(short, (start, start + "290 Kč".len()), 300);
+        assert_eq!((whole.as_str(), span), (short, (start, start + "290 Kč".len())));
     }
 
     #[test]

@@ -9,7 +9,9 @@
 
 use serde_json::Value;
 
-use crate::ai::grounding::{locate_quoted_value, snippet_of, value_key};
+use crate::ai::grounding::{
+    ValueHint, extend_over_operator, locate_quoted_value, normalize_label, snippet_with_span, value_key,
+};
 use crate::ai::normalize::json_list;
 use crate::ai::provider::{ChatMessage, ChatRequest};
 
@@ -90,14 +92,16 @@ fn raw_fact(item: &Value) -> Option<RawFact> {
 /// Keep the facts grounded in `source` as occurrences with the ids `next_id…`: the `block` must be
 /// one of the source's ids (case and surrounding spaces aside), its text must contain the `quote`,
 /// and the `value` must be a whole token inside that quote (`grounding::locate_quoted_value`). The
-/// occurrence takes the page's own spelling of the value, the crawler's text around it as
-/// evidence, the block's heading path (or header/footer label) and page set, and the value's
+/// occurrence takes the page's own spelling of the value — for a number, with an operator written
+/// right before it (`od 18 let`, `18+`, `grounding::extend_over_operator`), even when the model put
+/// that operator into the qualifiers — the crawler's text around it as evidence (with the value's
+/// place in it), the block's heading path (or header/footer label) and page set, and the value's
 /// comparison key read with `lang` and `site_country` (the model's `normalized` form is only a
 /// hint). An unknown `attribute_key` becomes `Other`; `subject`, `attribute` and `qualifiers` get
 /// their whitespace collapsed and are cut to 120, 120 and 200 characters. At most
 /// `MAX_FACTS_PER_SOURCE` facts are kept (the first grounded ones); a repeat of a kept fact (the
-/// same value span with the same key) is skipped. Returns the occurrences and the number of facts
-/// dropped as ungrounded.
+/// same value span with the same key for the same subject) is skipped. Returns the occurrences
+/// and the number of facts dropped as ungrounded.
 pub fn verify_facts(
     raw: Vec<RawFact>,
     source: &AnalysisSource,
@@ -106,43 +110,50 @@ pub fn verify_facts(
     next_id: &mut usize,
 ) -> (Vec<Occurrence>, usize) {
     let mut kept: Vec<Occurrence> = Vec::new();
-    let mut seen: Vec<(String, (usize, usize), AttributeKey)> = Vec::new();
+    let mut seen: Vec<(String, (usize, usize), AttributeKey, String)> = Vec::new();
     let mut ungrounded = 0;
     for fact in raw {
         if kept.len() >= MAX_FACTS_PER_SOURCE {
             break;
         }
+        let attribute_key = AttributeKey::parse(&fact.attribute_key);
+        let hint = attribute_key.value_hint();
         let wanted = fact.block.trim();
         let located = source
             .blocks
             .iter()
             .find(|b| !wanted.is_empty() && b.ref_id.eq_ignore_ascii_case(wanted))
             .and_then(|b| {
-                let span = locate_quoted_value(&b.text, &fact.quote, &fact.value)?;
+                let mut span = locate_quoted_value(&b.text, &fact.quote, &fact.value)?;
+                if hint == ValueHint::Number {
+                    span = extend_over_operator(&b.text, span);
+                }
                 Some((b, span, b.text.get(span.0..span.1)?.to_string()))
             });
         let Some((block, span, value)) = located else {
             ungrounded += 1;
             continue;
         };
-        let attribute_key = AttributeKey::parse(&fact.attribute_key);
-        let identity = (block.ref_id.clone(), span, attribute_key);
+        let subject = clean_label(&fact.subject, MAX_SUBJECT_CHARS);
+        let identity = (block.ref_id.clone(), span, attribute_key, normalize_label(&subject));
         if seen.contains(&identity) {
             continue;
         }
         seen.push(identity);
+        let (evidence, value_span) = snippet_with_span(&block.text, span, EVIDENCE_CHARS);
         kept.push(Occurrence {
             id: *next_id,
             source: source.id,
             region: source.kind,
             block_ref: block.ref_id.clone(),
             attribute_key,
-            subject: clean_label(&fact.subject, MAX_SUBJECT_CHARS),
+            subject,
             attribute: clean_label(&fact.attribute, MAX_ATTRIBUTE_CHARS),
-            value_key: value_key(attribute_key.value_hint(), &value, &fact.normalized, lang, site_country),
+            value_key: value_key(hint, &value, &fact.normalized, lang, site_country),
             value,
             qualifiers: clean_label(&fact.qualifiers, MAX_QUALIFIERS_CHARS),
-            evidence: snippet_of(&block.text, span, EVIDENCE_CHARS),
+            evidence,
+            value_span,
             heading_path: block.heading_path.clone(),
             pages: block.pages.clone(),
         });
@@ -499,6 +510,75 @@ mod tests {
         assert_eq!(ungrounded, 0);
         let keys: Vec<AttributeKey> = kept.iter().map(|o| o.attribute_key).collect();
         assert_eq!(keys, vec![AttributeKey::Price, AttributeKey::Fee]);
+    }
+
+    #[test]
+    fn an_operator_before_a_number_is_kept_in_the_value_and_its_key() {
+        let mut source = page_source();
+        source.blocks = vec![
+            block("B1", "Půjčku poskytujeme od 18 let.", &[], &[2]),
+            block("B2", "Nabídka platí do 18 let.", &[], &[2]),
+            block("B3", "Vstup 18+ let", &[], &[2]),
+            block("B4", "Kontakt od 8 do 18 h", &[], &[2]),
+        ];
+        let raw = vec![
+            fact("B1", "age_limit", "18 let", "od 18 let"),
+            fact("B2", "age_limit", "18 let", "do 18 let"),
+            fact("B3", "age_limit", "18", "Vstup 18"),
+            fact("B4", "opening_hours", "8 do 18 h", "8 do 18 h"),
+        ];
+        let (kept, _) = verify(raw, &source);
+        let values: Vec<&str> = kept.iter().map(|o| o.value.as_str()).collect();
+        assert_eq!(
+            values,
+            vec!["od 18 let", "do 18 let", "18+", "8 do 18 h"],
+            "only numbers take the operator"
+        );
+        assert_eq!(
+            kept[0].value_key,
+            value_key(ValueHint::Number, "od 18 let", "", "cs", Some("CZ"))
+        );
+        assert_ne!(kept[0].value_key, kept[1].value_key, "from 18 is not up to 18");
+        assert_eq!(
+            &kept[0].evidence[kept[0].value_span.0..kept[0].value_span.1],
+            "od 18 let"
+        );
+    }
+
+    #[test]
+    fn the_same_value_for_two_subjects_is_kept_twice() {
+        let mut source = page_source();
+        source.blocks = vec![block("B1", "Zákaznická linka a reklamace: 800 123 456", &[], &[2])];
+        let mut line = fact("B1", "phone", "800 123 456", "800 123 456");
+        line.subject = "Zákaznická linka".to_string();
+        let mut complaints = line.clone();
+        complaints.subject = "Reklamace".to_string();
+        let mut again = line.clone();
+        again.subject = "zákaznická  LINKA".to_string();
+        let (kept, ungrounded) = verify(vec![line, complaints, again], &source);
+        let subjects: Vec<&str> = kept.iter().map(|o| o.subject.as_str()).collect();
+        assert_eq!(subjects, vec!["Zákaznická linka", "Reklamace"]);
+        assert_eq!(ungrounded, 0);
+    }
+
+    #[test]
+    fn the_evidence_marks_the_cited_copy_of_a_repeated_value() {
+        let text = format!("Basic 290 Kč. {}Premium 290 Kč měsíčně.", "x ".repeat(20));
+        let mut source = page_source();
+        source.blocks = vec![block("B1", &text, &[], &[2])];
+        let (kept, _) = verify(vec![fact("B1", "price", "290 Kč", "Premium 290 Kč")], &source);
+        let o = &kept[0];
+        assert_eq!(o.evidence, text, "a short block is its own evidence");
+        assert_eq!(o.value_span.0, text.rfind("290 Kč").unwrap(), "the cited copy");
+        assert_eq!(&o.evidence[o.value_span.0..o.value_span.1], "290 Kč");
+    }
+
+    #[test]
+    fn a_chrome_chunk_never_holds_more_lines_than_facts_are_kept() {
+        assert_eq!(
+            crate::ai::consistency::sources::MAX_LINES_PER_CHROME_SOURCE,
+            MAX_FACTS_PER_SOURCE
+        );
     }
 
     #[test]
