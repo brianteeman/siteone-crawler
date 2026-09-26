@@ -7,3 +7,6 @@
 
 /// Extraction: a few block-grounded facts from one page or one chunk of header/footer lines.
 pub const EXTRACT: &str = include_str!("../../../prompts/consistency/extract.md");
+
+/// Grouping: labels of one attribute key that name the same property of the same subject.
+pub const GROUP: &str = include_str!("../../../prompts/consistency/group.md");

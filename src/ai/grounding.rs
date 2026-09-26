@@ -10,7 +10,7 @@
 //     meaning (`ValueKey::Exact`), and marks an equivalence it cannot be sure of as
 //     `ValueKey::Uncertain`, which may be shown as a difference but never establishes "equal";
 //   - `fact_signals`, `numbers_in`, `date_mentions` and `snippet_of` support block selection,
-//     prose validation and evidence display.
+//     prose validation and evidence display; `normalize_label` compares the names of facts.
 
 use std::collections::HashSet;
 use std::ops::{Range, RangeInclusive};
@@ -18,6 +18,8 @@ use std::ops::{Range, RangeInclusive};
 use chrono::NaiveDate;
 use once_cell::sync::Lazy;
 use regex::Regex;
+use unicode_normalization::UnicodeNormalization;
+use unicode_normalization::char::is_combining_mark;
 
 // ---------------------------------------------------------------------------
 // Normalization and matching
@@ -117,6 +119,26 @@ pub fn find_token_bounded(hay: &str, needle: &str) -> Option<(usize, usize)> {
                 .map_or(1, char::len_utf8);
     }
     None
+}
+
+/// A label (a subject or an attribute of a fact) reduced for comparing names: decomposed (NFKD)
+/// with the diacritics dropped, lowercased, every char that is not a letter or a digit turned into
+/// a space, whitespace collapsed and trimmed. `Zákaznická  linka!` → `zakaznicka linka`.
+pub fn normalize_label(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut gap = false;
+    for c in s.nfkd().filter(|c| !is_combining_mark(*c)).flat_map(char::to_lowercase) {
+        if c.is_alphanumeric() {
+            if gap && !out.is_empty() {
+                out.push(' ');
+            }
+            gap = false;
+            out.push(c);
+        } else {
+            gap = true;
+        }
+    }
+    out
 }
 
 /// Locate a value the model quoted from a block: `value` as a whole token of `block` (see
@@ -1312,6 +1334,17 @@ mod tests {
         let (a, b) = find_token_bounded(text, "290 Kč").expect("the standalone price");
         assert_eq!(a, text.rfind("290 Kč").unwrap());
         assert_eq!(&text[a..b], "290 Kč");
+    }
+
+    #[test]
+    fn labels_normalize_case_diacritics_and_punctuation() {
+        assert_eq!(normalize_label("  Zákaznická  linka! "), "zakaznicka linka");
+        assert_eq!(normalize_label("ZÁKAZNICKÁ\u{a0}LINKA"), "zakaznicka linka");
+        assert_eq!(normalize_label("Hypotéka – úrok (od)"), "hypoteka urok od");
+        assert_eq!(normalize_label("Customer-line / E-mail"), "customer line e mail");
+        assert_eq!(normalize_label("Tarif 2 · cena/měs."), "tarif 2 cena mes");
+        assert_eq!(normalize_label("Straße Größe"), "straße große");
+        assert_eq!(normalize_label(" -– "), "");
     }
 
     #[test]

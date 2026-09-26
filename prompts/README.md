@@ -23,3 +23,5 @@ inside the step's XML envelope, escaped with `sanitize_for_prompt`.
 
 - `extract.md` — a few block-grounded facts from one page (`<page_data>`) or one chunk of
   header/footer lines (`<chrome_data>`).
+- `group.md` — groups the labels of one attribute key (`<labels>`) that name the same property of
+  the same subject.

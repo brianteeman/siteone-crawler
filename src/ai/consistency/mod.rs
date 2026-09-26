@@ -5,9 +5,12 @@
 // figures, identifiers) across the crawled pages and the header/footer lines they share:
 //   sources  — numbered evidence blocks per page, plus the unique fact-bearing header/footer
 //              lines with their exact page sets;
-//   extract  — a few block-grounded facts per source, verified against the crawler's own text.
+//   extract  — a few block-grounded facts per source, verified against the crawler's own text;
+//   keys     — facts grouped per attribute key into keys (same property of the same subject), in
+//              context-sized chunks over several levels.
 
 pub mod extract;
+pub mod keys;
 pub mod model;
 pub mod prompts;
 pub mod sources;

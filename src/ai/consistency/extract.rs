@@ -10,9 +10,7 @@
 use serde_json::Value;
 
 use crate::ai::grounding::{locate_quoted_value, snippet_of, value_key};
-use crate::ai::normalize::{
-    normalize_json_array, normalize_json_response, repair_json, strip_code_fences, strip_think,
-};
+use crate::ai::normalize::json_list;
 use crate::ai::provider::{ChatMessage, ChatRequest};
 
 use super::model::{AnalysisSource, AttributeKey, Occurrence, Page, RawFact, SourceKind};
@@ -63,31 +61,7 @@ pub fn build_extract_request(
 /// objects, and blank template entries (no value and no quote, e.g. an echoed schema), are
 /// skipped; string fields also accept numbers.
 pub fn parse_facts(raw: &str) -> Result<Vec<RawFact>, String> {
-    let cleaned = strip_code_fences(&strip_think(raw));
-    let outer_is_array = cleaned
-        .find(['{', '['])
-        .is_some_and(|at| cleaned.get(at..).is_some_and(|rest| rest.starts_with('[')));
-    for candidate in [
-        normalize_json_array(raw),
-        normalize_json_response(raw),
-        repair_json(raw),
-    ] {
-        let Ok(value) = serde_json::from_str::<Value>(&candidate) else {
-            continue;
-        };
-        let facts = match &value {
-            Value::Array(items) if outer_is_array => items,
-            Value::Object(object) => match object.get("facts") {
-                Some(Value::Array(items)) => items,
-                Some(Value::Null) => return Ok(Vec::new()),
-                Some(_) => return Err("\"facts\" is not an array".to_string()),
-                None => continue,
-            },
-            _ => continue,
-        };
-        return Ok(facts.iter().filter_map(raw_fact).collect());
-    }
-    Err("the answer is not a JSON object with \"facts\"".to_string())
+    Ok(json_list(raw, "facts")?.iter().filter_map(raw_fact).collect())
 }
 
 fn raw_fact(item: &Value) -> Option<RawFact> {
