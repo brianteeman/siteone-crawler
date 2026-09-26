@@ -7,5 +7,7 @@
 //              lines with their exact page sets;
 //   extract  — a few block-grounded facts per source, verified against the crawler's own text.
 
+pub mod extract;
 pub mod model;
+pub mod prompts;
 pub mod sources;

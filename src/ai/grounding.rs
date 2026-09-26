@@ -92,8 +92,9 @@ pub fn contains_normalized(hay: &str, needle: &str) -> bool {
 }
 
 /// Find `needle` in `hay` after normalization, as a whole token: the chars next to the match may
-/// not be a letter or a digit, nor a `.`/`,` joined to a digit (so `5 %` never matches inside
-/// `15 %` or `1,5 %`, and `290` never inside `1.290`). Returns the first such match as a byte range
+/// not be a letter or a digit, nor a `.`/`,` joined to a digit, nor — next to a digit of the match —
+/// a space or an apostrophe joined to a digit (so `5 %` never matches inside `15 %` or `1,5 %`, and
+/// `290` never inside `1.290`, `1 290` or `1'290`). Returns the first such match as a byte range
 /// of the ORIGINAL `hay` (e.g. for `snippet_of`); `None` when there is none or `needle` is empty.
 pub fn find_token_bounded(hay: &str, needle: &str) -> Option<(usize, usize)> {
     let needle = normalize_for_match(needle).text;
@@ -118,18 +119,60 @@ pub fn find_token_bounded(hay: &str, needle: &str) -> Option<(usize, usize)> {
     None
 }
 
+/// Locate a value the model quoted from a block: `value` as a whole token of `block` (see
+/// `find_token_bounded`, checked against the block's text, not the quote's edges) inside an
+/// occurrence of `quote` in `block`, both compared after `normalize_for_match`. Returns the
+/// value's byte range in the ORIGINAL `block`; `None` when the quote is not in the block, or the
+/// value is not a token of it there, or either is empty.
+pub fn locate_quoted_value(block: &str, quote: &str, value: &str) -> Option<(usize, usize)> {
+    let quote = normalize_for_match(quote).text;
+    let value = normalize_for_match(value).text;
+    if quote.is_empty() || value.is_empty() {
+        return None;
+    }
+    let block = normalize_for_match(block);
+    let text = block.text.as_str();
+    let mut from = 0;
+    while let Some(found) = text.get(from..).and_then(|rest| rest.find(&quote)) {
+        let quote_start = from + found;
+        let quote_end = quote_start + quote.len();
+        let mut at = quote_start;
+        while let Some(offset) = text.get(at..quote_end).and_then(|inside| inside.find(&value)) {
+            let start = at + offset;
+            let end = start + value.len();
+            if token_bounded(text, start, end) {
+                return block.original_span(start, end);
+            }
+            at = start + next_char_len(text, start);
+        }
+        from = quote_start + next_char_len(text, quote_start);
+    }
+    None
+}
+
+fn next_char_len(text: &str, at: usize) -> usize {
+    text.get(at..)
+        .and_then(|rest| rest.chars().next())
+        .map_or(1, char::len_utf8)
+}
+
 fn token_bounded(text: &str, start: usize, end: usize) -> bool {
+    let first = text.get(start..).and_then(|rest| rest.chars().next());
+    let last = text.get(..end).and_then(|head| head.chars().next_back());
     let mut before = text.get(..start).unwrap_or_default().chars().rev();
     let mut after = text.get(end..).unwrap_or_default().chars();
-    free_edge(before.next(), before.next()) && free_edge(after.next(), after.next())
+    free_edge(first, before.next(), before.next()) && free_edge(last, after.next(), after.next())
 }
 
 /// A match edge is free when the char next to it is not a letter or a digit, nor a `.`/`,`
-/// followed (away from the match) by a digit.
-fn free_edge(neighbour: Option<char>, beyond: Option<char>) -> bool {
+/// followed (away from the match) by a digit; and, when the match's own edge char is a digit, nor
+/// a space or an apostrophe followed by a digit (a thousands separator: `290` is no token of
+/// `1 290`, `123 456` none of `800 123 456`).
+fn free_edge(edge: Option<char>, neighbour: Option<char>, beyond: Option<char>) -> bool {
     match neighbour {
         Some(c) if c.is_alphanumeric() => false,
         Some('.' | ',') => !beyond.is_some_and(|c| c.is_numeric()),
+        Some(' ' | '\'' | '’') if edge.is_some_and(|c| c.is_numeric()) => !beyond.is_some_and(|c| c.is_numeric()),
         _ => true,
     }
 }
@@ -1249,6 +1292,51 @@ mod tests {
         assert!(find_token_bounded("(5 %)", "5 %").is_some());
         assert!(find_token_bounded("E-mail:info@example.cz.", "info@example.cz").is_some());
         assert_eq!(find_token_bounded("anything", ""), None);
+    }
+
+    #[test]
+    fn a_number_never_matches_across_a_thousands_space() {
+        // A space (or an apostrophe) between digits may be a thousands separator.
+        assert_eq!(find_token_bounded("Premium 1 290 Kč", "290 Kč"), None);
+        assert_eq!(find_token_bounded("Premium 1\u{a0}290 Kč", "290 Kč"), None);
+        assert_eq!(find_token_bounded("Premium 1\u{202f}290 Kč", "290 Kč"), None);
+        assert_eq!(find_token_bounded("Preis 1'290 CHF", "290 CHF"), None);
+        assert_eq!(find_token_bounded("Volejte 800 123 456", "123 456"), None);
+        assert_eq!(find_token_bounded("Volejte 800 123 456", "800 123"), None);
+        assert_eq!(find_token_bounded("Celkem 1 290 Kč", "1"), None);
+        // The whole number, and a number next to words, are still tokens.
+        assert!(find_token_bounded("Premium 1 290 Kč", "1 290 Kč").is_some());
+        assert!(find_token_bounded("Volejte 800 123 456 nebo pište", "800 123 456").is_some());
+        assert!(find_token_bounded("Basic 290 Kč, Premium 1 290 Kč", "290 Kč").is_some());
+        let text = "Premium 1 290 Kč, Basic 290 Kč";
+        let (a, b) = find_token_bounded(text, "290 Kč").expect("the standalone price");
+        assert_eq!(a, text.rfind("290 Kč").unwrap());
+        assert_eq!(&text[a..b], "290 Kč");
+    }
+
+    #[test]
+    fn a_quoted_value_is_located_inside_its_quote() {
+        let block = "Basic 290 Kč měsíčně, Premium 1 290 Kč měsíčně, Business 290 Kč ročně";
+        // The value inside the quoted occurrence, not the first one in the block.
+        let (a, b) = locate_quoted_value(block, "Business 290 Kč ročně", "290 Kč").expect("located");
+        assert_eq!(a, block.rfind("290 Kč").unwrap());
+        assert_eq!(&block[a..b], "290 Kč");
+        // Token boundaries are checked in the block, not at the quote's edges.
+        assert_eq!(locate_quoted_value(block, "290 Kč měsíčně, Business", "290 Kč"), None);
+        assert_eq!(locate_quoted_value(block, "Premium 1 290 Kč", "290 Kč"), None);
+        // A value elsewhere in the block, a quote that is not in the block, empty inputs.
+        assert_eq!(locate_quoted_value(block, "Basic 290 Kč", "1 290 Kč"), None);
+        assert_eq!(locate_quoted_value(block, "Basic 390 Kč", "390 Kč"), None);
+        assert_eq!(locate_quoted_value(block, "", "290 Kč"), None);
+        assert_eq!(locate_quoted_value(block, "Basic 290 Kč", ""), None);
+        // Normalization (case, NBSP, emphasis) on both sides; the span is in the original block.
+        let block = "Zákaznická linka: **800\u{a0}123\u{a0}456** (po–pá)";
+        let (a, b) = locate_quoted_value(block, "zákaznická linka: 800 123 456", "800 123 456").expect("located");
+        assert_eq!(&block[a..b], "800\u{a0}123\u{a0}456");
+        // The quote occurs twice; the value is a token only in the second occurrence.
+        let block = "Sleva 15 % a 5 % navíc";
+        let (a, _) = locate_quoted_value(block, "5 %", "5 %").expect("located");
+        assert_eq!(a, block.rfind("5 %").unwrap());
     }
 
     // --- fact_signals ---
