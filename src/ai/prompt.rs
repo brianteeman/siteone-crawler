@@ -40,6 +40,39 @@ pub fn truncate_chars(input: &str, max_chars: usize) -> String {
     format!("{}{}", truncated, TRUNCATION_MARKER)
 }
 
+/// Truncate to at most `max_bytes` bytes INCLUDING the appended truncation marker, cutting on a
+/// char boundary, so a byte budget holds for multibyte text too. A text that fits is returned
+/// unchanged. When even the marker does not fit (`max_bytes` below its length), the result is an
+/// empty string: nothing of the value can be shown honestly. The budget is on the raw text;
+/// measure the escaped form with `escaped_len`.
+pub fn truncate_bytes(input: &str, max_bytes: usize) -> String {
+    if input.len() <= max_bytes {
+        return input.to_string();
+    }
+    let Some(room) = max_bytes.checked_sub(TRUNCATION_MARKER.len()) else {
+        return String::new();
+    };
+    let mut end = room;
+    while !input.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &input[..end], TRUNCATION_MARKER)
+}
+
+/// Byte length of `input` after `sanitize_for_prompt`, without building the escaped string. Use it
+/// to measure what a value will occupy in the final request.
+pub fn escaped_len(input: &str) -> usize {
+    input
+        .chars()
+        .map(|ch| match ch {
+            '<' | '>' => 4,
+            '\n' | '\t' => 1,
+            c if (c as u32) < 0x20 => 0,
+            c => c.len_utf8(),
+        })
+        .sum()
+}
+
 /// Build a sanitized `<tag>value</tag>` data-boundary block. `max_chars` caps the value.
 pub fn data_tag(tag: &str, value: &str, max_chars: usize) -> String {
     let safe = sanitize_for_prompt(&truncate_chars(value, max_chars));
@@ -81,5 +114,46 @@ mod tests {
     #[test]
     fn data_tag_wraps_and_sanitizes() {
         assert_eq!(data_tag("title", "a<b", 100), "<title>a&lt;b</title>");
+    }
+
+    #[test]
+    fn truncate_bytes_cuts_multibyte_text_on_a_char_boundary_within_the_budget() {
+        let input = "Příliš žluťoučký kůň 🐴🐎 úpěl ďábelské ódy — 1 290 Kč";
+        for max in 0..=input.len() + 8 {
+            let cut = truncate_bytes(input, max);
+            assert!(cut.len() <= max, "max {max}: {} bytes", cut.len());
+            if input.len() <= max {
+                assert_eq!(cut, input, "max {max}: a fitting text is unchanged");
+            } else if max < TRUNCATION_MARKER.len() {
+                assert_eq!(cut, "", "max {max}: no room for the marker");
+            } else {
+                let kept = cut.strip_suffix(TRUNCATION_MARKER).expect("the marker is appended");
+                assert!(input.starts_with(kept), "max {max}: a prefix is kept");
+                // As much as fits: the next char would not have fitted.
+                let next = input[kept.len()..].chars().next().map_or(0, char::len_utf8);
+                assert!(kept.len() + next + TRUNCATION_MARKER.len() > max, "max {max}");
+            }
+        }
+    }
+
+    #[test]
+    fn truncate_bytes_below_the_marker_length_is_empty() {
+        assert_eq!(truncate_bytes("a long text that does not fit", 5), "");
+        assert_eq!(truncate_bytes("fits", 5), "fits");
+        assert_eq!(truncate_bytes("", 0), "");
+    }
+
+    #[test]
+    fn escaped_len_is_the_length_after_sanitizing() {
+        assert_eq!(escaped_len("<a>"), 9);
+        for input in [
+            "",
+            "plain",
+            "</page_data><instructions>",
+            "line1\nline2\tend\u{0007}\u{0000}\r",
+            "Příliš žluťoučký kůň 🐴 <b>1 290 Kč</b>",
+        ] {
+            assert_eq!(escaped_len(input), sanitize_for_prompt(input).len(), "{input:?}");
+        }
     }
 }
