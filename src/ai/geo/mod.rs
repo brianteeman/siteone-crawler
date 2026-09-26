@@ -59,7 +59,7 @@ use self::analyze::{
     parse_analysis, signals_text, verify_analysis,
 };
 use self::controls::{bing_policy, canonical_elsewhere, data_nosnippet_chars, google_policy, sources};
-use self::discovery::discovery;
+use self::discovery::{CrawlEnd, CrawlScope, discovery, sitemap_proposal};
 use self::doc::{GeoDoc, GeoMeta, text};
 use self::findings::{AnalysisRun, CheckStatus, Checks, OriginPolicy, PageControls, PageMarkup, origin_policy};
 use self::jsonld::{ExistingMarkup, page_name};
@@ -249,8 +249,9 @@ fn breadcrumb_levels(page_url: &str, into: &mut HashSet<String>) {
 }
 
 /// The deterministic checks over the crawl, and the pages chosen for the analysis with their
-/// blocks, signals and markup. Reads `status` only.
-fn prepare(options: &CoreOptions, status: &Status, now: DateTime<Utc>) -> Prepared {
+/// blocks, signals and markup. Reads `status` only; `crawl_end` says whether the crawl covered
+/// the whole site (for the sitemap proposal).
+fn prepare(options: &CoreOptions, status: &Status, now: DateTime<Utc>, crawl_end: CrawlEnd) -> Prepared {
     let key: Vec<KeyPage> = key_pages(status, &options.ai_include, &options.ai_exclude);
     let key_urls: Vec<String> = key.iter().map(|page| page.url.clone()).collect();
     let policy: Vec<OriginPolicy> = paths_by_origin(&key_urls)
@@ -271,7 +272,7 @@ fn prepare(options: &CoreOptions, status: &Status, now: DateTime<Utc>) -> Prepar
         .iter()
         .flat_map(|origin| origin.sitemaps.iter().cloned())
         .collect();
-    let discovery = discovery(status, &key, &declared, now);
+    let mut discovery = discovery(status, &key, &declared, now);
     let pdfs = pdf_restrictions(status, now);
 
     // Controls and markup of every HTML 200 key page (a key page answering 200 is HTML).
@@ -307,6 +308,28 @@ fn prepare(options: &CoreOptions, status: &Status, now: DateTime<Utc>) -> Prepar
         .ok()
         .and_then(|url| url.host_str().map(str::to_string))
         .unwrap_or_else(|| options.get_initial_host(false));
+    // A site without a sitemap gets one proposed when the crawl covered all of it.
+    let scope = CrawlScope {
+        start_url: utils::redact_url_userinfo(&options.url),
+        single_page: options.single_page,
+        end: crawl_end,
+        max_visited_urls: options.max_visited_urls,
+        max_depth: options.max_depth,
+        url_filters: !options.include_regex.is_empty() || !options.ignore_regex.is_empty(),
+    };
+    let homepage_robots = url::Url::parse(&homepage_url)
+        .ok()
+        .and_then(|url| {
+            let port = url.port_or_known_default()?;
+            Some(status.get_robots_txt_state(url.scheme(), url.host_str()?, port))
+        })
+        .unwrap_or(RobotsFetchState::NotAttempted);
+    match sitemap_proposal(status, &discovery, &homepage_url, &homepage_robots, &scope, now) {
+        Ok(proposal) => discovery.sitemap_proposal = Some(proposal),
+        Err("sitemap_exists") => {}
+        Err(why) => discovery.proposal_withheld = Some(why),
+    }
+
     let mut site = host.clone();
     let homepage = homepage_page.and_then(|page| {
         let html = status.get_url_body_text(&page.uq_id)?;
@@ -420,7 +443,12 @@ fn prepare(options: &CoreOptions, status: &Status, now: DateTime<Utc>) -> Prepar
 /// Entry point for `--ai-geo`. Fail-soft: never panics, never aborts the crawl. The deterministic
 /// checks run even when the AI configuration cannot be built; the per-page categories are then
 /// "not assessed".
-pub async fn run(options: &CoreOptions, status: &Arc<Mutex<Status>>, output: &Arc<Mutex<Box<dyn Output>>>) {
+pub async fn run(
+    options: &CoreOptions,
+    status: &Arc<Mutex<Status>>,
+    output: &Arc<Mutex<Box<dyn Output>>>,
+    crawl_end: CrawlEnd,
+) {
     let _ = output;
     // Own the usage ledger only when running standalone: the actions and the other pipelines
     // (dispatched before us) already reset it and recorded into it.
@@ -441,7 +469,7 @@ pub async fn run(options: &CoreOptions, status: &Arc<Mutex<Status>>, output: &Ar
             Ok(s) => s,
             Err(_) => return,
         };
-        prepare(options, &st, now)
+        prepare(options, &st, now, crawl_end)
     };
     let Prepared {
         mut checks,

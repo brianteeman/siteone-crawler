@@ -7,6 +7,7 @@
 // that cannot be trusted (all identical, or in the future), the `Last-Modified` coverage of the
 // key pages, and hreflang alternates of the key pages that lead to a URL that was not crawled or
 // did not answer 200. Everything comes from the crawl stored in `Status`; nothing is fetched here.
+// When the site has no sitemap and the crawl covered all of it, the kit proposes one (Phase 2).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -18,9 +19,11 @@ use scraper::{Html, Selector};
 
 use crate::ai::geo::controls::{bing_policy, canonical_elsewhere, google_policy, sources};
 use crate::ai::geo::keys::{KeyPage, normalized_url, redirect_chain, visits_by_url};
+use crate::ai::geo::robots_ai::{robots_of, state_is_known};
 use crate::ai::geo::signals::{LastModifiedCoverage, last_modified_coverage};
 use crate::content_processor::xml_processor::XmlProcessor;
-use crate::result::status::Status;
+use crate::export::sitemap_exporter::lastmod_from_headers;
+use crate::result::status::{RobotsFetchState, Status};
 use crate::result::visited_url::{SOURCE_SITEMAP, VisitedUrl};
 use crate::types::ContentTypeId;
 
@@ -31,6 +34,9 @@ const LASTMOD_FUTURE_TOLERANCE_HOURS: i64 = 24;
 /// Identical `lastmod` values are a pattern (the generation time) from this many on; two pages
 /// may well have changed together.
 const LASTMOD_IDENTICAL_MIN: usize = 3;
+
+/// A sitemap file lists at most this many URLs (sitemaps.org).
+const SITEMAP_MAX_URLS: usize = 50_000;
 
 static ALTERNATE_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse("link[rel][hreflang][href]").unwrap());
 
@@ -145,6 +151,63 @@ pub enum HreflangProblem {
     OtherSite,
 }
 
+/// How the crawl ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrawlEnd {
+    /// The queue ran empty.
+    Complete,
+    /// Stopped by Ctrl+C or a `stop` on stdin.
+    Interrupted,
+    /// Stopped taking new URLs at `--max-visited-urls`.
+    UrlLimit,
+}
+
+/// How much of the site the crawl covered: a sitemap is proposed only for a crawl of all of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrawlScope {
+    pub start_url: String,
+    pub single_page: bool,
+    pub end: CrawlEnd,
+    pub max_visited_urls: i64,
+    /// `--max-depth` (0 = no limit).
+    pub max_depth: i64,
+    /// `--include-regex` or `--ignore-regex` limited the URLs crawled.
+    pub url_filters: bool,
+}
+
+/// A page of the proposed sitemap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposedUrl {
+    pub url: String,
+    /// From a plausible `Last-Modified` only (the sitemap exporter's filter).
+    pub lastmod: Option<String>,
+}
+
+/// The crawled HTML 200 pages the proposed sitemap leaves out, by reason.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LeftOut {
+    /// `noindex` for Google or Bing (meta tags or X-Robots-Tag).
+    pub noindex: usize,
+    /// A canonical URL elsewhere.
+    pub canonical_elsewhere: usize,
+    /// Disallowed for Googlebot or Bingbot by the origin's robots.txt.
+    pub blocked: usize,
+    /// On another origin than the homepage (a sitemap lists the URLs of its own origin).
+    pub other_origin: usize,
+}
+
+/// The sitemap the kit proposes: the canonical, indexable HTML 200 pages of the homepage's origin
+/// that a crawl of the whole site found.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SitemapProposal {
+    /// `scheme://host[:port]` of the homepage, where the sitemap belongs.
+    pub origin: String,
+    /// In the sitemap exporter's order: fewer slashes first, then alphabetically.
+    pub urls: Vec<ProposedUrl>,
+    pub left_out: LeftOut,
+    pub scope: CrawlScope,
+}
+
 /// The discovery and freshness checks.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Discovery {
@@ -164,6 +227,11 @@ pub struct Discovery {
     pub missing_from_sitemaps: Vec<String>,
     pub hreflang_issues: Vec<HreflangIssue>,
     pub last_modified: LastModifiedCoverage,
+    /// The sitemap proposed for a site without one (see `sitemap_proposal`).
+    pub sitemap_proposal: Option<SitemapProposal>,
+    /// Why no sitemap is proposed although the site has none (a `sitemap_proposal` error other
+    /// than `sitemap_exists`).
+    pub proposal_withheld: Option<&'static str>,
 }
 
 /// Parses a sitemap: a `<urlset>` or a `<sitemapindex>` root (with any namespace prefix), the
@@ -497,6 +565,104 @@ pub fn discovery(status: &Status, key: &[KeyPage], declared: &[String], now: Dat
     found
 }
 
+/// The sitemap proposed for a site that has none, from a crawl of the whole site: its canonical,
+/// indexable HTML 200 pages on the homepage's origin that robots.txt leaves open to Googlebot and
+/// Bingbot, with a `lastmod` only from a plausible `Last-Modified`. The error names why there is
+/// none: `sitemap_exists` (declared in robots.txt or crawled), `robots_unknown` (robots.txt, which
+/// may declare one, was not read), `single_page`, `interrupted`, `url_limit`, `limited_scope`
+/// (`--max-depth`, `--include-regex`, `--ignore-regex`), `no_pages` or `too_many_urls`.
+pub fn sitemap_proposal(
+    status: &Status,
+    discovery: &Discovery,
+    homepage_url: &str,
+    robots: &RobotsFetchState,
+    scope: &CrawlScope,
+    now: DateTime<Utc>,
+) -> Result<SitemapProposal, &'static str> {
+    if !discovery.sitemaps.is_empty() {
+        return Err("sitemap_exists");
+    }
+    if !state_is_known(robots) {
+        return Err("robots_unknown");
+    }
+    if scope.single_page {
+        return Err("single_page");
+    }
+    match scope.end {
+        CrawlEnd::Complete => {}
+        CrawlEnd::Interrupted => return Err("interrupted"),
+        CrawlEnd::UrlLimit => return Err("url_limit"),
+    }
+    if scope.max_depth > 0 || scope.url_filters {
+        return Err("limited_scope");
+    }
+    let origin = url::Url::parse(homepage_url)
+        .map(|url| url.origin())
+        .map_err(|_| "no_pages")?;
+    let rules = robots_of(robots);
+    let mut left_out = LeftOut::default();
+    let mut urls = Vec::new();
+    for visit in status.get_visited_urls() {
+        if visit.status_code != 200
+            || visit.content_type != ContentTypeId::Html
+            || visit.is_external
+            || !visit.is_allowed_for_crawling
+        {
+            continue;
+        }
+        let Ok(parsed) = url::Url::parse(&visit.url) else {
+            continue;
+        };
+        if parsed.origin() != origin {
+            left_out.other_origin += 1;
+            continue;
+        }
+        let Some(head) = page_head(status, &visit) else {
+            continue;
+        };
+        match not_indexable(status, &visit, &head, now) {
+            Some(ListedReason::CanonicalElsewhere(_)) => {
+                left_out.canonical_elsewhere += 1;
+                continue;
+            }
+            Some(_) => {
+                left_out.noindex += 1;
+                continue;
+            }
+            None => {}
+        }
+        let path = &parsed[url::Position::BeforePath..];
+        if let Some(rules) = &rules
+            && !(rules.is_allowed("Googlebot", path) && rules.is_allowed("Bingbot", path))
+        {
+            left_out.blocked += 1;
+            continue;
+        }
+        urls.push(ProposedUrl {
+            url: visit.url.clone(),
+            lastmod: status
+                .get_url_headers(&visit.uq_id)
+                .and_then(|headers| lastmod_from_headers(&headers, now)),
+        });
+    }
+    if urls.is_empty() {
+        return Err("no_pages");
+    }
+    if urls.len() > SITEMAP_MAX_URLS {
+        return Err("too_many_urls");
+    }
+    urls.sort_by(|a, b| {
+        let slashes = |url: &str| url.trim_end_matches('/').matches('/').count();
+        slashes(&a.url).cmp(&slashes(&b.url)).then_with(|| a.url.cmp(&b.url))
+    });
+    Ok(SitemapProposal {
+        origin: origin.ascii_serialization(),
+        urls,
+        left_out,
+        scope: scope.clone(),
+    })
+}
+
 /// The same host, with or without `www.`.
 fn same_site(page: &url::Url, target: &str) -> bool {
     let site = |host: &str| host.trim_start_matches("www.").to_string();
@@ -580,6 +746,7 @@ mod tests {
     use super::*;
     use crate::ai::geo::keys::KeyPage;
     use crate::ai::geo::test_support::{add, add_with_headers, new_status, page};
+    use crate::result::status::RobotsFetchState;
     use crate::result::visited_url::{SOURCE_A_HREF, SOURCE_INIT_URL, SOURCE_SITEMAP};
     use crate::types::ContentTypeId;
     use chrono::TimeZone;
@@ -1157,6 +1324,204 @@ mod tests {
         assert_eq!(
             found.last_modified.pages, 1,
             "the Last-Modified coverage of the key pages"
+        );
+    }
+
+    fn complete_scope() -> CrawlScope {
+        CrawlScope {
+            start_url: "https://example.com/".to_string(),
+            single_page: false,
+            end: CrawlEnd::Complete,
+            max_visited_urls: 10_000,
+            max_depth: 0,
+            url_filters: false,
+        }
+    }
+
+    fn robots(content: &str) -> RobotsFetchState {
+        RobotsFetchState::Ok {
+            status: 200,
+            content: content.to_string(),
+            valid_utf8: true,
+        }
+    }
+
+    /// A crawl without any sitemap: indexable pages, a `noindex` page, a canonicalized page, a
+    /// 404, a page on another origin, a page blocked for Googlebot, a PDF and an external page.
+    fn site_without_sitemap() -> Status {
+        let mut status = new_status();
+        let html =
+            |extra_head: &str| format!("<html><head>{extra_head}</head><body><main><p>Text</p></main></body></html>");
+        let pages: [(&str, &str, i32, String); 7] = [
+            ("home", "https://example.com/", 200, html("")),
+            ("zeta", "https://example.com/zeta", 200, html("")),
+            ("deep", "https://example.com/a/b?x=1&y=2", 200, html("")),
+            (
+                "hidden",
+                "https://example.com/hidden",
+                200,
+                html(r#"<meta name="robots" content="noindex">"#),
+            ),
+            (
+                "dup",
+                "https://example.com/dup",
+                200,
+                html(r#"<link rel="canonical" href="https://example.com/zeta">"#),
+            ),
+            ("gone", "https://example.com/gone", 404, html("")),
+            ("private", "https://example.com/private/page", 200, html("")),
+        ];
+        for (uq_id, url, code, body) in pages {
+            let (source, attr) = if uq_id == "home" {
+                ("", SOURCE_INIT_URL)
+            } else {
+                ("home", SOURCE_A_HREF)
+            };
+            let headers: &[(&str, &str)] = match uq_id {
+                // A plausible Last-Modified, a day before the response.
+                "zeta" => &[
+                    ("last-modified", "Tue, 01 Sep 2026 10:00:00 GMT"),
+                    ("date", "Wed, 02 Sep 2026 10:00:00 GMT"),
+                ],
+                // A dynamic page stamping "now": no lastmod.
+                "deep" => &[
+                    ("last-modified", "Wed, 02 Sep 2026 10:00:00 GMT"),
+                    ("date", "Wed, 02 Sep 2026 10:00:00 GMT"),
+                ],
+                _ => &[],
+            };
+            add_with_headers(
+                &mut status,
+                page(uq_id, source, attr, url, code, None),
+                Some(&body),
+                headers,
+            );
+        }
+        let mut www = page("www", "home", SOURCE_A_HREF, "https://www.example.com/other", 200, None);
+        www.is_external = false;
+        add(&mut status, www, Some(&html("")));
+        let mut external = page("ext", "home", SOURCE_A_HREF, "https://partner.example.org/", 200, None);
+        external.is_external = true;
+        add(&mut status, external, Some(&html("")));
+        let mut pdf = page("pdf", "home", SOURCE_A_HREF, "https://example.com/price.pdf", 200, None);
+        pdf.content_type = ContentTypeId::Other;
+        add(&mut status, pdf, None);
+        status
+    }
+
+    #[test]
+    fn a_sitemap_is_proposed_from_the_indexable_pages_of_a_complete_crawl() {
+        let status = site_without_sitemap();
+        let rules = robots("User-agent: *\nDisallow:\n\nUser-agent: Googlebot\nDisallow: /private/\n");
+        let found = Discovery::default();
+        let proposal = sitemap_proposal(
+            &status,
+            &found,
+            "https://example.com/",
+            &rules,
+            &complete_scope(),
+            now(),
+        )
+        .expect("a complete crawl without a sitemap");
+        assert_eq!(proposal.origin, "https://example.com");
+        // Canonical, indexable HTML 200 pages of the homepage's origin, in the sitemap exporter's
+        // order (fewer slashes first, then alphabetically).
+        assert_eq!(
+            proposal.urls,
+            [
+                ProposedUrl {
+                    url: "https://example.com/".to_string(),
+                    lastmod: None,
+                },
+                ProposedUrl {
+                    url: "https://example.com/zeta".to_string(),
+                    lastmod: Some("2026-09-01T10:00:00+00:00".to_string()),
+                },
+                ProposedUrl {
+                    url: "https://example.com/a/b?x=1&y=2".to_string(),
+                    lastmod: None,
+                },
+            ]
+        );
+        assert_eq!(
+            (
+                proposal.left_out.noindex,
+                proposal.left_out.canonical_elsewhere,
+                proposal.left_out.blocked,
+                proposal.left_out.other_origin,
+            ),
+            (1, 1, 1, 1)
+        );
+        assert_eq!(proposal.scope, complete_scope());
+
+        // Without robots.txt the pages are not blocked.
+        let proposal = sitemap_proposal(
+            &status,
+            &found,
+            "https://example.com/",
+            &RobotsFetchState::NotFound { status: 404 },
+            &complete_scope(),
+            now(),
+        )
+        .unwrap();
+        assert_eq!(proposal.urls.len(), 4);
+        assert_eq!(proposal.left_out.blocked, 0);
+    }
+
+    #[test]
+    fn no_sitemap_is_proposed_when_one_exists_or_the_crawl_did_not_cover_the_whole_site() {
+        let status = site_without_sitemap();
+        let rules = robots("User-agent: *\nDisallow:\n");
+        let propose = |found: &Discovery, state: &RobotsFetchState, scope: &CrawlScope| {
+            sitemap_proposal(&status, found, "https://example.com/", state, scope, now()).map(|_| ())
+        };
+        let none = Discovery::default();
+        assert_eq!(propose(&none, &rules, &complete_scope()), Ok(()));
+
+        let with_sitemap = Discovery {
+            sitemaps: vec![SitemapFile {
+                url: "https://example.com/sitemap.xml".to_string(),
+                declared: true,
+                state: SitemapState::NotCrawled,
+            }],
+            ..Discovery::default()
+        };
+        assert_eq!(propose(&with_sitemap, &rules, &complete_scope()), Err("sitemap_exists"));
+
+        let scope = |change: fn(&mut CrawlScope)| {
+            let mut scope = complete_scope();
+            change(&mut scope);
+            scope
+        };
+        let cases: [(CrawlScope, &str); 5] = [
+            (scope(|scope| scope.single_page = true), "single_page"),
+            (scope(|scope| scope.end = CrawlEnd::UrlLimit), "url_limit"),
+            (scope(|scope| scope.end = CrawlEnd::Interrupted), "interrupted"),
+            (scope(|scope| scope.max_depth = 2), "limited_scope"),
+            (scope(|scope| scope.url_filters = true), "limited_scope"),
+        ];
+        for (scope, why) in cases {
+            assert_eq!(propose(&none, &rules, &scope), Err(why), "{scope:?}");
+        }
+        // Whether robots.txt declares a sitemap is not known.
+        for state in [
+            RobotsFetchState::Skipped,
+            RobotsFetchState::NotAttempted,
+            RobotsFetchState::Unavailable {
+                status_or_error: "HTTP 503".to_string(),
+            },
+        ] {
+            assert_eq!(
+                propose(&none, &state, &complete_scope()),
+                Err("robots_unknown"),
+                "{state:?}"
+            );
+        }
+        // No indexable page.
+        let empty = new_status();
+        assert_eq!(
+            sitemap_proposal(&empty, &none, "https://example.com/", &rules, &complete_scope(), now()).map(|_| ()),
+            Err("no_pages")
         );
     }
 }

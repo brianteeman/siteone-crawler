@@ -18,6 +18,7 @@ use unicode_normalization::char::is_combining_mark;
 use crate::ai::blocks::Block;
 use crate::ai::geo::agents::{AI_AGENTS, AiAgent, Purpose};
 use crate::ai::geo::analyze::{Answered, PageAnalysis, PageType, block_ref};
+use crate::ai::geo::discovery::{CrawlEnd, SitemapProposal};
 use crate::ai::geo::findings::ORGANIZATION_TYPES;
 use crate::ai::geo::jsonld::{self, ExistingMarkup};
 use crate::ai::geo::robots_ai::{AgentAccess, AiRobots, policy_equivalent};
@@ -31,6 +32,8 @@ pub const MANIFEST_PATH: &str = "jsonld/_manifest.json";
 pub const ENTITY_DRAFTS_PATH: &str = "drafts/entity-drafts.md";
 pub const LEADS_PATH: &str = "leads.md";
 pub const LLMS_TXT_PATH: &str = "llms.txt";
+pub const SITEMAP_PATH: &str = "sitemap/sitemap.proposed.xml";
+pub const SITEMAP_COVERAGE_PATH: &str = "sitemap/coverage.json";
 /// File stems of `jsonld/` that no page may take.
 pub const RESERVED_NAMES: &[&str] = &["_manifest", "site-website", "site-organization"];
 /// A page slug is cut to this many characters.
@@ -113,6 +116,10 @@ pub struct KitInput<'a> {
     pub key_paths: &'a [String],
     /// Absolute sitemap URLs to declare in a new robots.txt.
     pub sitemaps: &'a [String],
+    /// The sitemap proposed for a site without one.
+    pub sitemap: Option<&'a SitemapProposal>,
+    /// Why no sitemap is proposed although the site has none, in the report's language.
+    pub sitemap_withheld: Option<&'a str>,
 }
 
 /// The optional robots.txt block for AI-training crawlers: `Disallow: /` for every training-only
@@ -840,6 +847,61 @@ pub fn readme(locale: &ReportLocale, files: &[String], withheld: Option<&str>, t
     out
 }
 
+/// The proposed sitemap: a `<urlset>` of `<loc>` (URL-escaped, then entity-escaped) and, when
+/// known, `<lastmod>`; no `<priority>` or `<changefreq>`, which Google ignores.
+pub fn sitemap_xml(proposal: &SitemapProposal) -> String {
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n",
+    );
+    for entry in &proposal.urls {
+        let loc = url::Url::parse(&entry.url).map_or_else(|_| entry.url.clone(), |url| url.to_string());
+        xml.push_str(&format!(
+            "  <url>\n    <loc>{}</loc>\n",
+            crate::export::sitemap_exporter::escape_xml(&loc)
+        ));
+        if let Some(lastmod) = &entry.lastmod {
+            xml.push_str(&format!("    <lastmod>{lastmod}</lastmod>\n"));
+        }
+        xml.push_str("  </url>\n");
+    }
+    xml.push_str("</urlset>\n");
+    xml
+}
+
+/// What the proposed sitemap covers: the crawl's scope, the pages left out and why, and where the
+/// `lastmod` values come from.
+pub fn coverage_json(proposal: &SitemapProposal, today: &str) -> String {
+    let scope = &proposal.scope;
+    let coverage = json!({
+        "generator": "SiteOne Crawler",
+        "generated": today,
+        "origin": proposal.origin,
+        "urls": proposal.urls.len(),
+        "withLastmod": proposal.urls.iter().filter(|url| url.lastmod.is_some()).count(),
+        "leftOut": {
+            "noindex": proposal.left_out.noindex,
+            "canonicalElsewhere": proposal.left_out.canonical_elsewhere,
+            "blockedByRobotsTxt": proposal.left_out.blocked,
+            "otherOrigin": proposal.left_out.other_origin,
+        },
+        "scope": {
+            "startUrl": scope.start_url,
+            "crawlComplete": scope.end == CrawlEnd::Complete,
+            "singlePage": scope.single_page,
+            "maxVisitedUrls": scope.max_visited_urls,
+            "maxDepth": scope.max_depth,
+            "urlFilters": scope.url_filters,
+        },
+        "notes": [
+            "Lists the canonical, indexable HTML pages that answered 200 on this origin, as the crawl found them by following links from the start URL.",
+            "Pages that no crawled page links to are not in it; add them by hand.",
+            "Pages with noindex, a canonical URL elsewhere, or blocked for Googlebot or Bingbot by robots.txt are left out.",
+            "lastmod comes only from a plausible Last-Modified response header; the other URLs have none rather than a wrong one.",
+        ],
+    });
+    format!("{}\n", serde_json::to_string_pretty(&coverage).unwrap_or_default())
+}
+
 /// The manifest of the kit's JSON-LD.
 fn manifest(markup: &[KitEntry], possible_profiles: &[String], today: &str) -> String {
     let entries: Vec<Value> = markup
@@ -918,13 +980,65 @@ pub fn build(
             &llms_txt(input.site_name, input.analyses, input.titles),
         ));
     }
+    if let Some(sitemap) = input.sitemap {
+        files.push(KitFile::text(SITEMAP_PATH, &sitemap_xml(sitemap)));
+        files.push(KitFile::text(SITEMAP_COVERAGE_PATH, &coverage_json(sitemap, today)));
+    }
     let mut names: Vec<String> = vec![README_PATH.to_string()];
     names.extend(files.iter().map(|file| file.relative_path.clone()));
-    files.insert(
-        0,
-        KitFile::text(README_PATH, &readme(input.locale, &names, withheld.as_deref(), today)),
-    );
+    let mut text = readme(input.locale, &names, withheld.as_deref(), today);
+    text.push_str(&sitemap_readme(input.locale, input.sitemap, input.sitemap_withheld));
+    files.insert(0, KitFile::text(README_PATH, &text));
     files
+}
+
+/// The README part on the proposed sitemap, or on why there is none; empty when the site has one.
+fn sitemap_readme(locale: &ReportLocale, sitemap: Option<&SitemapProposal>, withheld: Option<&str>) -> String {
+    let cs = locale.is_czech();
+    if let Some(sitemap) = sitemap {
+        let address = format!("{}/sitemap.xml", sitemap.origin);
+        return if cs {
+            format!(
+                "\n## Navržená sitemapa\n\n\
+                 Web nemá sitemapu uvedenou v robots.txt ani nalezenou při procházení, a procházení pokrylo \
+                 celý web. {SITEMAP_PATH} proto uvádí {} kanonických indexovatelných stránek, které vrátily \
+                 200; {SITEMAP_COVERAGE_PATH} popisuje rozsah procházení a vynechané stránky. Pokud už \
+                 sitemapu máte (např. odeslanou v Search Console), porovnejte ji s tímto souborem místo \
+                 nahrazení. Instalace: zkontrolujte seznam, uložte soubor jako {address}, uveďte ho v \
+                 robots.txt řádkem „Sitemap: {address}“ a odešlete ho v Google Search Console a Bing \
+                 Webmaster Tools (evidence: moderate — sitemapa pomáhá vyhledávačům stránky najít, \
+                 zařazení nezaručuje). Stránky, na které nevede žádný odkaz, v ní chybí.\n",
+                sitemap.urls.len()
+            )
+        } else {
+            format!(
+                "\n## Proposed sitemap\n\n\
+                 The site has no sitemap declared in robots.txt or found by the crawl, and the crawl \
+                 covered the whole site. {SITEMAP_PATH} therefore lists its {} canonical, indexable pages \
+                 that answered 200; {SITEMAP_COVERAGE_PATH} states the crawl's scope and the pages left \
+                 out. If you already have a sitemap (for example one submitted in Search Console), compare \
+                 it with this file instead of replacing it. To install it: review the list, save the file \
+                 as {address}, declare it in robots.txt with the line \"Sitemap: {address}\", and submit \
+                 it in Google Search Console and Bing Webmaster Tools (evidence: moderate — a sitemap \
+                 helps engines find pages; it does not make them index them). Pages that no page links \
+                 to are not in it.\n",
+                sitemap.urls.len()
+            )
+        };
+    }
+    match withheld {
+        Some(why) if cs => format!(
+            "\n**sitemap.proposed.xml nebyl vytvořen: {why}.** Web nemá sitemapu uvedenou v robots.txt ani \
+             nalezenou při procházení; SiteOne Crawler ji umí vytvořit z úplného procházení \
+             (--sitemap-xml-file).\n"
+        ),
+        Some(why) => format!(
+            "\n**sitemap.proposed.xml was not generated: {why}.** The site has no sitemap declared in \
+             robots.txt or found by the crawl; SiteOne Crawler can write one from a complete crawl \
+             (--sitemap-xml-file).\n"
+        ),
+        None => String::new(),
+    }
 }
 
 #[cfg(test)]
@@ -932,6 +1046,7 @@ mod tests {
     use super::*;
     use crate::ai::blocks::blocks_from_html;
     use crate::ai::geo::analyze::{analyzed_page, build_page_request, parse_analysis, verify_analysis};
+    use crate::ai::geo::discovery::{CrawlScope, LeftOut, ProposedUrl};
     use crate::ai::geo::robots_ai::{evaluate, robots_of};
 
     const TODAY: &str = "2026-09-26";
@@ -1521,6 +1636,8 @@ mod tests {
             agents: &agents,
             key_paths: &paths(&["/"]),
             sitemaps: &[],
+            sitemap: None,
+            sitemap_withheld: None,
         };
         let files = build(&input, &state, robots.as_ref(), TODAY);
         let names: Vec<&str> = files.iter().map(|file| file.relative_path.as_str()).collect();
@@ -1560,6 +1677,8 @@ mod tests {
             agents: &agents,
             key_paths: &paths(&["/", "/faq"]),
             sitemaps: &[],
+            sitemap: None,
+            sitemap_withheld: None,
         };
         let files = build(
             &input,
@@ -1618,5 +1737,136 @@ mod tests {
                 .iter()
                 .any(|file| file.relative_path == "robots/robots.proposed.txt")
         );
+    }
+
+    fn proposal() -> SitemapProposal {
+        SitemapProposal {
+            origin: "https://example.com".to_string(),
+            urls: vec![
+                ProposedUrl {
+                    url: "https://example.com/".to_string(),
+                    lastmod: None,
+                },
+                ProposedUrl {
+                    url: "https://example.com/a?x=1&y=<2>".to_string(),
+                    lastmod: Some("2026-09-01T10:00:00+00:00".to_string()),
+                },
+                ProposedUrl {
+                    url: "https://example.com/služby/".to_string(),
+                    lastmod: None,
+                },
+            ],
+            left_out: LeftOut {
+                noindex: 2,
+                canonical_elsewhere: 1,
+                blocked: 0,
+                other_origin: 0,
+            },
+            scope: CrawlScope {
+                start_url: "https://example.com/".to_string(),
+                single_page: false,
+                end: CrawlEnd::Complete,
+                max_visited_urls: 10_000,
+                max_depth: 0,
+                url_filters: false,
+            },
+        }
+    }
+
+    #[test]
+    fn a_proposed_sitemap_is_a_valid_url_set_with_its_coverage() {
+        let proposal = proposal();
+        let xml = sitemap_xml(&proposal);
+        assert!(xml.starts_with(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n"
+        ));
+        // URL-escaped, then entity-escaped, as the protocol asks.
+        assert!(
+            xml.contains("<loc>https://example.com/a?x=1&amp;y=%3C2%3E</loc>"),
+            "{xml}"
+        );
+        assert!(xml.contains("<loc>https://example.com/slu%C5%BEby/</loc>"), "{xml}");
+        assert!(!xml.contains("<priority>") && !xml.contains("<changefreq>"), "{xml}");
+        let parsed = crate::ai::geo::discovery::parse_sitemap(&xml).expect("a valid sitemap");
+        assert_eq!(parsed.entries.len(), 3);
+        assert_eq!(parsed.entries[1].lastmod.as_deref(), Some("2026-09-01T10:00:00+00:00"));
+        assert_eq!(
+            parsed.entries[0].lastmod, None,
+            "no lastmod without a plausible Last-Modified"
+        );
+
+        let coverage: Value = serde_json::from_str(&coverage_json(&proposal, TODAY)).expect("JSON");
+        assert_eq!(coverage["generated"], TODAY);
+        assert_eq!(coverage["urls"], 3);
+        assert_eq!(coverage["withLastmod"], 1);
+        assert_eq!(coverage["origin"], "https://example.com");
+        assert_eq!(coverage["leftOut"]["noindex"], 2);
+        assert_eq!(coverage["leftOut"]["canonicalElsewhere"], 1);
+        let scope = &coverage["scope"];
+        assert_eq!(scope["startUrl"], "https://example.com/");
+        assert_eq!(scope["crawlComplete"], true);
+        assert_eq!(scope["maxVisitedUrls"], 10_000);
+        assert_eq!(scope["maxDepth"], 0);
+        assert_eq!(scope["urlFilters"], false);
+        assert!(
+            coverage["notes"].as_array().is_some_and(|notes| notes
+                .iter()
+                .any(|note| note.as_str().unwrap_or_default().contains("links"))),
+            "pages without links to them are not in it: {coverage}"
+        );
+    }
+
+    #[test]
+    fn the_kit_carries_the_proposed_sitemap_or_says_why_there_is_none() {
+        let state = RobotsFetchState::NotFound { status: 404 };
+        let agents = verdicts(None);
+        let titles = HashMap::new();
+        let proposal = proposal();
+        for language in ["en", "cs"] {
+            let locale = ReportLocale::new(language);
+            let mut input = KitInput {
+                locale: &locale,
+                site_name: "Example",
+                markup: &[],
+                possible_profiles: &[],
+                analyses: &[],
+                titles: &titles,
+                agents: &agents,
+                key_paths: &paths(&["/"]),
+                sitemaps: &[],
+                sitemap: Some(&proposal),
+                sitemap_withheld: None,
+            };
+            let files = build(&input, &state, None, TODAY);
+            let names: Vec<&str> = files.iter().map(|file| file.relative_path.as_str()).collect();
+            assert!(
+                names.contains(&SITEMAP_PATH) && names.contains(&SITEMAP_COVERAGE_PATH),
+                "{names:?}"
+            );
+            let readme = String::from_utf8(files[0].bytes.clone()).unwrap();
+            for part in [
+                SITEMAP_PATH,
+                SITEMAP_COVERAGE_PATH,
+                "https://example.com/sitemap.xml",
+                "Sitemap: https://example.com/sitemap.xml",
+                "Search Console",
+                "Bing Webmaster Tools",
+            ] {
+                assert!(readme.contains(part), "{language}: {part}");
+            }
+
+            input.sitemap = None;
+            input.sitemap_withheld = Some("the crawl stopped at --max-visited-urls");
+            let files = build(&input, &state, None, TODAY);
+            assert!(!files.iter().any(|file| file.relative_path.starts_with("sitemap/")));
+            let readme = String::from_utf8(files[0].bytes.clone()).unwrap();
+            let withheld = if language == "cs" {
+                "sitemap.proposed.xml nebyl vytvořen: the crawl stopped at --max-visited-urls"
+            } else {
+                "sitemap.proposed.xml was not generated: the crawl stopped at --max-visited-urls"
+            };
+            assert!(readme.contains(withheld), "{language}: {readme}");
+            assert!(!readme.contains(SITEMAP_COVERAGE_PATH), "{language}");
+        }
     }
 }

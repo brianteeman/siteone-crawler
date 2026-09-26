@@ -387,6 +387,12 @@ impl Crawler {
         self.terminated.load(Ordering::SeqCst) || STOP_REQUESTED.load(Ordering::SeqCst)
     }
 
+    /// Whether the crawl stopped taking new URLs at `--max-visited-urls` (the queue refuses URLs
+    /// once queued + visited reach the limit, and every queued URL is visited).
+    pub fn reached_max_visited_urls(&self) -> bool {
+        self.visited.len() as i64 >= self.options.max_visited_urls
+    }
+
     /// Take the next URL from the queue (breadth-first order)
     fn take_next_from_queue(&self) -> Option<QueueEntry> {
         let mut order = self.queue_order.lock().unwrap_or_else(|e| e.into_inner());

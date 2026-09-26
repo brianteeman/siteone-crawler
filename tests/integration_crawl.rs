@@ -7969,3 +7969,58 @@ fn ai_geo_compares_the_raw_html_with_the_rendered_page_in_browser_mode() {
     assert!(raw < 50, "the HTML as fetched has next to no text: {render}");
     assert!(rendered > 500, "the rendered page has the text: {render}");
 }
+
+/// A sitemap is proposed only when the crawl found none and covered the whole site; a crawl cut
+/// at `--max-visited-urls` says why there is none.
+#[test]
+fn ai_geo_proposes_a_sitemap_only_after_a_complete_crawl() {
+    let server = geo_site();
+    let crawl = |name: &str, extra: &[&str]| {
+        let tmp = TempDir::new(name);
+        let reports = tmp.path.join("reports");
+        let report_dir = format!("--ai-report-dir={}", reports.display());
+        let mut args = vec![
+            "--ai-provider=openai",
+            "--ai-model=gpt-test",
+            "--ai-api-key-env=SITEONE_GEO_TEST_KEY_THAT_IS_NOT_SET",
+            "--ai-geo",
+            report_dir.as_str(),
+        ];
+        args.extend_from_slice(extra);
+        let output = crawl_geo(&server, &args);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let kit = geo_outputs(&reports)
+            .into_iter()
+            .find(|name| name.starts_with("ai-geo-kit."))
+            .expect("the kit");
+        (tmp, reports.join(kit))
+    };
+
+    let (_tmp, kit) = crawl("ai-geo-sitemap", &[]);
+    let xml = std::fs::read_to_string(kit.join("sitemap/sitemap.proposed.xml")).expect("the proposed sitemap");
+    let base = server.url();
+    let base = base.trim_end_matches('/');
+    for path in ["/", "/faq", "/blog/first-post"] {
+        assert!(xml.contains(&format!("<loc>{base}{path}</loc>")), "{path}: {xml}");
+    }
+    assert!(!xml.contains("/hidden<"), "a noindex page is left out: {xml}");
+    assert!(!xml.contains("/private<"), "a 403 page is left out: {xml}");
+    let coverage: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(kit.join("sitemap/coverage.json")).expect("coverage.json"))
+            .expect("JSON");
+    assert_eq!(coverage["scope"]["crawlComplete"], true, "{coverage}");
+    assert_eq!(coverage["leftOut"]["noindex"], 1, "{coverage}");
+
+    let (_tmp, kit) = crawl("ai-geo-sitemap-limit", &["--max-visited-urls=3"]);
+    assert!(!kit.join("sitemap").exists(), "no proposal from a cut crawl");
+    let readme = std::fs::read_to_string(kit.join("README.md")).expect("README.md");
+    assert!(
+        readme.contains("sitemap.proposed.xml was not generated: the crawl stopped at --max-visited-urls"),
+        "{readme}"
+    );
+}

@@ -315,7 +315,15 @@ impl Manager {
                     crawler.fetch_robots_txt(&host, port, &scheme).await;
                 }
             }
-            crate::ai::geo::run(options.as_ref(), crawler.get_status(), crawler.get_output()).await;
+            // A sitemap is proposed only from a crawl of the whole site.
+            let crawl_end = if crawler.was_interrupted() {
+                crate::ai::geo::discovery::CrawlEnd::Interrupted
+            } else if crawler.reached_max_visited_urls() {
+                crate::ai::geo::discovery::CrawlEnd::UrlLimit
+            } else {
+                crate::ai::geo::discovery::CrawlEnd::Complete
+            };
+            crate::ai::geo::run(options.as_ref(), crawler.get_status(), crawler.get_output(), crawl_end).await;
         }
         if options.ai_enabled && runs_ai {
             crate::events::phase("ai", crate::events::PhaseState::Finished);

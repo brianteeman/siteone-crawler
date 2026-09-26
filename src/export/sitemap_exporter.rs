@@ -294,7 +294,7 @@ fn xml_output_path(output_file: &str) -> (String, bool) {
 }
 
 /// Escape special XML characters in a string.
-fn escape_xml(s: &str) -> String {
+pub(crate) fn escape_xml(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")

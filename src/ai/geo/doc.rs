@@ -219,6 +219,10 @@ impl GeoDoc {
             .map(|sitemap| sitemap.url.clone())
             .collect();
         let titles: HashMap<String, String> = HashMap::new();
+        let sitemap_withheld = self
+            .discovery
+            .proposal_withheld
+            .map(|why| text(&locale, &format!("sitemap_withheld.{why}")));
         let input = KitInput {
             locale: &locale,
             site_name: &self.meta.site_name,
@@ -229,6 +233,8 @@ impl GeoDoc {
             agents: &agents,
             key_paths: &key_paths,
             sitemaps: &sitemaps,
+            sitemap: self.discovery.sitemap_proposal.as_ref(),
+            sitemap_withheld,
         };
         kit::build(&input, &state, robots.as_ref(), today)
     }
@@ -1479,6 +1485,19 @@ impl GeoDoc {
                     .collect(),
             ));
         }
+        if let Some(proposal) = &discovery.sitemap_proposal {
+            nodes.push(Node::Para(line(fill(
+                text(locale, "label.sitemap_proposed"),
+                &[proposal.urls.len().to_string()],
+                0,
+            ))));
+        } else if let Some(why) = discovery.proposal_withheld {
+            nodes.push(Node::Para(line(fill(
+                text(locale, "label.sitemap_withheld"),
+                &[text(locale, &format!("sitemap_withheld.{why}")).to_string()],
+                0,
+            ))));
+        }
         let modified = discovery.last_modified;
         if modified.pages > 0 {
             nodes.push(Node::Para(line(fill(
@@ -2069,6 +2088,12 @@ fn discovery_json(discovery: &Discovery) -> Value {
             "withHeader": discovery.last_modified.with_header,
             "plausible": discovery.last_modified.plausible,
         },
+        "sitemapProposal": discovery.sitemap_proposal.as_ref().map(|proposal| json!({
+            "origin": proposal.origin,
+            "urls": proposal.urls.len(),
+            "withLastmod": proposal.urls.iter().filter(|url| url.lastmod.is_some()).count(),
+        })),
+        "proposalWithheld": discovery.proposal_withheld,
     })
 }
 
@@ -2177,6 +2202,33 @@ const EN: &[(&str, &str)] = &[
     ("reason.no_pages_analyzed", "no page was analyzed"),
     ("reason.manual_only", "not visible from the website — please check"),
     ("reason.no_pages_checked", "no key page could be checked"),
+    (
+        "label.sitemap_proposed",
+        "The site has no sitemap and the crawl covered all of it: the kit proposes one with its {0} canonical, indexable page(s) (sitemap/sitemap.proposed.xml).",
+    ),
+    ("label.sitemap_withheld", "No sitemap is proposed: {0}."),
+    (
+        "sitemap_withheld.robots_unknown",
+        "robots.txt, which may declare a sitemap, could not be read",
+    ),
+    (
+        "sitemap_withheld.single_page",
+        "only one page was crawled (--single-page)",
+    ),
+    ("sitemap_withheld.interrupted", "the crawl was interrupted"),
+    ("sitemap_withheld.url_limit", "the crawl stopped at --max-visited-urls"),
+    (
+        "sitemap_withheld.limited_scope",
+        "--max-depth, --include-regex or --ignore-regex limited the crawl",
+    ),
+    (
+        "sitemap_withheld.no_pages",
+        "the crawl found no canonical, indexable page",
+    ),
+    (
+        "sitemap_withheld.too_many_urls",
+        "the crawl found more pages than one sitemap file may list (50,000)",
+    ),
     (
         "reason.render_not_comparable",
         "no rendered key page could be compared with its HTML",
@@ -2954,6 +3006,36 @@ const CS: &[(&str, &str)] = &[
     ("reason.no_pages_analyzed", "žádná stránka nebyla analyzována"),
     ("reason.manual_only", "z webu není vidět — zkontrolujte prosím"),
     ("reason.no_pages_checked", "žádnou klíčovou stránku nešlo zkontrolovat"),
+    (
+        "label.sitemap_proposed",
+        "Web nemá sitemapu a procházení pokrylo celý web: sada navrhuje sitemapu s jeho kanonickými indexovatelnými stránkami ({0}) v sitemap/sitemap.proposed.xml.",
+    ),
+    ("label.sitemap_withheld", "Sitemapa se nenavrhuje: {0}."),
+    (
+        "sitemap_withheld.robots_unknown",
+        "robots.txt, který může sitemapu uvádět, se nepodařilo přečíst",
+    ),
+    (
+        "sitemap_withheld.single_page",
+        "procházela se jen jedna stránka (--single-page)",
+    ),
+    ("sitemap_withheld.interrupted", "procházení bylo přerušeno"),
+    (
+        "sitemap_withheld.url_limit",
+        "procházení skončilo na limitu --max-visited-urls",
+    ),
+    (
+        "sitemap_withheld.limited_scope",
+        "procházení omezil --max-depth, --include-regex nebo --ignore-regex",
+    ),
+    (
+        "sitemap_withheld.no_pages",
+        "procházení nenašlo žádnou kanonickou indexovatelnou stránku",
+    ),
+    (
+        "sitemap_withheld.too_many_urls",
+        "procházení našlo víc stránek, než smí uvést jeden soubor sitemapy (50 000)",
+    ),
     (
         "reason.render_not_comparable",
         "žádnou vykreslenou klíčovou stránku nešlo porovnat s jejím HTML",
@@ -4015,6 +4097,21 @@ mod tests {
         ] {
             all_keys.push(format!("reason.{reason}"));
         }
+        for why in [
+            "robots_unknown",
+            "single_page",
+            "interrupted",
+            "url_limit",
+            "limited_scope",
+            "no_pages",
+            "too_many_urls",
+        ] {
+            all_keys.push(format!("sitemap_withheld.{why}"));
+        }
+        all_keys.extend([
+            "label.sitemap_proposed".to_string(),
+            "label.sitemap_withheld".to_string(),
+        ]);
         for language in ["en", "cs"] {
             let locale = ReportLocale::new(language);
             for key in &all_keys {
