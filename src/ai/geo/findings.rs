@@ -15,7 +15,7 @@ use crate::ai::geo::access::{AccessIssue, AccessKind, AccessStats};
 use crate::ai::geo::agents::{AI_AGENTS, AiAgent, Compliance, Purpose};
 use crate::ai::geo::analyze::{Answered, OfferEarly, PageAnalysis, PageType};
 use crate::ai::geo::controls::EnginePolicy;
-use crate::ai::geo::discovery::{Discovery, HreflangProblem, SitemapState};
+use crate::ai::geo::discovery::{Discovery, HreflangProblem, SitemapKind, SitemapState};
 use crate::ai::geo::jsonld::ExistingMarkup;
 use crate::ai::geo::keys::KeyPage;
 use crate::ai::geo::render::RenderCheck;
@@ -1274,7 +1274,26 @@ fn discovery(checks: &Checks, found: &mut Found) -> Counts {
                 SitemapState::Parsed { .. } | SitemapState::Redirected(_) => {}
             }
         }
-        if discovery.key_pages_compared == 0 {
+        // Not compared because a sitemap could not be read or no page list was read; with every
+        // sitemap read, 0 compared only means that no key page is indexable.
+        let incomplete = discovery.sitemaps.iter().any(|sitemap| {
+            matches!(
+                sitemap.state,
+                SitemapState::Malformed(_)
+                    | SitemapState::Failed(_)
+                    | SitemapState::NotCrawled
+                    | SitemapState::Unsupported(_)
+            )
+        }) || !discovery.sitemaps.iter().any(|sitemap| {
+            matches!(
+                sitemap.state,
+                SitemapState::Parsed {
+                    kind: SitemapKind::UrlSet,
+                    ..
+                }
+            )
+        });
+        if discovery.key_pages_compared == 0 && incomplete {
             found.add(
                 "sitemap_comparison_not_assessed",
                 "",
@@ -1976,6 +1995,11 @@ mod tests {
             only(&none, CategoryId::Discovery, "no_sitemap").status,
             CheckStatus::Info
         );
+
+        // Every sitemap was read, but no key page is indexable: nothing to compare, nothing missing.
+        let mut noindex = clean();
+        noindex.discovery.key_pages_compared = 0;
+        assert!(issues(&noindex, CategoryId::Discovery).is_empty());
 
         let mut partial = clean();
         partial.discovery.sitemaps.push(SitemapFile {

@@ -2428,7 +2428,7 @@ const EN: &[(&str, &str)] = &[
     ),
     (
         "issue.user_fetch_blocked",
-        "{0} (fetches pages on a user's request) is blocked on {1}: {2}",
+        "{0} (fetches pages on a user's request) is blocked on {n} key page(s) of {1}: {2}",
     ),
     (
         "fix.user_fetch_blocked",
@@ -2436,7 +2436,7 @@ const EN: &[(&str, &str)] = &[
     ),
     (
         "issue.user_fetch_blocked_limited",
-        "{0} is blocked on {1}, but its vendor says robots.txt may not apply to it (limited effect): {2}",
+        "{0} is blocked on {n} key page(s) of {1}, but its vendor says robots.txt may not apply to it (limited effect): {2}",
     ),
     (
         "fix.user_fetch_blocked_limited",
@@ -2444,15 +2444,15 @@ const EN: &[(&str, &str)] = &[
     ),
     (
         "issue.training_crawler_blocked",
-        "The AI-training crawler {0} is blocked on {1}: {2}",
+        "{0} (AI training) is blocked on {n} key page(s) of {1}: {2}",
     ),
     (
         "fix.training_crawler_blocked",
-        "Nothing to do if intended: blocking training crawlers does not affect visibility in AI search.",
+        "Nothing to do if intended: blocking AI training does not affect visibility in AI search.",
     ),
     (
         "issue.grounding_control_blocked",
-        "{0} is blocked on {1}: Gemini may use your pages neither for training nor for grounding ({2})",
+        "{0} is blocked on {n} key page(s) of {1}: Gemini may use them neither for training nor for grounding ({2})",
     ),
     (
         "fix.grounding_control_blocked",
@@ -2781,11 +2781,11 @@ const EN: &[(&str, &str)] = &[
     ),
     (
         "issue.sitemap_comparison_not_assessed",
-        "Key pages were not compared with the sitemaps: not every sitemap could be read",
+        "Key pages were not compared with the sitemaps: a sitemap could not be read, or none lists pages",
     ),
     (
         "fix.sitemap_comparison_not_assessed",
-        "Make every sitemap readable to assess the coverage.",
+        "Make every sitemap readable, with a list of the pages, to assess the coverage.",
     ),
     (
         "issue.missing_from_sitemap",
@@ -3183,7 +3183,7 @@ const CS: &[(&str, &str)] = &[
     ),
     (
         "issue.user_fetch_blocked",
-        "{0} (načítá stránky na žádost uživatele) má zakázaný přístup na {1}: {2}",
+        "{0} (načítá stránky na žádost uživatele) má zakázaný přístup na klíčové stránky {1} ({n}): {2}",
     ),
     (
         "fix.user_fetch_blocked",
@@ -3191,7 +3191,7 @@ const CS: &[(&str, &str)] = &[
     ),
     (
         "issue.user_fetch_blocked_limited",
-        "{0} má zakázaný přístup na {1}, ale podle provozovatele se na něj robots.txt nemusí vztahovat (omezený účinek): {2}",
+        "{0} má zakázaný přístup na klíčové stránky {1} ({n}), ale podle provozovatele se na něj robots.txt nemusí vztahovat (omezený účinek): {2}",
     ),
     (
         "fix.user_fetch_blocked_limited",
@@ -3199,15 +3199,15 @@ const CS: &[(&str, &str)] = &[
     ),
     (
         "issue.training_crawler_blocked",
-        "Crawler pro trénování AI {0} má zakázaný přístup na {1}: {2}",
+        "{0} (trénování AI) má zakázaný přístup na klíčové stránky {1} ({n}): {2}",
     ),
     (
         "fix.training_crawler_blocked",
-        "Je-li to záměr, nic nedělejte: blokování trénovacích crawlerů neovlivňuje viditelnost v AI vyhledávání.",
+        "Je-li to záměr, nic nedělejte: zákaz trénování AI neovlivňuje viditelnost v AI vyhledávání.",
     ),
     (
         "issue.grounding_control_blocked",
-        "{0} je zakázán na {1}: Gemini nesmí vaše stránky použít k trénování ani k ukotvení odpovědí ({2})",
+        "{0} je zakázán na klíčových stránkách {1} ({n}): Gemini je nesmí použít k trénování ani k ukotvení odpovědí ({2})",
     ),
     (
         "fix.grounding_control_blocked",
@@ -3508,7 +3508,7 @@ const CS: &[(&str, &str)] = &[
     ),
     (
         "fix.no_site_markup",
-        "Volitelně nasaďte celowebový JSON-LD ze sady (evidence: weak).",
+        "Volitelně nasaďte celowebový JSON-LD ze sady (síla dokladů: slabá).",
     ),
     (
         "issue.no_sitemap",
@@ -3536,11 +3536,11 @@ const CS: &[(&str, &str)] = &[
     ),
     (
         "issue.sitemap_comparison_not_assessed",
-        "Klíčové stránky nebyly porovnány se sitemapami: ne každou sitemapu šlo přečíst",
+        "Klíčové stránky nebyly porovnány se sitemapami: některou sitemapu nešlo přečíst, nebo žádná neuvádí stránky",
     ),
     (
         "fix.sitemap_comparison_not_assessed",
-        "Zajistěte čitelnost všech sitemap, aby šlo pokrytí posoudit.",
+        "Zajistěte čitelnost všech sitemap se seznamem stránek, aby šlo pokrytí posoudit.",
     ),
     (
         "issue.missing_from_sitemap",
@@ -3967,6 +3967,29 @@ mod tests {
                 }
             }
         }
+        for (key, value) in CS {
+            assert!(!value.contains("(evidence"), "{key}: untranslated evidence label");
+        }
+        // A verdict may be "partly blocked": the titles of blocked agents say on how many pages.
+        for key in [
+            "search_crawler_blocked",
+            "search_crawler_partly_blocked",
+            "user_fetch_blocked",
+            "user_fetch_blocked_limited",
+            "training_crawler_blocked",
+            "grounding_control_blocked",
+        ] {
+            for table in [EN, CS] {
+                let template = table
+                    .iter()
+                    .find(|(known, _)| *known == format!("issue.{key}"))
+                    .unwrap()
+                    .1;
+                assert!(template.contains("{n}"), "{key}: {template}");
+            }
+        }
+        // Applebot-Extended, a control token, is reported with this title too.
+        assert!(!text(&ReportLocale::new("en"), "issue.training_crawler_blocked").contains("crawler"));
         let mut en_keys: Vec<&str> = EN.iter().map(|(key, _)| *key).collect();
         let mut cs_keys: Vec<&str> = CS.iter().map(|(key, _)| *key).collect();
         en_keys.sort_unstable();
