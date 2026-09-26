@@ -27,3 +27,8 @@ inside the step's XML envelope, escaped with `sanitize_for_prompt`.
   the same subject.
 - `judge.md` — reviews groups of differing values (`<groups>`) with a lenient rubric;
   `prompts::judge_system` appends the `<output_language>` of the prose.
+
+Each prompt has a `<security>` block that declares its envelope untrusted data, and the unit tests
+check that a forged closing tag or a natural-language instruction inside the data stays inert. The
+code never trusts the answers: facts are verified against the crawler's blocks, ids against the
+supplied lists, and the review's priority, numbers and wording are gated in `judge.rs`.
