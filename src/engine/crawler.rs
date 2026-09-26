@@ -59,7 +59,7 @@ use crate::engine::robots_txt::RobotsTxt;
 use crate::error::{CrawlerError, CrawlerResult};
 use crate::options::core_options::CoreOptions;
 use crate::output::output::Output;
-use crate::result::status::Status;
+use crate::result::status::{RobotsFetchState, Status};
 use crate::result::visited_url::VisitedUrl;
 use crate::types::{ContentTypeId, DeviceType, SkippedReason};
 use crate::utils;
@@ -1501,9 +1501,12 @@ impl Crawler {
         true
     }
 
-    /// Fetch and parse robots.txt for a domain
+    /// Fetch and parse robots.txt for a domain, and record in `Status` how it was fetched.
     pub async fn fetch_robots_txt(&self, domain: &str, port: u16, scheme: &str) {
         if self.options.ignore_robots_txt {
+            if let Ok(st) = self.status.lock() {
+                st.set_robots_txt_state(scheme, domain, port, RobotsFetchState::Skipped);
+            }
             return;
         }
 
@@ -1545,7 +1548,7 @@ impl Crawler {
 
         let count = self.loaded_robots_txt_count.fetch_add(1, Ordering::SeqCst) + 1;
 
-        if let Ok(resp) = response {
+        if let Ok(ref resp) = response {
             if count <= 10
                 && let Ok(st) = self.status.lock()
             {
@@ -1569,6 +1572,15 @@ impl Crawler {
 
                 if let Ok(st) = self.status.lock() {
                     st.set_robots_txt_content(scheme, domain, port, &body_str);
+                    st.set_robots_txt_state(
+                        scheme,
+                        domain,
+                        port,
+                        RobotsFetchState::Ok {
+                            status: 200,
+                            content: body_str.into_owned(),
+                        },
+                    );
                 }
 
                 self.robots_txt_cache.insert(cache_key, Some(robots_txt));
@@ -1578,6 +1590,110 @@ impl Crawler {
 
         // No valid robots.txt found
         self.robots_txt_cache.insert(cache_key, None);
+
+        let robots_url = format!("{}://{}:{}/robots.txt", scheme, domain, port);
+        let state = self.robots_txt_fetch_state(robots_url, response).await;
+        if let Ok(st) = self.status.lock() {
+            st.set_robots_txt_state(scheme, domain, port, state);
+        }
+    }
+
+    /// The fetch state of a robots.txt whose first answer to `url` is `response`: 2xx → `Ok`,
+    /// 429 and 5xx → `Unavailable`, any other 4xx → `NotFound`, a failed request → `Unavailable`.
+    /// Redirects are followed here, up to 5 as RFC 9309 §2.3.1.2 asks, and a loop or a longer
+    /// chain is `Unavailable`. Only this recorded state follows them: the crawl itself obeys a
+    /// robots.txt answered directly with a 200, as before.
+    async fn robots_txt_fetch_state(&self, url: String, response: CrawlerResult<HttpResponse>) -> RobotsFetchState {
+        const MAX_REDIRECTS: usize = 5;
+        let mut visited = vec![url::Url::parse(&url).map(|parsed| parsed.to_string()).unwrap_or(url)];
+        let mut response = response;
+        loop {
+            let resp = match response {
+                Ok(resp) => resp,
+                Err(error) => {
+                    return RobotsFetchState::Unavailable {
+                        status_or_error: error.to_string(),
+                    };
+                }
+            };
+            let code = resp.status_code;
+            let redirect_target = match code {
+                200..=299 => {
+                    return RobotsFetchState::Ok {
+                        status: code,
+                        content: resp.body_text().unwrap_or_default(),
+                    };
+                }
+                300..=399 => resp.get_header("location").and_then(|location| {
+                    let base = url::Url::parse(visited.last()?).ok()?;
+                    base.join(location).ok()
+                }),
+                429 => {
+                    return RobotsFetchState::Unavailable {
+                        status_or_error: "HTTP 429".to_string(),
+                    };
+                }
+                400..=499 => return RobotsFetchState::NotFound { status: code },
+                ..0 => {
+                    return RobotsFetchState::Unavailable {
+                        status_or_error: utils::get_http_client_code_with_error_description(code, false),
+                    };
+                }
+                _ => {
+                    return RobotsFetchState::Unavailable {
+                        status_or_error: format!("HTTP {}", code),
+                    };
+                }
+            };
+            let Some(target) = redirect_target.filter(|target| matches!(target.scheme(), "http" | "https")) else {
+                return RobotsFetchState::Unavailable {
+                    status_or_error: format!("HTTP {} redirect without a usable Location", code),
+                };
+            };
+            let target_url = target.to_string();
+            if visited.contains(&target_url) {
+                return RobotsFetchState::Unavailable {
+                    status_or_error: format!("redirect loop at {}", target_url),
+                };
+            }
+            if visited.len() > MAX_REDIRECTS {
+                return RobotsFetchState::Unavailable {
+                    status_or_error: format!("more than {} redirects", MAX_REDIRECTS),
+                };
+            }
+            visited.push(target_url);
+
+            let scheme = target.scheme();
+            let host = target.host_str().unwrap_or_default();
+            let port = target.port_or_known_default().unwrap_or(80);
+            let path = match target.query() {
+                Some(query) => format!("{}?{}", target.path(), query),
+                None => target.path().to_string(),
+            };
+            let (request_host, request_path) =
+                Self::apply_http_request_transformations(host, &path, &self.options.transform_url);
+            let forced_ip = self
+                .resolve_cache
+                .get(&format!("{}:{}", request_host, port))
+                .map(|v| v.value().clone());
+            response = self
+                .http_client
+                .fetch_http_only(
+                    &request_host,
+                    port,
+                    scheme,
+                    &request_path,
+                    "GET",
+                    3,
+                    &Self::get_crawler_user_agent_signature(),
+                    ACCEPT_HEADER,
+                    "gzip, deflate, br",
+                    None,
+                    ParsedUrl::may_send_credentials(&self.initial_parsed_url, scheme, host, port),
+                    forced_ip.as_deref(),
+                )
+                .await;
+        }
     }
 
     /// Size reported for a crawled URL: the decoded body length. For assets a `Content-Length`

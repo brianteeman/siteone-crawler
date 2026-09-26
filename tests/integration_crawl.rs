@@ -5924,3 +5924,225 @@ fn ai_utility_modes_report_configuration_errors_as_json() {
         "{answer}"
     );
 }
+
+// =========================================================================
+// robots.txt fetch state per origin
+// =========================================================================
+
+/// Fetches robots.txt for the origin of `url` the way the manager does before a crawl, and
+/// returns the fetch state recorded for that origin.
+fn robots_fetch_state(url: &str, extra_args: &[&str]) -> siteone_crawler::result::status::RobotsFetchState {
+    use siteone_crawler::analysis::manager::AnalysisManager;
+    use siteone_crawler::content_processor::manager::ContentProcessorManager;
+    use siteone_crawler::engine::crawler::Crawler;
+    use siteone_crawler::engine::http_client::HttpClient;
+    use siteone_crawler::engine::parsed_url::ParsedUrl;
+    use siteone_crawler::info::Info;
+    use siteone_crawler::output::multi_output::MultiOutput;
+    use siteone_crawler::result::status::Status;
+    use siteone_crawler::result::storage::memory_storage::MemoryStorage;
+    use std::sync::Arc;
+
+    let mut argv = vec![
+        "siteone-crawler".to_string(),
+        format!("--url={url}"),
+        format!("--config-file={}", if cfg!(windows) { "NUL" } else { "/dev/null" }),
+    ];
+    argv.extend(extra_args.iter().map(|arg| arg.to_string()));
+    let options = Arc::new(siteone_crawler::options::core_options::parse_argv(&argv).expect("valid options"));
+    let info = Info::new(
+        "SiteOne Crawler".into(),
+        "test".into(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        url.to_string(),
+    );
+    let status = Status::new(
+        Box::new(MemoryStorage::new(false)),
+        true,
+        info,
+        std::time::Instant::now(),
+    );
+    let http_client = HttpClient::new(None, None, None, false, None, false);
+    let crawler = Crawler::new(
+        options,
+        Arc::new(http_client),
+        ContentProcessorManager::new(),
+        AnalysisManager::new(),
+        Box::new(MultiOutput::new()),
+        status,
+    )
+    .expect("a crawler");
+    let parsed = ParsedUrl::parse(url, None);
+    let host = parsed.host.clone().expect("a host");
+    let port = parsed.port.expect("an explicit port");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    runtime.block_on(crawler.fetch_robots_txt(&host, port, "http"));
+    crawler
+        .get_status()
+        .lock()
+        .expect("the status")
+        .get_robots_txt_state("http", &host, port)
+}
+
+#[test]
+fn robots_txt_fetch_state_is_ok_with_the_content() {
+    use siteone_crawler::result::status::RobotsFetchState;
+
+    let tmp = TempDir::new("robots-state-ok");
+    std::fs::write(tmp.path.join("index.html"), "<html><body>Home</body></html>").expect("index.html");
+    std::fs::write(tmp.path.join("robots.txt"), "User-agent: *\nDisallow: /private/\n").expect("robots.txt");
+    let server = LocalServer::start(&tmp.path);
+
+    assert_eq!(
+        robots_fetch_state(&server.url(), &[]),
+        RobotsFetchState::Ok {
+            status: 200,
+            content: "User-agent: *\nDisallow: /private/\n".to_string(),
+        }
+    );
+}
+
+#[test]
+fn robots_txt_fetch_state_is_not_found_for_a_404() {
+    use siteone_crawler::result::status::RobotsFetchState;
+
+    let tmp = TempDir::new("robots-state-404");
+    std::fs::write(tmp.path.join("index.html"), "<html><body>Home</body></html>").expect("index.html");
+    let server = LocalServer::start(&tmp.path);
+
+    assert_eq!(
+        robots_fetch_state(&server.url(), &[]),
+        RobotsFetchState::NotFound { status: 404 }
+    );
+}
+
+#[test]
+fn robots_txt_fetch_state_is_unavailable_for_a_503() {
+    use siteone_crawler::result::status::RobotsFetchState;
+
+    let server = RecordingServer::start(vec![Route {
+        path: "/robots.txt",
+        headers: vec![("Status", "503 Service Unavailable".to_string())],
+        body: b"User-agent: *\nDisallow: /\n".to_vec(),
+    }]);
+
+    let state = robots_fetch_state(&server.url(), &[]);
+    assert!(
+        matches!(&state, RobotsFetchState::Unavailable { status_or_error } if status_or_error.contains("503")),
+        "{state:?}"
+    );
+
+    // A 429 does not say that the file is missing: like a 5xx, the rules stay unknown.
+    let rate_limited = RecordingServer::start(vec![Route {
+        path: "/robots.txt",
+        headers: vec![("Status", "429 Too Many Requests".to_string())],
+        body: Vec::new(),
+    }]);
+    let state = robots_fetch_state(&rate_limited.url(), &[]);
+    assert!(
+        matches!(&state, RobotsFetchState::Unavailable { status_or_error } if status_or_error.contains("429")),
+        "{state:?}"
+    );
+}
+
+#[test]
+fn robots_txt_fetch_state_is_unavailable_when_the_server_cannot_be_reached() {
+    use siteone_crawler::result::status::RobotsFetchState;
+
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("a free port")
+        .port();
+
+    let state = robots_fetch_state(&format!("http://127.0.0.1:{port}/"), &[]);
+    assert!(matches!(state, RobotsFetchState::Unavailable { .. }), "{state:?}");
+}
+
+#[test]
+fn robots_txt_fetch_state_follows_redirects_and_reports_a_loop() {
+    use siteone_crawler::result::status::RobotsFetchState;
+
+    let tmp = TempDir::new("robots-state-redirect");
+    std::fs::write(tmp.path.join("real-robots.txt"), "User-agent: *\nDisallow: /x/\n").expect("real-robots.txt");
+    let redirected = RedirectServer::start(
+        &tmp.path,
+        vec![Redirect {
+            host: None,
+            path: Some("/robots.txt"),
+            location: "http://127.0.0.1:{port}/real-robots.txt",
+        }],
+    );
+    assert_eq!(
+        robots_fetch_state(&format!("http://127.0.0.1:{}/", redirected.port()), &[]),
+        RobotsFetchState::Ok {
+            status: 200,
+            content: "User-agent: *\nDisallow: /x/\n".to_string(),
+        }
+    );
+
+    let looping = RedirectServer::start(
+        &tmp.path,
+        vec![Redirect {
+            host: None,
+            path: Some("/robots.txt"),
+            location: "http://127.0.0.1:{port}/robots.txt",
+        }],
+    );
+    let state = robots_fetch_state(&format!("http://127.0.0.1:{}/", looping.port()), &[]);
+    assert!(
+        matches!(&state, RobotsFetchState::Unavailable { status_or_error } if status_or_error.contains("redirect")),
+        "{state:?}"
+    );
+}
+
+#[test]
+fn robots_txt_fetch_state_is_skipped_with_ignore_robots_txt() {
+    use siteone_crawler::result::status::RobotsFetchState;
+
+    let tmp = TempDir::new("robots-state-skipped");
+    std::fs::write(tmp.path.join("robots.txt"), "User-agent: *\nDisallow: /\n").expect("robots.txt");
+    let server = LocalServer::start(&tmp.path);
+
+    assert_eq!(
+        robots_fetch_state(&server.url(), &["--ignore-robots-txt"]),
+        RobotsFetchState::Skipped
+    );
+}
+
+#[test]
+fn robots_txt_fetch_state_is_not_attempted_for_an_origin_never_fetched() {
+    use siteone_crawler::result::status::{RobotsFetchState, Status};
+    use siteone_crawler::result::storage::memory_storage::MemoryStorage;
+
+    let status = Status::new(
+        Box::new(MemoryStorage::new(false)),
+        true,
+        siteone_crawler::info::Info::new(
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ),
+        std::time::Instant::now(),
+    );
+    assert_eq!(
+        status.get_robots_txt_state("https", "example.com", 443),
+        RobotsFetchState::NotAttempted
+    );
+    assert_eq!(
+        serde_json::to_value(RobotsFetchState::Unavailable {
+            status_or_error: "HTTP 503".into()
+        })
+        .unwrap(),
+        serde_json::json!({"state": "unavailable", "statusOrError": "HTTP 503"})
+    );
+}

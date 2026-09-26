@@ -54,6 +54,9 @@ pub struct Status {
     /// Robots.txt content - key is "scheme://host:port"
     robots_txt_content: RwLock<HashMap<String, String>>,
 
+    /// How robots.txt was fetched - key is "scheme://host:port"
+    robots_txt_state: RwLock<HashMap<String, RobotsFetchState>>,
+
     /// Skipped URLs (transferred from crawler after crawling)
     skipped_urls: Mutex<Vec<SkippedUrlEntry>>,
 
@@ -71,6 +74,23 @@ pub struct Status {
 
     /// Per-URL browser-rendering diagnostics, keyed by uq_id (only populated in --browser mode).
     browser_diagnostics: Mutex<HashMap<String, crate::browser::diagnostics::BrowserDiagnostics>>,
+}
+
+/// How the robots.txt of one origin was fetched. Only `Ok` and `NotFound` say what the file
+/// is; the other states leave its rules unknown.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum RobotsFetchState {
+    /// A 2xx answer (after redirects), with its body.
+    Ok { status: i32, content: String },
+    /// A 4xx answer other than 429: there is no robots.txt.
+    NotFound { status: i32 },
+    /// A 429 or 5xx answer, a timeout, a network error or a redirect loop.
+    Unavailable { status_or_error: String },
+    /// Not fetched because of `--ignore-robots-txt`.
+    Skipped,
+    /// Never fetched for this origin.
+    NotAttempted,
 }
 
 /// Entry for a skipped URL stored in Status
@@ -108,6 +128,7 @@ impl Status {
             visited_urls: Mutex::new(IndexMap::new()),
             visited_url_to_analysis_result: Mutex::new(HashMap::new()),
             robots_txt_content: RwLock::new(HashMap::new()),
+            robots_txt_state: RwLock::new(HashMap::new()),
             skipped_urls: Mutex::new(Vec::new()),
             ai_report_summary_html: Mutex::new(None),
             ai_report_model: Mutex::new(None),
@@ -565,6 +586,23 @@ impl Status {
             .read()
             .ok()
             .and_then(|map| map.get(&key).cloned())
+    }
+
+    pub fn set_robots_txt_state(&self, scheme: &str, host: &str, port: u16, state: RobotsFetchState) {
+        let key = format!("{}://{}:{}", scheme, host, port);
+        if let Ok(mut map) = self.robots_txt_state.write() {
+            map.insert(key, state);
+        }
+    }
+
+    /// How the robots.txt of the origin was fetched; `NotAttempted` when it never was.
+    pub fn get_robots_txt_state(&self, scheme: &str, host: &str, port: u16) -> RobotsFetchState {
+        let key = format!("{}://{}:{}", scheme, host, port);
+        self.robots_txt_state
+            .read()
+            .ok()
+            .and_then(|map| map.get(&key).cloned())
+            .unwrap_or(RobotsFetchState::NotAttempted)
     }
 }
 
