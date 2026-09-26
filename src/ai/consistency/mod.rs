@@ -119,6 +119,51 @@ fn report_error(status: &Arc<Mutex<Status>>, msg: &str) {
     }
 }
 
+/// The sources of the pages to extract, and the pages that have content blocks of which none fits
+/// the extraction budget (e.g. next to a very long URL): those are not sent, but reported (as
+/// reduced pages with all their blocks omitted), never silently dropped. A page without content
+/// blocks is neither.
+fn page_sources(
+    pages: &[Page],
+    pages_blocks: &[(usize, Vec<Block>)],
+    budget: usize,
+) -> (Vec<AnalysisSource>, Vec<AnalysisSource>) {
+    pages
+        .iter()
+        .zip(pages_blocks)
+        .map(|(page, (_, blocks))| page_source(page, blocks, budget))
+        .filter(|source| !source.blocks.is_empty() || source.omitted_blocks > 0)
+        .partition(|source| !source.blocks.is_empty())
+}
+
+/// The audit record of a page none of whose blocks fit the extraction budget.
+fn unfit_source_out(source: &AnalysisSource) -> SourceOut {
+    SourceOut {
+        id: source.id,
+        kind: source.kind,
+        url: source.url.clone(),
+        path: source.path.clone(),
+        blocks: source.blocks.len(),
+        omitted_blocks: source.omitted_blocks,
+        truncated_blocks: source.truncated_blocks,
+        facts: 0,
+        ungrounded: 0,
+        failed: false,
+    }
+}
+
+/// The pages analyzed (content sent and extracted) and the pages reduced (blocks left out or cut,
+/// all of them for a page over the budget) among the page sources of `outs`.
+fn page_counts(outs: &[SourceOut]) -> (usize, usize) {
+    let pages = || outs.iter().filter(|s| s.kind == SourceKind::Page && !s.failed);
+    (
+        pages().filter(|s| s.blocks > 0).count(),
+        pages()
+            .filter(|s| s.omitted_blocks > 0 || s.truncated_blocks > 0)
+            .count(),
+    )
+}
+
 /// The country whose dialling rules read the national phone numbers of `source` (see
 /// `grounding::site_country`): for a page, by its own host and language (`langs[page]`; none: the
 /// site's) — a language without a region takes the site's country only when it is the site's
@@ -251,12 +296,7 @@ pub async fn run(options: &CoreOptions, status: &Arc<Mutex<Status>>, output: &Ar
     // national phone numbers by its own host and language (`source_country`).
     let site_lang = langs.iter().find(|lang| !lang.is_empty()).cloned().unwrap_or_default();
 
-    let mut sources: Vec<AnalysisSource> = pages
-        .iter()
-        .zip(&pages_blocks)
-        .map(|(page, (_, blocks))| page_source(page, blocks, budgets.extract_input_bytes))
-        .filter(|source| !source.blocks.is_empty())
-        .collect();
+    let (mut sources, unfit) = page_sources(&pages, &pages_blocks, budgets.extract_input_bytes);
     let lines = chrome_lines(&pages_blocks);
     drop(pages_blocks);
     let page_sources = sources.len();
@@ -357,6 +397,8 @@ pub async fn run(options: &CoreOptions, status: &Arc<Mutex<Status>>, output: &Ar
             failed: failed_sources.last().is_some_and(|f| f.id == source.id),
         });
     }
+    // Pages none of whose content fit the budget: nothing was sent, all their blocks are omitted.
+    source_outs.extend(unfit.iter().map(unfit_source_out));
     eprintln!(
         "{}",
         utils::get_color_text(
@@ -460,13 +502,7 @@ pub async fn run(options: &CoreOptions, status: &Arc<Mutex<Status>>, output: &Ar
     if per_call > 0 {
         failed_reviews = to_review.len() - reviewed;
     }
-    let pages_reduced = sources
-        .iter()
-        .zip(&source_outs)
-        .filter(|(s, out)| {
-            s.kind == SourceKind::Page && !out.failed && (s.omitted_blocks > 0 || s.truncated_blocks > 0)
-        })
-        .count();
+    let (pages_analyzed, pages_reduced) = page_counts(&source_outs);
     let chrome_lines_analyzed = sources
         .iter()
         .zip(&source_outs)
@@ -483,10 +519,7 @@ pub async fn run(options: &CoreOptions, status: &Arc<Mutex<Status>>, output: &Ar
         context_window: budget.context_tokens(),
         pages_eligible: eligible,
         pages_selected: selected,
-        pages_analyzed: source_outs
-            .iter()
-            .filter(|s| s.kind == SourceKind::Page && !s.failed)
-            .count(),
+        pages_analyzed,
         pages_missing_body: missing_body,
         pages_reduced,
         chrome_lines_analyzed,
@@ -1764,5 +1797,57 @@ mod country_tests {
         // Header/footer lines: the country all their pages share, else none.
         assert_eq!(country(SourceKind::Chrome, 9, &[0, 2, 3]), Some("DE"));
         assert_eq!(country(SourceKind::Chrome, 9, &[0, 1, 2]), None);
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::model::{Page, SourceKind};
+    use super::{page_counts, page_sources, unfit_source_out};
+    use crate::ai::blocks::blocks_from_html;
+
+    #[test]
+    fn a_page_whose_content_fits_no_budget_is_reported_not_dropped() {
+        let pages = vec![
+            Page {
+                index: 0,
+                url: "https://example.com/".to_string(),
+                path: "/".to_string(),
+                title: "Service".to_string(),
+            },
+            Page {
+                index: 1,
+                url: format!("https://example.com/?q={}", "x".repeat(4_000)),
+                path: "/?q=…".to_string(),
+                title: "Service".to_string(),
+            },
+            Page {
+                index: 2,
+                url: "https://example.com/empty".to_string(),
+                path: "/empty".to_string(),
+                title: String::new(),
+            },
+        ];
+        let html = "<main><h1>Service</h1><p>Company ID 12345678</p></main>";
+        let pages_blocks = vec![
+            (0, blocks_from_html(html)),
+            (1, blocks_from_html(html)),
+            (2, blocks_from_html("<main></main>")),
+        ];
+        let (sources, unfit) = page_sources(&pages, &pages_blocks, 3_072);
+        assert_eq!(sources.iter().map(|s| s.id).collect::<Vec<_>>(), [0]);
+        assert_eq!(
+            unfit.iter().map(|s| s.id).collect::<Vec<_>>(),
+            [1],
+            "not the empty page"
+        );
+        assert_eq!(unfit[0].omitted_blocks, 2);
+
+        let mut outs: Vec<_> = Vec::new();
+        outs.extend(unfit.iter().map(unfit_source_out));
+        assert_eq!(outs[0].kind, SourceKind::Page);
+        assert_eq!((outs[0].blocks, outs[0].omitted_blocks, outs[0].failed), (0, 2, false));
+        // Analyzed: pages with content sent; reduced: pages with blocks not inspected.
+        assert_eq!(page_counts(&outs), (0, 1));
     }
 }

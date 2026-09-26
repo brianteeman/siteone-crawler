@@ -75,7 +75,8 @@ pub struct Meta {
     pub pages_analyzed: usize,
     /// Selected pages without a stored HTML body.
     pub pages_missing_body: usize,
-    /// Analyzed pages whose input was reduced (blocks left out or cut).
+    /// Selected pages whose input was reduced (blocks left out or cut; all of them for a page
+    /// whose content fit no extraction request, which is then not analyzed).
     pub pages_reduced: usize,
     pub chrome_lines_analyzed: usize,
     pub chrome_lines_excluded: usize,
@@ -557,8 +558,8 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ),
     (
         "reason_pages_reduced",
-        "{n} page was too long: some of its blocks were not inspected|{n} pages were too long: some of their blocks were not inspected",
-        "{n} stránka byla příliš dlouhá: část jejích bloků nebyla prověřena|{n} stránky byly příliš dlouhé: část jejich bloků nebyla prověřena|{n} stránek bylo příliš dlouhých: část jejich bloků nebyla prověřena",
+        "{n} page was too long: some or all of its blocks were not inspected|{n} pages were too long: some or all of their blocks were not inspected",
+        "{n} stránka byla příliš dlouhá: některé nebo všechny její bloky nebyly prověřeny|{n} stránky byly příliš dlouhé: některé nebo všechny jejich bloky nebyly prověřeny|{n} stránek bylo příliš dlouhých: některé nebo všechny jejich bloky nebyly prověřeny",
     ),
     (
         "reason_chrome_lines_excluded",
