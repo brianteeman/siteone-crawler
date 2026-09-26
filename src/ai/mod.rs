@@ -6,6 +6,7 @@
 // Nothing here runs unless the user explicitly configures an AI provider.
 
 pub mod actions;
+pub mod blocks;
 pub mod client;
 pub mod config;
 pub mod elaborate;
