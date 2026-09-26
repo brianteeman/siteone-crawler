@@ -512,6 +512,19 @@ impl Counts {
             ..Counts::default()
         }
     }
+
+    /// A check of the key pages that could run on `checked` of them; the others (no HTML page with
+    /// a body: a redirect, an error, another content type) are skipped.
+    fn of_key_pages(key_pages: usize, checked: usize, reason: &'static str) -> Self {
+        let attempted = key_pages.max(checked);
+        Counts {
+            attempted,
+            succeeded: checked,
+            skipped: attempted - checked,
+            reason,
+            ..Counts::default()
+        }
+    }
 }
 
 /// Collects the issues of one category.
@@ -945,7 +958,7 @@ fn indexing_controls(checks: &Checks, found: &mut Found) -> Counts {
         );
     }
     grouped.emit(found, Evidence::Strong);
-    Counts::all(checks.controls.len(), "no_pages_checked")
+    Counts::of_key_pages(checks.key_pages.len(), checks.controls.len(), "no_pages_checked")
 }
 
 fn rendering(checks: &Checks, found: &mut Found) -> Counts {
@@ -962,7 +975,7 @@ fn rendering(checks: &Checks, found: &mut Found) -> Counts {
             pages,
         );
     }
-    Counts::all(checks.render.checked, "no_pages_checked")
+    Counts::of_key_pages(checks.key_pages.len(), checks.render.checked, "no_pages_checked")
 }
 
 fn llm_counts(run: &AnalysisRun) -> Counts {
@@ -1205,7 +1218,7 @@ fn structured_data(checks: &Checks, found: &mut Found) -> Counts {
             );
         }
     }
-    Counts::all(checks.markup.len(), "no_pages_checked")
+    Counts::of_key_pages(checks.key_pages.len(), checks.markup.len(), "no_pages_checked")
 }
 
 fn discovery(checks: &Checks, found: &mut Found) -> Counts {
@@ -1326,7 +1339,7 @@ fn discovery(checks: &Checks, found: &mut Found) -> Counts {
             Vec::new(),
         );
     }
-    Counts::all(coverage.pages, "no_pages_checked")
+    Counts::of_key_pages(checks.key_pages.len(), coverage.pages, "no_pages_checked")
 }
 
 #[cfg(test)]
@@ -1517,6 +1530,29 @@ mod tests {
             (1, 1, 0, 0)
         );
         assert_eq!(state(&clean(), CategoryId::ObservedAccess).attempted, 2);
+    }
+
+    #[test]
+    fn key_pages_that_could_not_be_checked_count_as_skipped() {
+        let mut checks = clean();
+        let mut denied = key("https://example.com/zakazano");
+        denied.status_code = 403;
+        denied.score = None;
+        checks.key_pages.push(denied);
+        for category in [
+            CategoryId::IndexingControls,
+            CategoryId::Rendering,
+            CategoryId::StructuredData,
+            CategoryId::Discovery,
+        ] {
+            let counted = state(&checks, category);
+            assert_eq!(
+                (counted.attempted, counted.succeeded, counted.failed, counted.skipped),
+                (3, 2, 0, 1),
+                "{category:?}: a 403 key page has no HTML to check"
+            );
+            assert_eq!(counted.status, CheckStatus::Ok);
+        }
     }
 
     #[test]
