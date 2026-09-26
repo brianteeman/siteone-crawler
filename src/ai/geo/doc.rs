@@ -245,12 +245,22 @@ pub fn text(locale: &ReportLocale, key: &str) -> &'static str {
         .map_or("", |(_, text)| text)
 }
 
-/// A template with `{0}`, `{1}`, … replaced by `args`, `{*}` by all of them joined with `; ` and
-/// `{n}` by `count`.
+/// At most this many arguments are shown for `{*}`.
+const MAX_LISTED_ARGS: usize = 3;
+
+/// A template with `{0}`, `{1}`, … replaced by `args`, `{*}` by the first `MAX_LISTED_ARGS` of them
+/// joined with `; ` (and `…` when there are more) and `{n}` by `count`.
 fn fill(template: &str, args: &[String], count: usize) -> String {
-    let mut out = template
-        .replace("{n}", &count.to_string())
-        .replace("{*}", &args.join("; "));
+    let mut listed = args
+        .iter()
+        .take(MAX_LISTED_ARGS)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ");
+    if args.len() > MAX_LISTED_ARGS {
+        listed.push_str("; …");
+    }
+    let mut out = template.replace("{n}", &count.to_string()).replace("{*}", &listed);
     for (index, arg) in args.iter().enumerate() {
         out = out.replace(&format!("{{{index}}}"), arg);
     }
@@ -274,7 +284,8 @@ fn issue_fix(locale: &ReportLocale, issue: &Issue) -> String {
 }
 
 /// The report's opening lines: how many categories have problems and points to review on how
-/// many key pages, what could not be assessed, and the biggest lever (the first priority).
+/// many key pages, what could not be assessed, and the biggest lever (the first priority, when it
+/// is a problem or a point to review).
 pub fn summary(locale: &ReportLocale, cats: &[(CategoryId, CategoryState)], priorities: &[&Issue]) -> String {
     let count = |status: CheckStatus| cats.iter().filter(|(_, state)| state.status == status).count();
     let key_pages = cats
@@ -303,7 +314,11 @@ pub fn summary(locale: &ReportLocale, cats: &[(CategoryId, CategoryState)], prio
         out.push_str(text(locale, "summary.access_not_assessed"));
     }
     out.push(' ');
-    match priorities.first() {
+    // Only a problem or a point to review is a lever; an Info item may need no action at all.
+    match priorities
+        .first()
+        .filter(|first| matches!(first.status, CheckStatus::Problem | CheckStatus::Attention))
+    {
         Some(first) => out.push_str(&fill(text(locale, "summary.lever"), &[issue_title(locale, first)], 0)),
         None => out.push_str(text(locale, "summary.nothing_found")),
     }
@@ -4018,6 +4033,42 @@ mod tests {
         );
         let nothing = summary(&ReportLocale::new("en"), &[], &[]);
         assert!(nothing.contains(text(&ReportLocale::new("en"), "summary.nothing_found")));
+    }
+
+    #[test]
+    fn issue_titles_show_at_most_three_arguments_and_info_is_no_lever() {
+        let en = ReportLocale::new("en");
+        let targets: Vec<String> = (0..150).map(|i| format!("https://example.com/p{i}/")).collect();
+        let issue = Issue {
+            id: "indexing_controls.canonical_elsewhere".to_string(),
+            category: CategoryId::IndexingControls,
+            status: CheckStatus::Attention,
+            evidence: crate::ai::geo::findings::Evidence::Strong,
+            scope: "Google, Bing",
+            source: crate::ai::geo::findings::SRC_GOOGLE_AI_FEATURES,
+            title_key: "canonical_elsewhere",
+            args: targets.clone(),
+            pages: targets
+                .iter()
+                .map(|target| target.trim_end_matches('/').to_string())
+                .collect(),
+        };
+        let title = issue_title(&en, &issue);
+        assert!(title.contains("https://example.com/p2/; …"), "{title}");
+        assert!(!title.contains("https://example.com/p3/"), "{title}");
+        assert!(title.starts_with("150 key page(s)"), "{title}");
+
+        let info = Issue {
+            status: CheckStatus::Info,
+            title_key: "training_crawler_blocked",
+            args: vec!["GPTBot".to_string(), "https://example.com".to_string(), String::new()],
+            ..issue.clone()
+        };
+        let calm = summary(&en, &[], &[&info]);
+        assert!(calm.contains(text(&en, "summary.nothing_found")), "{calm}");
+        assert!(!calm.contains("GPTBot"), "an Info item is no lever: {calm}");
+        let lever = summary(&en, &[], &[&issue, &info]);
+        assert!(lever.contains("The biggest lever: 150 key page(s)"), "{lever}");
     }
 
     #[test]
