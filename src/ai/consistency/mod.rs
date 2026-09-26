@@ -11,6 +11,7 @@
 //   judge    — deterministic candidates (differing values stated in several places), cohorts, a
 //              fair review allocation, and the validated, policy-gated review.
 
+pub mod doc;
 pub mod extract;
 pub mod judge;
 pub mod keys;

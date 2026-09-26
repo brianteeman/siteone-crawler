@@ -415,7 +415,7 @@ fn fmt_dur_ms(ms: u64) -> String {
 }
 
 /// Escape text for safe HTML embedding.
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
     for c in s.chars() {
         match c {
@@ -436,7 +436,7 @@ fn esc(s: &str) -> String {
 /// whitespace and C0 control characters are removed first, mirroring (more strictly than) the
 /// browser URL parser — otherwise `" javascript:"` or `"java\tscript:"` would slip past the scheme
 /// scan and execute on click.
-fn is_safe_url(url: &str) -> bool {
+pub(crate) fn is_safe_url(url: &str) -> bool {
     let normalized: String = url
         .chars()
         .filter(|c| !c.is_ascii_whitespace() && (*c as u32) >= 0x20)
@@ -641,7 +641,7 @@ fn render_bold(s: &str) -> String {
 
 /// The SiteOne Crawler wordmark logo (same artwork as the audit report). Its two paths use CSS
 /// variables (`--logo-a`/`--logo-b`) so it re-tints for the light/dark theme.
-const LOGO_SVG: &str = r##"<svg class="logo-svg" viewBox="0 0 119 59" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M49.4 29.1L49.4 29.1L49.4 29.1l8.8-8.8l0 0h0V0h-9.9v16.2l-5.9 5.9L29.1 8.9L15.9 22.1l-5.9-5.9V0H0v20.2h0l0 0l8.8 8.8l0 0l0 0L0 37.9l0 0h0v20.2h9.9V42l5.9-5.9l13.3 13.3l13.3-13.3l5.9 5.9v16.2h9.9V38h0l0 0L49.4 29.1z M29.1 35.4l-6.3-6.3l6.3-6.3l6.3 6.3L29.1 35.4z" fill="var(--logo-a)"/><path fill-rule="evenodd" clip-rule="evenodd" d="M92.3 15v33.2H75.5v10H119v-10h-16.4V0h-9.3L67.1 26.2l7 7C74.1 33.2 92.3 15 92.3 15z" fill="var(--logo-b)"/></svg>"##;
+pub(crate) const LOGO_SVG: &str = r##"<svg class="logo-svg" viewBox="0 0 119 59" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M49.4 29.1L49.4 29.1L49.4 29.1l8.8-8.8l0 0h0V0h-9.9v16.2l-5.9 5.9L29.1 8.9L15.9 22.1l-5.9-5.9V0H0v20.2h0l0 0l8.8 8.8l0 0l0 0L0 37.9l0 0h0v20.2h9.9V42l5.9-5.9l13.3 13.3l13.3-13.3l5.9 5.9v16.2h9.9V38h0l0 0L49.4 29.1z M29.1 35.4l-6.3-6.3l6.3-6.3l6.3 6.3L29.1 35.4z" fill="var(--logo-a)"/><path fill-rule="evenodd" clip-rule="evenodd" d="M92.3 15v33.2H75.5v10H119v-10h-16.4V0h-9.3L67.1 26.2l7 7C74.1 33.2 92.3 15 92.3 15z" fill="var(--logo-b)"/></svg>"##;
 
 const CSS: &str = r#":root{--bg:#f3f4f6;--surface:#fff;--ink:#111827;--muted:#6b7280;--border:#e5e7eb;--accent:#4e79a7;--accent-ink:#fff;--chipbg:#eef2f7;--logo-a:#111827;--logo-b:#4e79a7}
 [data-theme="dark"]{--bg:#0f172a;--surface:#1f2937;--ink:#e5e7eb;--muted:#9ca3af;--border:#374151;--accent:#7aa8d6;--accent-ink:#0f172a;--chipbg:#243244;--logo-a:#e5e7eb;--logo-b:#7aa8d6}
