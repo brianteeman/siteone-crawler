@@ -52,7 +52,7 @@ pub struct Candidate {
 /// reused by both `select_pages` (which caps it) and the brand-elaborate selector (which clusters
 /// and LLM-selects over it).
 pub struct CandidateSet {
-    /// Candidates sorted by `score` descending. NOT capped.
+    /// Candidates sorted by `score` descending, ties by URL. NOT capped.
     pub candidates: Vec<Candidate>,
     pub total_html_pages: usize,
     pub total_eligible_before_masks: usize,
@@ -122,7 +122,14 @@ pub fn build_candidates(status: &Status, include: &[String], exclude: &[String])
             score: score_page(u, init_uq.as_deref(), &depths, &fanout),
         })
         .collect();
-    candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    // Ties are broken by URL, so the order (and the --ai-max-pages cut) does not depend on the
+    // order in which the crawl happened to complete.
+    candidates.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.url.cmp(&b.url))
+    });
 
     CandidateSet {
         candidates,
@@ -294,6 +301,96 @@ mod tests {
         let res = compile(&["(unclosed".to_string()], "include");
         assert_eq!(res.len(), 1);
         assert!(!res[0].is_match("https://example.test/private").unwrap());
+    }
+
+    /// A status with the homepage and `pages` (all linked from it, so of equal score), stored
+    /// in the order given — as a crawl completing in that order would store them.
+    fn status_with(pages: &[&str]) -> Status {
+        use crate::info::Info;
+        use crate::result::storage::memory_storage::MemoryStorage;
+        use crate::result::visited_url::SOURCE_A_HREF;
+
+        let info = Info::new(
+            "SiteOne Crawler".to_string(),
+            "test".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            "https://example.com/".to_string(),
+        );
+        let mut status = Status::new(
+            Box::new(MemoryStorage::new(false)),
+            true,
+            info,
+            std::time::Instant::now(),
+        );
+        let page = |uq_id: &str, source: &str, attr: i32, url: &str| {
+            VisitedUrl::new(
+                uq_id.to_string(),
+                source.to_string(),
+                attr,
+                url.to_string(),
+                200,
+                0.1,
+                Some(100),
+                ContentTypeId::Html,
+                Some("text/html".to_string()),
+                None,
+                None,
+                false,
+                true,
+                0,
+                None,
+            )
+        };
+        status.add_visited_url(page("home", "", SOURCE_INIT_URL, "https://example.com/"), None, None);
+        for path in pages {
+            let url = format!("https://example.com/{path}");
+            status.add_visited_url(page(path, "home", SOURCE_A_HREF, &url), None, None);
+        }
+        status
+    }
+
+    #[test]
+    fn ties_are_broken_by_url() {
+        let urls = |status: &Status| -> Vec<String> {
+            build_candidates(status, &[], &[])
+                .candidates
+                .into_iter()
+                .map(|c| c.url)
+                .collect()
+        };
+        let forward = status_with(&["c", "a", "b"]);
+        let reversed = status_with(&["b", "a", "c"]);
+        let scores: Vec<f64> = build_candidates(&forward, &[], &[])
+            .candidates
+            .iter()
+            .skip(1)
+            .map(|c| c.score)
+            .collect();
+        assert!(
+            scores.windows(2).all(|pair| pair[0] == pair[1]),
+            "equal scores: {scores:?}"
+        );
+
+        let expected = [
+            "https://example.com/",
+            "https://example.com/a",
+            "https://example.com/b",
+            "https://example.com/c",
+        ];
+        assert_eq!(urls(&forward), expected);
+        assert_eq!(urls(&reversed), expected);
+        // The --ai-max-pages cut therefore does not depend on the crawl completion order.
+        let cut = |status: &Status| -> Vec<String> {
+            select_pages(status, &[], &[], 2)
+                .selected
+                .into_iter()
+                .map(|p| p.url)
+                .collect()
+        };
+        assert_eq!(cut(&forward), cut(&reversed));
     }
 
     #[test]
