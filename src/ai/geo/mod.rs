@@ -7,6 +7,7 @@
 pub mod access;
 pub mod agents;
 pub mod controls;
+pub mod jsonld;
 pub mod keys;
 pub mod render;
 pub mod robots_ai;
