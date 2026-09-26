@@ -9,6 +9,7 @@ pub mod actions;
 pub mod blocks;
 pub mod client;
 pub mod config;
+pub mod consistency;
 pub mod elaborate;
 pub mod grounding;
 pub mod normalize;
