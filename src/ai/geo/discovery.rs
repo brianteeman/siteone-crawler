@@ -17,7 +17,7 @@ use quick_xml::events::Event;
 use scraper::{Html, Selector};
 
 use crate::ai::geo::controls::{bing_policy, canonical_elsewhere, google_policy, sources};
-use crate::ai::geo::keys::{KeyPage, normalized_url, visits_by_url};
+use crate::ai::geo::keys::{KeyPage, normalized_url, redirect_chain, visits_by_url};
 use crate::ai::geo::signals::{LastModifiedCoverage, last_modified_coverage};
 use crate::content_processor::xml_processor::XmlProcessor;
 use crate::result::status::Status;
@@ -88,6 +88,11 @@ pub enum SitemapState {
     /// Declared in robots.txt (or listed in an index) with a URL that is not an absolute http(s)
     /// URL, which engines do not use (Google requires a fully-qualified sitemap URL).
     NotAbsolute,
+    /// Redirects (through a crawled chain) to this URL.
+    Redirected(String),
+    /// A feed or text sitemap ("RSS", "Atom", "text"), which engines accept but this check does
+    /// not read.
+    Unsupported(&'static str),
 }
 
 /// A sitemap declared in robots.txt, crawled, or listed in a crawled sitemap index.
@@ -145,7 +150,8 @@ pub struct Discovery {
     /// By URL.
     pub listed_issues: Vec<ListedIssue>,
     /// Indexable key pages (200 HTML, no `noindex`, no canonical elsewhere) compared with the
-    /// sitemaps; 0 when no `<urlset>` was parsed.
+    /// sitemaps; 0 — not assessed — when no `<urlset>` was parsed or a known sitemap could not be
+    /// read, since the comparison would then be incomplete.
     pub key_pages_compared: usize,
     /// Of those, the ones no sitemap lists, in key-page order.
     pub missing_from_sitemaps: Vec<String>,
@@ -317,13 +323,20 @@ pub fn discovery(status: &Status, key: &[KeyPage], declared: &[String], now: Dat
         if visit.content_type != ContentTypeId::Xml && !expected {
             continue;
         }
-        let state = if visit.status_code != 200 {
+        let state = if (301..=308).contains(&visit.status_code) {
+            match redirect_target(visit, &by_url) {
+                Some(target) => SitemapState::Redirected(target),
+                None => SitemapState::Failed(visit.status_code),
+            }
+        } else if visit.status_code != 200 {
             SitemapState::Failed(visit.status_code)
         } else {
-            let parsed = status
-                .get_url_body_text(&visit.uq_id)
-                .ok_or_else(|| "empty file".to_string())
-                .and_then(|body| parse_sitemap(&body));
+            let body = status.get_url_body_text(&visit.uq_id).unwrap_or_default();
+            let parsed = if body.trim().is_empty() {
+                Err("empty file".to_string())
+            } else {
+                parse_sitemap(&body)
+            };
             match parsed {
                 Ok(parsed) => {
                     let locs = parsed.entries.iter().map(|entry| entry.loc.clone());
@@ -337,7 +350,10 @@ pub fn discovery(status: &Status, key: &[KeyPage], declared: &[String], now: Dat
                         lastmod: lastmod_stats(&parsed.entries, now),
                     }
                 }
-                Err(error) => SitemapState::Malformed(error),
+                Err(error) => match other_format(&body) {
+                    Some(format) => SitemapState::Unsupported(format),
+                    None => SitemapState::Malformed(error),
+                },
             }
         };
         if !expected && !matches!(state, SitemapState::Parsed { .. }) {
@@ -372,6 +388,8 @@ pub fn discovery(status: &Status, key: &[KeyPage], declared: &[String], now: Dat
             );
         }
     }
+    // Key pages are compared only with a complete set: every known sitemap was read (a relative
+    // declaration, which engines ignore, does not count), or redirects to one that was.
     let has_url_set = files.values().any(|file| {
         matches!(
             file.state,
@@ -381,6 +399,17 @@ pub fn discovery(status: &Status, key: &[KeyPage], declared: &[String], now: Dat
             }
         )
     });
+    let is_parsed = |url: &str| {
+        files
+            .get(&normalized_url(url))
+            .is_some_and(|file| matches!(file.state, SitemapState::Parsed { .. }))
+    };
+    let complete = files.values().all(|file| match &file.state {
+        SitemapState::Parsed { .. } | SitemapState::NotAbsolute => true,
+        SitemapState::Redirected(target) => is_parsed(target),
+        _ => false,
+    });
+    let compare = has_url_set && complete;
 
     let mut found = Discovery {
         listed_urls: listed.len(),
@@ -418,7 +447,7 @@ pub fn discovery(status: &Status, key: &[KeyPage], declared: &[String], now: Dat
         let Some(head) = page_head(status, visit) else {
             continue;
         };
-        if has_url_set && not_indexable(status, visit, &head, now).is_none() {
+        if compare && not_indexable(status, visit, &head, now).is_none() {
             found.key_pages_compared += 1;
             if !listed.contains(&normalized_url(&visit.url)) {
                 found.missing_from_sitemaps.push(visit.url.clone());
@@ -458,6 +487,44 @@ pub fn discovery(status: &Status, key: &[KeyPage], declared: &[String], now: Dat
 
     found.sitemaps = files.into_values().collect();
     found
+}
+
+/// Where a redirect leads: the end of its crawled chain, or else its `Location`.
+fn redirect_target(visit: &VisitedUrl, by_url: &HashMap<String, &VisitedUrl>) -> Option<String> {
+    let chain = redirect_chain(visit, by_url);
+    if chain.visits.len() > 1 {
+        return chain.visits.last().map(|last| last.url.clone());
+    }
+    let location = visit.extras.as_ref()?.get("Location")?;
+    let target = url::Url::parse(&visit.url).ok()?.join(location).ok()?;
+    Some(target.to_string())
+}
+
+/// The sitemap formats engines accept besides the sitemaps protocol: an RSS (or RDF) or Atom
+/// feed, and a text file of URLs, one per line.
+fn other_format(body: &str) -> Option<&'static str> {
+    let body = body.trim_start_matches('\u{feff}').trim();
+    if !body.starts_with('<') {
+        let mut lines = body.lines().map(str::trim).filter(|line| !line.is_empty()).peekable();
+        return (lines.peek().is_some()
+            && lines.all(|line| line.starts_with("http://") || line.starts_with("https://")))
+        .then_some("text");
+    }
+    let mut reader = Reader::from_str(body);
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref element) | Event::Empty(ref element)) => {
+                return match element.local_name().as_ref() {
+                    b"rss" | b"RDF" => Some("RSS"),
+                    b"feed" => Some("Atom"),
+                    _ => None,
+                };
+            }
+            Ok(Event::Decl(_) | Event::Comment(_) | Event::PI(_) | Event::DocType(_) | Event::Text(_)) => buf.clear(),
+            _ => return None,
+        }
+    }
 }
 
 /// The crawler's own rule for a sitemap URL: `sitemap` in the path and a `.xml` or `.gz` file.
@@ -744,6 +811,140 @@ mod tests {
         let without_sitemap = discovery(&new_status(), &key, &[], now());
         assert_eq!(without_sitemap.key_pages_compared, 0, "nothing to compare with");
         assert!(without_sitemap.missing_from_sitemaps.is_empty());
+    }
+
+    /// The homepage and a blog post, both key pages, and a sitemap index at /sitemap.xml whose
+    /// pages sitemap lists only the homepage.
+    fn site_with_an_index(posts: Option<&str>) -> (Status, Vec<KeyPage>) {
+        let mut status = new_status();
+        let html = "<html><head></head><body><p>Text</p></body></html>";
+        add(
+            &mut status,
+            page("home", "", SOURCE_INIT_URL, "https://example.com/", 200, None),
+            Some(html),
+        );
+        add(
+            &mut status,
+            page(
+                "post",
+                "home",
+                SOURCE_A_HREF,
+                "https://example.com/blog/post",
+                200,
+                None,
+            ),
+            Some(html),
+        );
+        let index = r#"<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+            <sitemap><loc>https://example.com/pages.xml</loc></sitemap>
+            <sitemap><loc>https://example.com/posts.xml</loc></sitemap></sitemapindex>"#;
+        add(
+            &mut status,
+            xml("index", "home", "https://example.com/sitemap.xml", 200),
+            Some(index),
+        );
+        add(
+            &mut status,
+            xml("pages", "index", "https://example.com/pages.xml", 200),
+            Some(&urlset(&[("https://example.com/", None)])),
+        );
+        if let Some(body) = posts {
+            add(
+                &mut status,
+                xml("posts", "index", "https://example.com/posts.xml", 200),
+                Some(body),
+            );
+        }
+        let key = vec![
+            key_page("home", "https://example.com/", 200),
+            key_page("post", "https://example.com/blog/post", 200),
+        ];
+        (status, key)
+    }
+
+    #[test]
+    fn key_pages_are_compared_only_with_a_complete_set_of_sitemaps() {
+        // The posts sitemap was not crawled: the blog post may well be listed there.
+        let (status, key) = site_with_an_index(None);
+        let partial = discovery(&status, &key, &[], now());
+        assert_eq!(partial.key_pages_compared, 0, "not assessed");
+        assert!(partial.missing_from_sitemaps.is_empty());
+
+        let (status, key) = site_with_an_index(Some(&urlset(&[("https://example.com/blog/post", None)])));
+        let complete = discovery(&status, &key, &["/relative.xml".to_string()], now());
+        assert_eq!(
+            complete.key_pages_compared, 2,
+            "a declaration engines ignore does not make the set incomplete"
+        );
+        assert!(complete.missing_from_sitemaps.is_empty());
+
+        let (status, key) = site_with_an_index(Some(&urlset(&[])));
+        assert_eq!(
+            discovery(&status, &key, &[], now()).missing_from_sitemaps,
+            ["https://example.com/blog/post"]
+        );
+    }
+
+    #[test]
+    fn a_redirected_sitemap_is_followed_and_feeds_are_not_read() {
+        let (mut status, key) = site_with_an_index(Some(&urlset(&[])));
+        add(
+            &mut status,
+            page(
+                "old",
+                "home",
+                SOURCE_A_HREF,
+                "http://example.com/sitemap.xml",
+                301,
+                Some("https://example.com/sitemap.xml"),
+            ),
+            None,
+        );
+        let declared = ["http://example.com/sitemap.xml".to_string()];
+        let found = discovery(&status, &key, &declared, now());
+        let old = found
+            .sitemaps
+            .iter()
+            .find(|file| file.url == "http://example.com/sitemap.xml")
+            .unwrap();
+        assert_eq!(
+            old.state,
+            SitemapState::Redirected("https://example.com/sitemap.xml".to_string())
+        );
+        assert_eq!(found.key_pages_compared, 2, "the redirect leads to a parsed sitemap");
+
+        // Engines accept RSS, Atom and text sitemaps; this check does not read them.
+        let formats = [
+            (
+                "rss",
+                "https://example.com/feed.xml",
+                "<rss version=\"2.0\"><channel></channel></rss>",
+                "RSS",
+            ),
+            (
+                "atom",
+                "https://example.com/atom.xml",
+                "<feed xmlns=\"http://www.w3.org/2005/Atom\"></feed>",
+                "Atom",
+            ),
+            (
+                "text",
+                "https://example.com/urls.txt",
+                "https://example.com/\nhttps://example.com/blog/post\n",
+                "text",
+            ),
+        ];
+        let mut declared = Vec::new();
+        for (uq_id, url, body, _) in formats {
+            add(&mut status, xml(uq_id, "home", url, 200), Some(body));
+            declared.push(url.to_string());
+        }
+        let found = discovery(&status, &key, &declared, now());
+        for (_, url, _, format) in formats {
+            let file = found.sitemaps.iter().find(|file| file.url == url).unwrap();
+            assert_eq!(file.state, SitemapState::Unsupported(format), "{url}");
+        }
+        assert_eq!(found.key_pages_compared, 0, "their URLs are unknown");
     }
 
     #[test]
