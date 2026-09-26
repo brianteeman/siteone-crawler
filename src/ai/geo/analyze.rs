@@ -1056,8 +1056,9 @@ fn verify_lead(raw: &RawAnalysis, shown: &Shown, lang: &str, rejected: &mut Reje
     })
 }
 
-/// A pair is kept when its question block is a heading, a `summary` or a `dt`, or ends with a
-/// question mark, and every answer block comes after it and before the next pair's question.
+/// A pair is kept when its blocks are the page's own content (not the site chrome the homepage
+/// shows), its question block is a heading, a `summary` or a `dt`, or ends with a question mark,
+/// and every answer block comes after it and before the next pair's question.
 fn verify_faq_pairs(raw: &[RawFaqPair], shown: &Shown, rejected: &mut Rejected) -> Vec<FaqPair> {
     let mut pairs: Vec<(&Block, &RawFaqPair)> = Vec::new();
     for pair in raw {
@@ -1077,9 +1078,10 @@ fn verify_faq_pairs(raw: &[RawFaqPair], shown: &Shown, rejected: &mut Rejected) 
         let (mut answers, all_valid) = shown.resolve(&pair.answer, &mut rejected.block_ids);
         answers.sort_by_key(|answer| answer.id);
         let is_question = question.kind == BlockKind::Heading || question.text.trim_end().ends_with(['?', '？']);
-        let in_place = answers
-            .iter()
-            .all(|answer| answer.id > question.id && answer.id < next_question);
+        let in_place = question.region == Region::Main
+            && answers
+                .iter()
+                .all(|answer| answer.region == Region::Main && answer.id > question.id && answer.id < next_question);
         if is_question && all_valid && !answers.is_empty() && in_place {
             kept.push(FaqPair {
                 question: (*question).clone(),
@@ -1612,6 +1614,34 @@ mod tests {
             ),
         );
         assert!(before.faq_pairs.is_empty(), "an answer before its question");
+    }
+
+    #[test]
+    fn faq_pairs_from_the_site_chrome_are_dropped() {
+        let html = "<html lang=\"cs\"><body><main><h1>Časté dotazy</h1>\
+            <h2>Jak dlouho trvá schválení?</h2><p>Obvykle do 5 dnů.</p></main>\
+            <footer><h3>Kde nás najdete?</h3><p>Praha 1</p></footer></body></html>";
+        let (page, blocks) = page_of(html);
+        let (_, coverage) = request(&page, &blocks, true, 1_000_000);
+        let json = answer(&format!(
+            r#""faq_pairs":[{{"question":"{}","answer":["{}"]}},{{"question":"{}","answer":["{}"]}}]"#,
+            r(&blocks, "Jak dlouho trvá schválení?"),
+            r(&blocks, "Obvykle do 5 dnů."),
+            r(&blocks, "Kde nás najdete?"),
+            r(&blocks, "Praha 1"),
+        ));
+        let analysis = verify_analysis(parse_analysis(&json).unwrap(), &page, &blocks, &coverage);
+        let questions: Vec<&str> = analysis
+            .faq_pairs
+            .iter()
+            .map(|pair| pair.question.text.as_str())
+            .collect();
+        assert_eq!(
+            questions,
+            ["Jak dlouho trvá schválení?"],
+            "the homepage shows its footer, but it is no FAQ"
+        );
+        assert_eq!(analysis.rejected.faq_pairs, 1);
     }
 
     #[test]
