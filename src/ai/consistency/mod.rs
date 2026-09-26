@@ -119,6 +119,58 @@ fn report_error(status: &Arc<Mutex<Status>>, msg: &str) {
     }
 }
 
+/// The country whose dialling rules read the national phone numbers of `source` (see
+/// `grounding::site_country`): for a page, by its own host and language (`langs[page]`; none: the
+/// site's) — a language without a region takes the site's country only when it is the site's
+/// language (`site_lang`); for header/footer lines, the country all their pages share, else none.
+/// `host` is the crawl's host, for a page URL that does not parse.
+fn source_country(
+    source: &AnalysisSource,
+    pages: &[Page],
+    langs: &[String],
+    site_lang: &str,
+    host: &str,
+) -> Option<&'static str> {
+    let page_country = |index: usize| {
+        let page_host = pages
+            .get(index)
+            .and_then(|p| url::Url::parse(&p.url).ok())
+            .and_then(|url| url.host_str().map(str::to_string))
+            .unwrap_or_else(|| host.to_string());
+        let lang = langs
+            .get(index)
+            .map(String::as_str)
+            .filter(|lang| !lang.trim().is_empty())
+            .unwrap_or(site_lang);
+        let primary = |lang: &str| {
+            lang.trim()
+                .split(['-', '_'])
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+        };
+        site_country(&page_host, lang).or_else(|| {
+            if primary(lang) == primary(site_lang) {
+                site_country(&page_host, site_lang)
+            } else {
+                None
+            }
+        })
+    };
+    match source.kind {
+        SourceKind::Page => page_country(source.id),
+        SourceKind::Chrome => {
+            let mut countries = source
+                .blocks
+                .iter()
+                .flat_map(|b| b.pages.iter())
+                .map(|&page| page_country(page));
+            let first = countries.next()??;
+            countries.all(|c| c == Some(first)).then_some(first)
+        }
+    }
+}
+
 /// The `<title>` (on one line) and the `<html lang>` of a page.
 fn page_meta(html: &str) -> (String, String) {
     let document = Html::parse_document(html);
@@ -195,10 +247,9 @@ pub async fn run(options: &CoreOptions, status: &Arc<Mutex<Status>>, output: &Ar
         langs.push(lang);
     }
     // The language of the site (the first page with one, the homepage first) reads the numbers of
-    // the header/footer and of pages without a language; with the host, it names the country of
-    // national phone numbers.
+    // the header/footer and of pages without a language; each page names the country of its
+    // national phone numbers by its own host and language (`source_country`).
     let site_lang = langs.iter().find(|lang| !lang.is_empty()).cloned().unwrap_or_default();
-    let country = site_country(&host, &site_lang);
 
     let mut sources: Vec<AnalysisSource> = pages
         .iter()
@@ -276,6 +327,7 @@ pub async fn run(options: &CoreOptions, status: &Arc<Mutex<Status>>, output: &Ar
         let (facts, ungrounded) = match answer {
             Ok(raw) => {
                 facts_extracted += raw.len();
+                let country = source_country(source, &pages, &langs, &site_lang, &host);
                 let (kept, ungrounded) = verify_facts(raw, source, lang, country, &mut next_id);
                 let facts = kept.len();
                 occurrences.extend(kept);
@@ -1648,5 +1700,69 @@ mod tests {
                 assert!(message.len() <= b.review_batch_bytes, "ctx {ctx}: {}", message.len());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod country_tests {
+    use super::model::{AnalysisSource, Page, SourceBlock, SourceKind};
+    use super::source_country;
+
+    fn page(index: usize, url: &str) -> Page {
+        Page {
+            index,
+            url: url.to_string(),
+            path: "/".to_string(),
+            title: String::new(),
+        }
+    }
+
+    fn source(kind: SourceKind, id: usize, pages: &[usize]) -> AnalysisSource {
+        AnalysisSource {
+            id,
+            kind,
+            url: String::new(),
+            path: String::new(),
+            blocks: vec![SourceBlock {
+                ref_id: "L1".to_string(),
+                text: "020 7946 0123".to_string(),
+                heading_path: Vec::new(),
+                pages: pages.to_vec(),
+            }],
+            omitted_blocks: 0,
+            truncated_blocks: 0,
+        }
+    }
+
+    #[test]
+    fn each_page_reads_national_numbers_by_its_own_country() {
+        let pages = vec![
+            page(0, "https://example.com/"),
+            page(1, "https://example.com/uk"),
+            page(2, "https://example.com/de"),
+            page(3, "https://example.com/de/kontakt"),
+            page(4, "https://example.com/en"),
+            page(5, "https://example.com/x"),
+            page(6, "https://example.cz/"),
+        ];
+        let langs: Vec<String> = ["de-DE", "en-GB", "de-DE", "de", "en", "", "en-GB"]
+            .map(str::to_string)
+            .to_vec();
+        let country = |kind: SourceKind, id: usize, on: &[usize]| {
+            source_country(&source(kind, id, on), &pages, &langs, "de-DE", "example.com")
+        };
+        assert_eq!(country(SourceKind::Page, 0, &[0]), Some("DE"));
+        assert_eq!(country(SourceKind::Page, 1, &[1]), Some("GB"), "the page's own region");
+        assert_eq!(country(SourceKind::Page, 3, &[3]), Some("DE"), "the site's language");
+        assert_eq!(country(SourceKind::Page, 4, &[4]), None, "another language, no region");
+        assert_eq!(
+            country(SourceKind::Page, 5, &[5]),
+            Some("DE"),
+            "no language: the site's"
+        );
+        assert_eq!(country(SourceKind::Page, 6, &[6]), Some("CZ"), "the page's own TLD");
+        // Header/footer lines: the country all their pages share, else none.
+        assert_eq!(country(SourceKind::Chrome, 9, &[0, 2, 3]), Some("DE"));
+        assert_eq!(country(SourceKind::Chrome, 9, &[0, 1, 2]), None);
     }
 }
