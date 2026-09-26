@@ -994,7 +994,8 @@ pub fn get_flat_response_headers(
             // Set-Cookie must NOT be merged with ", ": cookie values legitimately contain
             // ", " (e.g. in the Expires date), and multiple Set-Cookie headers have to stay
             // individually parseable. Join them with '\n', which the security analyzer splits on.
-            let separator = if k.eq_ignore_ascii_case("set-cookie") {
+            // X-Robots-Tag too: a `googlebot:` prefix scopes only the rest of its own instance.
+            let separator = if k.eq_ignore_ascii_case("set-cookie") || k.eq_ignore_ascii_case("x-robots-tag") {
                 "\n"
             } else {
                 ", "
@@ -1002,6 +1003,12 @@ pub fn get_flat_response_headers(
             (k.clone(), v.join(separator))
         })
         .collect()
+}
+
+/// A flat header value on one line: the instances that `get_flat_response_headers` joined with
+/// '\n' are shown separated by " | ".
+pub fn header_value_for_display(value: &str) -> String {
+    value.replace('\n', " | ")
 }
 
 /// Returns peak resident memory usage (VmHWM) in bytes by reading /proc/self/status.
@@ -1223,6 +1230,31 @@ mod tests {
         assert_eq!(flat.get("set-cookie").unwrap(), "a=1; Secure\nb=2; HttpOnly");
         // Other repeated headers keep the standard ", " join.
         assert_eq!(flat.get("cache-control").unwrap(), "public, max-age=3600");
+    }
+
+    #[test]
+    fn flat_headers_x_robots_tag_instances_joined_by_newline() {
+        use std::collections::HashMap;
+        let mut headers: HashMap<String, Vec<String>> = HashMap::new();
+        headers.insert(
+            "x-robots-tag".to_string(),
+            vec!["googlebot: noarchive, nosnippet".to_string(), "noindex".to_string()],
+        );
+        let flat = get_flat_response_headers(&headers);
+        // A `ua:` prefix scopes only its own instance, so the instance boundaries must survive.
+        assert_eq!(
+            flat.get("x-robots-tag").unwrap(),
+            "googlebot: noarchive, nosnippet\nnoindex"
+        );
+    }
+
+    #[test]
+    fn header_values_are_displayed_on_one_line() {
+        assert_eq!(
+            header_value_for_display("googlebot: noarchive\nnosnippet"),
+            "googlebot: noarchive | nosnippet"
+        );
+        assert_eq!(header_value_for_display("public, max-age=3600"), "public, max-age=3600");
     }
 
     // -- get_formatted_size --

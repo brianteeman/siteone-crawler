@@ -46,7 +46,10 @@ impl HeaderStats {
                 self.unique_values_limit_reached = true;
                 return;
             }
-            *self.unique_values.entry(value.to_string()).or_insert(0) += 1;
+            *self
+                .unique_values
+                .entry(utils::header_value_for_display(value))
+                .or_insert(0) += 1;
         }
     }
 
@@ -157,5 +160,17 @@ impl HeaderStats {
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_instances_are_shown_on_one_line() {
+        let mut stats = HeaderStats::new("x-robots-tag".to_string());
+        stats.add_value("googlebot: noarchive\nnosnippet");
+        assert_eq!(stats.get_values_preview(120), "googlebot: noarchive | nosnippet");
     }
 }

@@ -127,7 +127,7 @@ impl Output for JsonOutput {
                 let value = if let Some(v) = extra_parsed_content.get(header_name) {
                     v.trim().to_string()
                 } else if let Some(v) = response_headers.get(&header_name.to_lowercase()) {
-                    v.trim().to_string()
+                    utils::header_value_for_display(v.trim())
                 } else {
                     String::new()
                 };
@@ -347,6 +347,34 @@ mod tests {
 
     fn make_json_output() -> JsonOutput {
         JsonOutput::new(CrawlerInfo::default(), vec![], true, false, None, 0)
+    }
+
+    #[test]
+    fn extra_column_shows_header_instances_on_one_line() {
+        let column = crate::extra_column::ExtraColumn::from_text("X-Robots-Tag").unwrap();
+        let mut output = JsonOutput::new(CrawlerInfo::default(), vec![column], true, false, None, 0);
+        output.add_table_header();
+        let headers = HashMap::from([(
+            "x-robots-tag".to_string(),
+            "googlebot: noarchive\nnosnippet".to_string(),
+        )]);
+        output.add_table_row(
+            &headers,
+            "https://example.com/",
+            200,
+            0.1,
+            100,
+            1,
+            &HashMap::new(),
+            "1/1",
+            0,
+            None,
+        );
+        let json: Value = serde_json::from_str(&output.get_json()).unwrap();
+        assert_eq!(
+            json["results"][0]["extras"]["X-Robots-Tag"],
+            "googlebot: noarchive | nosnippet"
+        );
     }
 
     fn make_pass_result() -> CiGateResult {

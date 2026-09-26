@@ -5,4 +5,5 @@
 // See docs/superpowers/plans/2026-09-26-ai-search-readiness-geo.md.
 
 pub mod agents;
+pub mod controls;
 pub mod robots_ai;

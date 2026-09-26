@@ -449,7 +449,7 @@ impl Output for TextOutput {
             if let Some(v) = extra_parsed_content.get(header_name) {
                 value = v.trim().to_string();
             } else if let Some(v) = response_headers.get(&header_name.to_lowercase()) {
-                value = v.trim().to_string();
+                value = utils::header_value_for_display(v.trim());
             }
 
             let truncated = extra_column.get_truncated_value(Some(&value)).unwrap_or_default();
