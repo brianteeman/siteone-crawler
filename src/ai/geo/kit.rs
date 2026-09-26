@@ -461,6 +461,23 @@ fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Page or model text for Markdown: one line, and nothing in it can open a link, an image or raw
+/// HTML (`\`, `[` and `]` are escaped, `<` is written as `&lt;`).
+fn md_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in one_line(text).chars() {
+        match c {
+            '\\' | '[' | ']' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '<' => out.push_str("&lt;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn section_name(page_type: PageType) -> &'static str {
     match page_type {
         PageType::Homepage => "Home",
@@ -483,7 +500,7 @@ fn section_name(page_type: PageType) -> &'static str {
 /// one section per page type in the order the types first occur, each listing its pages in rank
 /// order as `- [title](url): main topic`.
 pub fn llms_txt(site_name: &str, analyses: &[PageAnalysis], titles: &HashMap<String, String>) -> String {
-    let mut out = format!("# {}\n\n", one_line(site_name));
+    let mut out = format!("# {}\n\n", md_escape(site_name));
     let homepage = analyses
         .iter()
         .find(|analysis| url::Url::parse(&analysis.url).is_ok_and(|url| url.path() == "/"))
@@ -495,7 +512,7 @@ pub fn llms_txt(site_name: &str, analyses: &[PageAnalysis], titles: &HashMap<Str
     if let Some(homepage) = homepage
         && !homepage.main_topic.trim().is_empty()
     {
-        out.push_str(&format!("> {}\n\n", one_line(&homepage.main_topic)));
+        out.push_str(&format!("> {}\n\n", md_escape(&homepage.main_topic)));
     }
     let mut sections: Vec<(PageType, Vec<String>)> = Vec::new();
     for analysis in analyses {
@@ -506,10 +523,14 @@ pub fn llms_txt(site_name: &str, analyses: &[PageAnalysis], titles: &HashMap<Str
         let title = if title.trim().is_empty() {
             analysis.url.clone()
         } else {
-            one_line(title).replace('[', "(").replace(']', ")")
+            one_line(title)
+                .replace('\\', "\\\\")
+                .replace('[', "(")
+                .replace(']', ")")
+                .replace('<', "&lt;")
         };
         let target = analysis.url.replace(' ', "%20").replace('(', "%28").replace(')', "%29");
-        let topic = one_line(&analysis.main_topic);
+        let topic = md_escape(&analysis.main_topic);
         let line = if topic.is_empty() {
             format!("- [{title}]({target})")
         } else {
@@ -546,9 +567,9 @@ pub fn leads_md(locale: &ReportLocale, analyses: &[PageAnalysis]) -> String {
         if analysis.lead.is_none() && unanswered.is_empty() {
             continue;
         }
-        let mut section = format!("## {}\n\n", analysis.url);
+        let mut section = format!("## {}\n\n", md_escape(&analysis.url));
         if !analysis.title.trim().is_empty() {
-            section.push_str(&format!("*{}*\n\n", one_line(&analysis.title)));
+            section.push_str(&format!("*{}*\n\n", md_escape(&analysis.title)));
         }
         if let Some(lead) = &analysis.lead {
             section.push_str(if cs {
@@ -556,14 +577,14 @@ pub fn leads_md(locale: &ReportLocale, analyses: &[PageAnalysis]) -> String {
             } else {
                 "**Draft — review before publishing**\n\n"
             });
-            section.push_str(&format!("> {}\n\n", one_line(&lead.text)));
+            section.push_str(&format!("> {}\n\n", md_escape(&lead.text)));
             section.push_str(if cs {
                 "Podpůrné výňatky ze stránky:\n\n"
             } else {
                 "Supporting excerpts from the page:\n\n"
             });
             for excerpt in &lead.excerpts {
-                section.push_str(&format!("- {}: {}\n", excerpt.block, one_line(&excerpt.text)));
+                section.push_str(&format!("- {}: {}\n", excerpt.block, md_escape(&excerpt.text)));
             }
             section.push('\n');
         }
@@ -574,7 +595,7 @@ pub fn leads_md(locale: &ReportLocale, analyses: &[PageAnalysis]) -> String {
                 "Questions not found on this page (in the inspected blocks):\n\n"
             });
             for question in unanswered {
-                section.push_str(&format!("- {}\n", one_line(question)));
+                section.push_str(&format!("- {}\n", md_escape(question)));
             }
             section.push('\n');
         }
@@ -598,7 +619,7 @@ pub fn leads_md(locale: &ReportLocale, analyses: &[PageAnalysis]) -> String {
 }
 
 fn table_cell(text: &str) -> String {
-    one_line(text).replace('|', "\\|")
+    md_escape(text).replace('|', "\\|")
 }
 
 /// The entity drafts of the analyzed pages as review tables; empty when there are none.
@@ -606,7 +627,7 @@ pub fn entity_drafts_md(locale: &ReportLocale, analyses: &[PageAnalysis]) -> Str
     let cs = locale.is_czech();
     let mut sections: Vec<String> = Vec::new();
     for analysis in analyses.iter().filter(|analysis| !analysis.entity_drafts.is_empty()) {
-        let mut section = format!("## {}\n\n", analysis.url);
+        let mut section = format!("## {}\n\n", md_escape(&analysis.url));
         for draft in &analysis.entity_drafts {
             section.push_str(&format!("### {}\n\n", draft.kind));
             section.push_str(if cs {
@@ -1346,6 +1367,38 @@ mod tests {
              - [Časté dotazy | Example](https://example.com/faq-2): Hypotéky\n\n\
              ## Articles\n\n- [Jak vybrat hypotéku](https://example.com/blog/hypoteka): Hypotéky\n"
         );
+    }
+
+    #[test]
+    fn page_and_model_text_cannot_add_links_to_llms_txt_leads_or_drafts() {
+        let page = "<html lang=\"cs\"><head><title>Ceník \\</title></head><body><main><h1>Ceník</h1>\
+            <p>Tarif [Mini] stojí málo.</p></main></body></html>";
+        let mut analysis = analysis_of("https://example.com/cenik", page, |blocks| {
+            format!(
+                r#","lead":"Viz [odkaz](https://evil.example) a <b>tučně</b>.","lead_blocks":["{}"],
+                   "entity_drafts":[{{"type":"Service","properties":{{"[x](https://evil.example)":{{"value":"Mini","block":"{}"}}}}}}]"#,
+                id(blocks, "Tarif [Mini] stojí málo."),
+                id(blocks, "Tarif [Mini] stojí málo.")
+            )
+        });
+        analysis.main_topic = "Ceník [klikni](https://evil.example)".to_string();
+        let llms = llms_txt(
+            "Example [s.r.o.](https://evil.example)",
+            std::slice::from_ref(&analysis),
+            &HashMap::new(),
+        );
+        let live_link = |text: &str| text.replace("\\]", "").contains("](https://evil.example)");
+        assert!(!live_link(&llms), "{llms}");
+        assert!(llms.contains("\\[klikni\\]"), "{llms}");
+        assert!(
+            llms.contains("- [Ceník \\\\](https://example.com/cenik)"),
+            "a backslash cannot open the link text: {llms}"
+        );
+        let leads = leads_md(&ReportLocale::new("en"), std::slice::from_ref(&analysis));
+        assert!(!live_link(&leads) && !leads.contains("<b>"), "{leads}");
+        assert!(leads.contains("Tarif \\[Mini\\] stojí málo."), "{leads}");
+        let drafts = entity_drafts_md(&ReportLocale::new("en"), &[analysis]);
+        assert!(!live_link(&drafts), "{drafts}");
     }
 
     #[test]
