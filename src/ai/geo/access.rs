@@ -13,6 +13,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use scraper::{Html, Selector};
 
+use crate::ai::blocks::blocks_from_html;
 use crate::ai::geo::keys::{KeyPage, redirect_chain, visits_by_url};
 use crate::result::status::Status;
 use crate::result::visited_url::VisitedUrl;
@@ -79,10 +80,20 @@ pub struct AccessStats {
 }
 
 /// Title fragments (lowercase) of bot-challenge and block pages.
-pub const CHALLENGE_TITLE_MARKERS: &[&str] = &["just a moment", "access denied", "captcha", "checking your browser"];
-/// HTML fragments (lowercase) of bot-challenge pages. A "captcha" or "access denied" elsewhere
-/// in a page is not enough: contact forms show reCAPTCHA.
-pub const CHALLENGE_HTML_MARKERS: &[&str] = &["cf-chl", "cf_chl", "checking your browser"];
+pub const CHALLENGE_TITLE_MARKERS: &[&str] = &[
+    "just a moment",
+    "attention required",
+    "access denied",
+    "captcha",
+    "checking your browser",
+];
+/// HTML fragments (lowercase) of bot-challenge pages: Cloudflare's challenge script (also on a
+/// localized page) and the old interstitial text. Not `cf-chl-`, which also names the Turnstile
+/// widget of ordinary forms, and not a "captcha" or "access denied" in the page text.
+pub const CHALLENGE_HTML_MARKERS: &[&str] = &["_cf_chl_opt", "checking your browser"];
+/// A page is suspected of being a challenge only with less visible text than this: challenge and
+/// block pages are tiny, an article about captchas is not.
+pub const CHALLENGE_MAX_TEXT_CHARS: usize = 1_000;
 /// Title or H1 fragments (lowercase) of "not found" pages; "404" counts as a number of its own.
 pub const SOFT_404_MARKERS: &[&str] = &["not found", "nenalezena", "nebyla nalezena"];
 /// A key page slower than the crawl's p90 is reported only above this many seconds.
@@ -178,7 +189,8 @@ fn response_issue(visit: &VisitedUrl, by_url: &HashMap<String, &VisitedUrl>) -> 
     })
 }
 
-/// A 200 HTML page that looks like a bot challenge, or else like a "not found" page.
+/// A 200 HTML page that looks like a bot challenge (a marker on a short page), or else like a
+/// "not found" page.
 fn page_issue(url: &str, body: &str) -> Option<AccessIssue> {
     let document = Html::parse_document(body);
     let text_of = |selector: &Selector| {
@@ -200,10 +212,17 @@ fn page_issue(url: &str, body: &str) -> Option<AccessIssue> {
     let title_lower = title.to_lowercase();
     let html_lower = body.to_lowercase();
 
-    let kind = if CHALLENGE_TITLE_MARKERS
+    let visible_chars = || {
+        blocks_from_html(body)
+            .iter()
+            .map(|block| block.text.chars().count())
+            .sum::<usize>()
+    };
+    let kind = if (CHALLENGE_TITLE_MARKERS
         .iter()
         .any(|marker| title_lower.contains(marker))
-        || CHALLENGE_HTML_MARKERS.iter().any(|marker| html_lower.contains(marker))
+        || CHALLENGE_HTML_MARKERS.iter().any(|marker| html_lower.contains(marker)))
+        && visible_chars() < CHALLENGE_MAX_TEXT_CHARS
     {
         AccessKind::SuspectedChallenge
     } else if [&title, &h1].iter().any(|text| {
@@ -386,47 +405,33 @@ mod tests {
     }
 
     #[test]
-    fn challenge_pages_are_suspected_by_their_markers() {
+    fn challenge_pages_are_suspected_by_their_markers_on_short_pages() {
         let mut status = new_status();
         add(
             &mut status,
             page("home", "", SOURCE_INIT_URL, "https://example.com/", 200, None),
             None,
         );
+        let article = format!(
+            "<html><head><title>How to add a CAPTCHA to your contact form</title></head><body><h1>CAPTCHA</h1><p>{}</p></body></html>",
+            "A long guide about forms. ".repeat(60)
+        );
         let bodies = [
-            (
-                "cf",
-                "<html><head><title>Just a moment...</title></head><body><script>window._cf_chl_opt={}</script></body></html>",
-                true,
-            ),
-            (
-                "chl",
-                r#"<html><head><title>Example</title></head><body><div id="cf-chl-widget"></div></body></html>"#,
-                true,
-            ),
-            (
-                "denied",
-                "<html><head><title>Access Denied</title></head><body>Reference #18</body></html>",
-                true,
-            ),
-            (
-                "check",
-                "<html><head><title>Example</title></head><body><p>Checking your browser before accessing example.com.</p></body></html>",
-                true,
-            ),
-            (
-                "captcha",
-                "<html><head><title>Please solve the CAPTCHA</title></head><body></body></html>",
-                true,
-            ),
+            ("cf", "<html><head><title>Just a moment...</title></head><body><script>window._cf_chl_opt={}</script></body></html>".to_string(), true),
+            // A localized Cloudflare challenge: its script marker is the same.
+            ("opt", "<html><head><title>Chvíli strpení…</title></head><body><script>window._cf_chl_opt={cvId:'3'}</script></body></html>".to_string(), true),
+            ("attention", "<html><head><title>Attention Required! | Cloudflare</title></head><body><h1>Sorry, you have been blocked</h1></body></html>".to_string(), true),
+            ("denied", "<html><head><title>Access Denied</title></head><body>Reference #18</body></html>".to_string(), true),
+            ("check", "<html><head><title>Example</title></head><body><p>Checking your browser before accessing example.com.</p></body></html>".to_string(), true),
+            ("captcha", "<html><head><title>Please solve the CAPTCHA</title></head><body></body></html>".to_string(), true),
             // A contact form with reCAPTCHA is a normal page.
-            (
-                "form",
-                r#"<html><head><title>Contact</title></head><body><form><div class="g-recaptcha"></div><p>This site is protected by reCAPTCHA. Access denied pages are rare.</p></form></body></html>"#,
-                false,
-            ),
+            ("form", r#"<html><head><title>Contact</title></head><body><form><div class="g-recaptcha"></div><p>This site is protected by reCAPTCHA. Access denied pages are rare.</p></form></body></html>"#.to_string(), false),
+            // So is a login form with Cloudflare Turnstile, whose widget ids start with "cf-chl-".
+            ("turnstile", r#"<html><head><title>Log in</title></head><body><form><input type="hidden" id="cf-chl-widget-abc12_response"><button>Log in</button></form></body></html>"#.to_string(), false),
+            // And a long page about captchas.
+            ("article", article, false),
         ];
-        for (uq_id, body, _) in bodies {
+        for (uq_id, body, _) in &bodies {
             add(
                 &mut status,
                 page(
