@@ -25,3 +25,5 @@ inside the step's XML envelope, escaped with `sanitize_for_prompt`.
   header/footer lines (`<chrome_data>`).
 - `group.md` — groups the labels of one attribute key (`<labels>`) that name the same property of
   the same subject.
+- `judge.md` — reviews groups of differing values (`<groups>`) with a lenient rubric;
+  `prompts::judge_system` appends the `<output_language>` of the prose.

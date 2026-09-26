@@ -349,6 +349,21 @@ pub struct FactKey {
     pub occurrence_ids: Vec<usize>,
 }
 
+/// A key whose occurrences state one exact value in several places.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConsistentFact {
+    pub key_id: usize,
+    pub name: String,
+    pub attribute_key: AttributeKey,
+    /// The value as the pages write it (the most common spelling).
+    pub value: String,
+    /// The distinct places stating it: pages, and header/footer lines.
+    pub sources: usize,
+    pub pages: usize,
+    pub occurrence_ids: Vec<usize>,
+}
+
 /// How important a finding is to check. The declaration order is the sort order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
