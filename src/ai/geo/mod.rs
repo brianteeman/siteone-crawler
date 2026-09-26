@@ -55,8 +55,8 @@ use crate::utils;
 
 use self::access::observed_access;
 use self::analyze::{
-    AnalyzedPage, CAT_PAGE, Coverage, RawAnalysis, analyzed_page, build_page_request, parse_analysis, signals_text,
-    verify_analysis,
+    AnalyzedPage, CAT_PAGE, Coverage, RawAnalysis, analyzed_page, build_page_request, has_offered_blocks,
+    parse_analysis, signals_text, verify_analysis,
 };
 use self::controls::{bing_policy, canonical_elsewhere, data_nosnippet_chars, google_policy, sources};
 use self::discovery::discovery;
@@ -127,6 +127,8 @@ struct Homepage {
 struct Prepared {
     checks: Checks,
     chosen: Vec<Chosen>,
+    /// Chosen pages without any text of their own, which are not analyzed.
+    without_text: Vec<String>,
     homepage: Option<Homepage>,
     homepage_url: String,
     site_name: String,
@@ -329,6 +331,7 @@ fn prepare(options: &CoreOptions, status: &Status, now: DateTime<Utc>) -> Prepar
         homepage_urls.contains(candidate.url.as_str())
     });
     let mut chosen = Vec::new();
+    let mut without_text = Vec::new();
     let mut levels: HashSet<String> = HashSet::new();
     for candidate in ranked {
         let Some(html) = status.get_url_body_text(&candidate.uq_id) else {
@@ -341,6 +344,11 @@ fn prepare(options: &CoreOptions, status: &Status, now: DateTime<Utc>) -> Prepar
                 page_checks(&candidate.url, &html, headers.as_ref(), now)
             }
         };
+        let is_homepage = homepage_urls.contains(candidate.url.as_str());
+        if !has_offered_blocks(&blocks, is_homepage) {
+            without_text.push(candidate.url.clone());
+            continue;
+        }
         let signals = page_signals(&candidate.url, &html);
         let signals_line = signals_text(
             &existing,
@@ -354,7 +362,7 @@ fn prepare(options: &CoreOptions, status: &Status, now: DateTime<Utc>) -> Prepar
             blocks,
             signals,
             signals_line,
-            is_homepage: homepage_urls.contains(candidate.url.as_str()),
+            is_homepage,
             existing,
         });
     }
@@ -395,6 +403,7 @@ fn prepare(options: &CoreOptions, status: &Status, now: DateTime<Utc>) -> Prepar
             analysis: AnalysisRun::default(),
         },
         chosen,
+        without_text,
         homepage,
         homepage_url,
         site_name: site,
@@ -432,6 +441,7 @@ pub async fn run(options: &CoreOptions, status: &Arc<Mutex<Status>>, output: &Ar
     let Prepared {
         mut checks,
         chosen,
+        without_text,
         homepage,
         homepage_url,
         site_name,
@@ -449,8 +459,10 @@ pub async fn run(options: &CoreOptions, status: &Arc<Mutex<Status>>, output: &Ar
             checks.key_pages.len(),
             locale.code(),
         );
+        print_without_text(&without_text);
         return;
     }
+    print_without_text(&without_text);
 
     // --- The per-page analysis. ---
     let mut analysis = AnalysisRun {
@@ -459,6 +471,7 @@ pub async fn run(options: &CoreOptions, status: &Arc<Mutex<Status>>, output: &Ar
             .iter()
             .map(|page| (page.page.url.clone(), page.signals.clone()))
             .collect(),
+        without_text,
         ..AnalysisRun::default()
     };
     let mut provider = options.ai_provider.clone();
@@ -691,6 +704,26 @@ fn dry_run(
             ),
         );
     }
+}
+
+/// Name the chosen pages that are not analyzed because their HTML has no text of their own.
+fn print_without_text(urls: &[String]) {
+    const SHOWN: usize = 10;
+    if urls.is_empty() {
+        return;
+    }
+    let mut list = urls.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
+    if urls.len() > SHOWN {
+        list.push_str(&format!(" and {} more", urls.len() - SHOWN));
+    }
+    eprintln!(
+        "  {}",
+        utils::get_color_text(
+            &format!("Not analyzed (no text of their own in the HTML): {list}"),
+            "gray",
+            false
+        )
+    );
 }
 
 /// The request of a page within `input_bytes`, and what it shows of the page.

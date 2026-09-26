@@ -608,6 +608,18 @@ fn block_score(block: &Block, first_after_h1: Option<usize>) -> u32 {
     score
 }
 
+/// A block the prompt offers: the page's own content (Main region), and the site chrome of the
+/// homepage; never an empty one.
+fn is_offered(block: &Block, is_homepage: bool) -> bool {
+    (block.region == Region::Main || is_homepage) && !block.text.trim().is_empty()
+}
+
+/// The page has text the prompt would offer; without it there is nothing to analyze (an app
+/// shell, for example).
+pub fn has_offered_blocks(blocks: &[Block], is_homepage: bool) -> bool {
+    blocks.iter().any(|block| is_offered(block, is_homepage))
+}
+
 /// The request for one page and what it shows of the page. The model sees the page's own blocks
 /// (and the site chrome of the homepage) as numbered lines inside `<page_data>`; every value is
 /// escaped. When the whole message would exceed `input_bytes`, blocks are chosen by score — the H1
@@ -624,10 +636,7 @@ pub fn build_page_request(
     max_tokens: u32,
     temperature: f32,
 ) -> (ChatRequest, Coverage) {
-    let offered: Vec<&Block> = blocks
-        .iter()
-        .filter(|block| (block.region == Region::Main || is_homepage) && !block.text.trim().is_empty())
-        .collect();
+    let offered: Vec<&Block> = blocks.iter().filter(|block| is_offered(block, is_homepage)).collect();
     let h1 = page.h1.as_deref().and_then(|h1| {
         offered
             .iter()

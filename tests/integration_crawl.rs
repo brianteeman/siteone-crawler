@@ -7270,7 +7270,12 @@ fn ai_geo_dry_run_prints_the_plan() {
     assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
     assert_line(
         &stderr,
-        r"AI search readiness dry-run: 5 page\(s\) → 5 analysis call\(s\), plus the deterministic checks of 6 key page\(s\); est\. input ~[1-9]\d* tokens, output [1-9]\d*–[1-9]\d* tokens, cost \$\d+\.\d{4}–\$\d+\.\d{4}; ctx 128000 tok\. No API calls made\.",
+        r"AI search readiness dry-run: 4 page\(s\) → 4 analysis call\(s\), plus the deterministic checks of 6 key page\(s\); est\. input ~[1-9]\d* tokens, output [1-9]\d*–[1-9]\d* tokens, cost \$\d+\.\d{4}–\$\d+\.\d{4}; ctx 128000 tok\. No API calls made\.",
+    );
+    // The app shell has no text of its own: nothing to send.
+    assert_line(
+        &stderr,
+        r"  Not analyzed \(no text of their own in the HTML\): http://127\.0\.0\.1:\d+/app",
     );
     assert!(stderr.contains("--ai-cache-dir"), "the cache note: {stderr}");
     assert!(
@@ -7540,14 +7545,16 @@ fn ai_geo_end_to_end() {
         .collect();
     assert_eq!(risks, vec![url("/app")]);
 
-    // The per-page analysis ran on every HTML page.
+    // The per-page analysis ran on every HTML page with text of its own; the app shell has none
+    // and is counted as skipped, not sent.
     assert_eq!(
         category("answerExtractability")["status"]
             .as_str()
             .map(|s| s != "notAssessed"),
         Some(true)
     );
-    assert_eq!(json["meta"]["analyzedPages"], 5, "{json_text}");
+    assert_eq!(category("answerExtractability")["skipped"], 1);
+    assert_eq!(json["meta"]["analyzedPages"], 4, "{json_text}");
     assert_eq!(json["failedPages"].as_array().map(Vec::len), Some(0), "{json_text}");
 
     // The kit: the training block without Allow, no proposal (the trailing ruleless group), and
@@ -7671,9 +7678,12 @@ fn ai_geo_end_to_end() {
             .map(|a| a["label"].clone()),
         Some(serde_json::json!("AI search readiness kit"))
     );
-    assert_eq!(assert_progress_runs_to_the_end(&events, "geo:pages"), 5);
-    for request in events_of(&events, "aiRequest") {
+    assert_eq!(assert_progress_runs_to_the_end(&events, "geo:pages"), 4);
+    let requests = events_of(&events, "aiRequest");
+    assert_eq!(requests.len(), 4, "one call per page with text");
+    for request in requests {
         assert_eq!(request["task"], "geo:pages", "{request}");
+        assert_ne!(request["subject"], "/app", "{request}");
     }
 
     // The configured key appears nowhere.

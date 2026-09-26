@@ -434,6 +434,9 @@ pub struct AnalysisRun {
     pub signals: Vec<(String, PageSignals)>,
     /// Why no page was analyzed at all (no model configured, a dry run, …).
     pub unavailable: Option<String>,
+    /// Chosen pages without any text of their own in the HTML (an app shell): not sent, counted
+    /// as skipped (the Rendering category covers them).
+    pub without_text: Vec<String>,
 }
 
 /// What the checks found: the input of the verdicts.
@@ -981,7 +984,7 @@ fn rendering(checks: &Checks, found: &mut Found) -> Counts {
 fn llm_counts(run: &AnalysisRun) -> Counts {
     if run.unavailable.is_some() {
         return Counts {
-            skipped: run.selected,
+            skipped: run.selected + run.without_text.len(),
             reason: "ai_unavailable",
             ..Counts::default()
         };
@@ -991,7 +994,7 @@ fn llm_counts(run: &AnalysisRun) -> Counts {
         attempted,
         succeeded: run.pages.len(),
         failed: run.failed.len(),
-        skipped: 0,
+        skipped: run.without_text.len(),
         reason: if attempted == 0 {
             "no_pages_analyzed"
         } else {
@@ -2015,6 +2018,27 @@ mod tests {
         assert_eq!(
             only(&partial, CategoryId::Discovery, "sitemap_comparison_not_assessed").status,
             CheckStatus::Info
+        );
+    }
+
+    #[test]
+    fn chosen_pages_without_text_count_as_skipped() {
+        let mut checks = clean();
+        checks.analysis.without_text = vec!["https://example.com/app".to_string()];
+        for category in [CategoryId::AnswerExtractability, CategoryId::EntityClarity] {
+            let counted = state(&checks, category);
+            assert_eq!(
+                (counted.attempted, counted.succeeded, counted.failed, counted.skipped),
+                (2, 2, 0, 1),
+                "{category:?}"
+            );
+        }
+        checks.analysis.pages.clear();
+        checks.analysis.unavailable = Some("no model configured".to_string());
+        assert_eq!(
+            state(&checks, CategoryId::AnswerExtractability).skipped,
+            3,
+            "none analyzed"
         );
     }
 
