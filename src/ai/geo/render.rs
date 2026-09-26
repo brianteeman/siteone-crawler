@@ -4,7 +4,9 @@
 // Log studies found no JavaScript execution by the crawlers of OpenAI, Anthropic and Perplexity,
 // while Google and Bing render pages. A key page whose raw HTML carries almost no text of its own
 // and shows an app shell (an empty mount point of a JavaScript framework, or a `noscript` asking
-// for JavaScript) is therefore "likely client-rendered": a rendering risk, not a proof.
+// for JavaScript) is therefore "likely client-rendered": a rendering risk, not a proof. In browser
+// mode the stored page is the rendered one, so the check compares its text with the text of the
+// HTML as fetched, which the renderer recorded before replacing the body (no refetch).
 
 use std::collections::HashMap;
 
@@ -14,12 +16,20 @@ use scraper::{ElementRef, Html, Selector};
 use crate::ai::blocks::blocks_from_html;
 use crate::ai::geo::keys::KeyPage;
 use crate::ai::geo::signals::main_text_chars;
+use crate::browser::diagnostics::BrowserDiagnostics;
 use crate::result::status::Status;
 use crate::result::visited_url::VisitedUrl;
 use crate::types::ContentTypeId;
 
 /// A page with less text of its own (Main region, in characters) than this may be an app shell.
 pub const APP_SHELL_MAX_TEXT_CHARS: usize = 250;
+
+/// Browser mode: a rendered page with less text of its own than this is not compared.
+pub const RENDERED_MIN_TEXT_CHARS: usize = 500;
+
+/// Browser mode: a page whose HTML as fetched holds less than this share of its rendered text is
+/// a rendering risk.
+pub const RAW_TO_RENDERED_MAX_RATIO: f64 = 0.5;
 
 /// With a JavaScript notice in `noscript` as its only sign, a page is an app shell only below
 /// this much text of its own (a "Loading…" at most): server-rendering frameworks such as Gatsby
@@ -47,17 +57,31 @@ pub struct RenderRisk {
     pub url: String,
     /// The visible text of the page's own content (Main region) in the raw HTML, in characters.
     pub main_text_chars: usize,
-    /// The app-shell signs found: `div#root`, `div#app`, `div#__next`, `div#__nuxt`, `app-root`
-    /// (each only when empty) or `noscript` (one that mentions JavaScript).
+    /// Browser mode: the same measure on the rendered page.
+    pub rendered_text_chars: Option<usize>,
+    /// Plain mode: the app-shell signs found: `div#root`, `div#app`, `div#__next`, `div#__nuxt`,
+    /// `app-root` (each only when empty) or `noscript` (one that mentions JavaScript).
     pub markers: Vec<&'static str>,
 }
 
-/// The plain-mode rendering check of the key pages.
+/// The rendering check of the key pages.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RenderCheck {
-    /// Key pages checked: HTML 200 responses with a stored body.
+    /// Whether the pages were rendered in a browser (`--browser`) and compared with their HTML.
+    pub browser: bool,
+    /// Key pages checked: HTML 200 responses with a stored body (browser mode: rendered, with the
+    /// text size of their HTML recorded).
     pub checked: usize,
     pub risks: Vec<RenderRisk>,
+    /// Browser mode: HTML 200 key pages that cannot be compared — the rendering failed, or the
+    /// page was not rendered (added after the crawl).
+    pub not_comparable: Vec<String>,
+}
+
+/// The visible text of a page's own content (Main region, collapsed blocks included, since they
+/// are in the HTML), in characters: the measure both rendering checks use.
+pub fn own_text_chars(html: &str) -> usize {
+    main_text_chars(&blocks_from_html(html)).0
 }
 
 /// The raw HTML of a page is an app shell when its own content (Main region, collapsed blocks
@@ -65,7 +89,7 @@ pub struct RenderCheck {
 /// and it has an empty framework mount point, or a `noscript` that mentions JavaScript — the
 /// latter alone only below `NOSCRIPT_ONLY_MAX_TEXT_CHARS`.
 pub fn plain_render_risk(url: &str, html: &str) -> Option<RenderRisk> {
-    let (main_text_chars, _) = main_text_chars(&blocks_from_html(html));
+    let main_text_chars = own_text_chars(html);
     if main_text_chars >= APP_SHELL_MAX_TEXT_CHARS {
         return None;
     }
@@ -76,31 +100,70 @@ pub fn plain_render_risk(url: &str, html: &str) -> Option<RenderRisk> {
     (!markers.is_empty()).then(|| RenderRisk {
         url: url.to_string(),
         main_text_chars,
+        rendered_text_chars: None,
         markers,
+    })
+}
+
+/// Browser mode: a rendered page with at least `RENDERED_MIN_TEXT_CHARS` of text of its own is a
+/// rendering risk when its HTML as fetched held less than `RAW_TO_RENDERED_MAX_RATIO` of it.
+pub fn browser_render_risk(url: &str, raw_text_chars: usize, rendered_text_chars: usize) -> Option<RenderRisk> {
+    let risky = rendered_text_chars >= RENDERED_MIN_TEXT_CHARS
+        && (raw_text_chars as f64) < RAW_TO_RENDERED_MAX_RATIO * rendered_text_chars as f64;
+    risky.then(|| RenderRisk {
+        url: url.to_string(),
+        main_text_chars: raw_text_chars,
+        rendered_text_chars: Some(rendered_text_chars),
+        markers: Vec::new(),
     })
 }
 
 /// Checks the key pages that answered 200 with HTML and whose body was stored.
 pub fn plain_render_risks(status: &Status, key: &[KeyPage]) -> RenderCheck {
-    let visited = status.get_visited_urls();
-    let by_uq_id: HashMap<&str, &VisitedUrl> = visited.iter().map(|visit| (visit.uq_id.as_str(), visit)).collect();
     let mut check = RenderCheck::default();
-    for page in key {
-        let Some(visit) = by_uq_id.get(page.uq_id.as_str()) else {
-            continue;
-        };
-        if visit.status_code != 200 || visit.content_type != ContentTypeId::Html {
-            continue;
-        }
-        let Some(body) = status.get_url_body_text(&visit.uq_id) else {
-            continue;
-        };
+    for (visit, body) in html_key_pages(status, key) {
         check.checked += 1;
         if let Some(risk) = plain_render_risk(&visit.url, &body) {
             check.risks.push(risk);
         }
     }
     check
+}
+
+/// Browser mode: compares each rendered HTML 200 key page with the text size of its HTML as
+/// fetched, recorded by the renderer. A page without that record (the rendering failed, or the
+/// page was added after the crawl without rendering) is not comparable.
+pub fn browser_render_risks(status: &Status, key: &[KeyPage]) -> RenderCheck {
+    let mut check = RenderCheck {
+        browser: true,
+        ..RenderCheck::default()
+    };
+    for (visit, body) in html_key_pages(status, key) {
+        let raw = status
+            .get_browser_diagnostics(&visit.uq_id)
+            .filter(|diagnostics: &BrowserDiagnostics| diagnostics.render_error.is_none())
+            .and_then(|diagnostics| diagnostics.raw_text_chars);
+        let Some(raw) = raw else {
+            check.not_comparable.push(visit.url.clone());
+            continue;
+        };
+        check.checked += 1;
+        if let Some(risk) = browser_render_risk(&visit.url, raw, own_text_chars(&body)) {
+            check.risks.push(risk);
+        }
+    }
+    check
+}
+
+/// The key pages that answered 200 with HTML, with their stored body, in key-page order.
+fn html_key_pages(status: &Status, key: &[KeyPage]) -> Vec<(VisitedUrl, String)> {
+    let visited = status.get_visited_urls();
+    let by_uq_id: HashMap<&str, &VisitedUrl> = visited.iter().map(|visit| (visit.uq_id.as_str(), visit)).collect();
+    key.iter()
+        .filter_map(|page| by_uq_id.get(page.uq_id.as_str()))
+        .filter(|visit| visit.status_code == 200 && visit.content_type == ContentTypeId::Html)
+        .filter_map(|visit| Some(((*visit).clone(), status.get_url_body_text(&visit.uq_id)?)))
+        .collect()
 }
 
 /// The app-shell signs of a page, in `MOUNT_POINTS` order, then `noscript`.
@@ -139,6 +202,7 @@ mod tests {
     use super::*;
     use crate::ai::geo::keys::KeyPage;
     use crate::ai::geo::test_support::{add, new_status, page};
+    use crate::browser::diagnostics::BrowserDiagnostics;
     use crate::result::visited_url::{SOURCE_A_HREF, SOURCE_INIT_URL};
 
     const URL: &str = "https://example.com/app";
@@ -217,6 +281,107 @@ mod tests {
         for html in &cases {
             assert_eq!(plain_render_risk(URL, html), None, "{html}");
         }
+    }
+
+    #[test]
+    fn the_browser_comparison_flags_text_that_appears_only_after_rendering() {
+        let risk = browser_render_risk(URL, 120, 2_000).expect("most of the text comes from JavaScript");
+        assert_eq!(risk.url, URL);
+        assert_eq!((risk.main_text_chars, risk.rendered_text_chars), (120, Some(2_000)));
+        assert!(risk.markers.is_empty());
+        // Half of the text or more is in the HTML as fetched.
+        assert_eq!(browser_render_risk(URL, 1_000, 2_000), None);
+        assert_eq!(browser_render_risk(URL, 1_900, 2_000), None);
+        // A script may also remove text.
+        assert_eq!(browser_render_risk(URL, 3_000, 2_000), None);
+        // Too little rendered text to compare.
+        assert_eq!(browser_render_risk(URL, 0, RENDERED_MIN_TEXT_CHARS - 1), None);
+        assert!(browser_render_risk(URL, 0, RENDERED_MIN_TEXT_CHARS).is_some());
+    }
+
+    #[test]
+    fn rendered_key_pages_are_compared_with_their_html_and_the_others_are_not_comparable() {
+        let mut status = new_status();
+        let long = long_text();
+        let rendered = format!("<html><body><main><h1>Pricing</h1><p>{long}{long}</p></main></body></html>");
+        let rendered_chars = own_text_chars(&rendered);
+        assert!(rendered_chars >= RENDERED_MIN_TEXT_CHARS, "{rendered_chars}");
+        let diagnostics = |raw: Option<usize>, error: Option<&str>| BrowserDiagnostics {
+            raw_text_chars: raw,
+            render_error: error.map(str::to_string),
+            ..Default::default()
+        };
+        let pages = [
+            // Server-rendered: the same text before and after rendering.
+            (
+                "home",
+                "https://example.com/",
+                Some(diagnostics(Some(rendered_chars), None)),
+            ),
+            // A single-page app: next to no text in the HTML as fetched.
+            ("spa", "https://example.com/app", Some(diagnostics(Some(9), None))),
+            // The render failed; the stored body is the HTML as fetched.
+            (
+                "failed",
+                "https://example.com/failed",
+                Some(diagnostics(None, Some("navigation failed"))),
+            ),
+            // Inserted after the crawl (gap-fill) without rendering.
+            ("bare", "https://example.com/bare", None),
+        ];
+        for (uq_id, url, diagnostics) in pages {
+            let source = if uq_id == "home" { "" } else { "home" };
+            let attr = if uq_id == "home" {
+                SOURCE_INIT_URL
+            } else {
+                SOURCE_A_HREF
+            };
+            add(&mut status, page(uq_id, source, attr, url, 200, None), Some(&rendered));
+            if let Some(diagnostics) = diagnostics {
+                status.add_browser_diagnostics(uq_id, diagnostics);
+            }
+        }
+        add(
+            &mut status,
+            page("denied", "home", SOURCE_A_HREF, "https://example.com/denied", 403, None),
+            Some(&rendered),
+        );
+        let key: Vec<KeyPage> = ["home", "spa", "failed", "bare", "denied"]
+            .iter()
+            .map(|uq_id| {
+                let visit = status
+                    .get_visited_urls()
+                    .into_iter()
+                    .find(|visit| visit.uq_id == *uq_id)
+                    .unwrap();
+                KeyPage {
+                    uq_id: uq_id.to_string(),
+                    url: visit.url.clone(),
+                    status_code: visit.status_code,
+                    score: None,
+                    is_homepage: *uq_id == "home",
+                }
+            })
+            .collect();
+
+        let check = browser_render_risks(&status, &key);
+        assert!(check.browser);
+        assert_eq!(check.checked, 2, "the rendered HTML 200 pages with a known raw size");
+        assert_eq!(
+            check.risks,
+            [RenderRisk {
+                url: "https://example.com/app".to_string(),
+                main_text_chars: 9,
+                rendered_text_chars: Some(rendered_chars),
+                markers: Vec::new(),
+            }]
+        );
+        assert_eq!(
+            check.not_comparable,
+            ["https://example.com/failed", "https://example.com/bare"]
+        );
+        // The plain check never marks its result as a browser comparison.
+        assert!(!plain_render_risks(&status, &key).browser);
     }
 
     #[test]

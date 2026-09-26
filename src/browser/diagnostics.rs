@@ -9,10 +9,10 @@
 // `Option<BrowserDiagnostics>` (always `None` on the direct-HTTP path). The CDP event
 // collection that fills them lives behind the `browser` Cargo feature (Phase 3).
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Severity classification shared by all diagnostic kinds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     Error,
@@ -21,7 +21,7 @@ pub enum Severity {
 }
 
 /// A `console.*` message captured from the page.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsoleMessage {
     pub severity: Severity,
     /// The console method (`log`, `warn`, `error`, ...).
@@ -32,7 +32,7 @@ pub struct ConsoleMessage {
 }
 
 /// An uncaught JavaScript exception thrown on the page.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsException {
     pub text: String,
     pub url: Option<String>,
@@ -41,7 +41,7 @@ pub struct JsException {
 }
 
 /// A failed or error network request (404/5xx, DNS/connection failures, blocked).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkError {
     pub url: String,
     pub status: Option<i32>,
@@ -51,7 +51,7 @@ pub struct NetworkError {
 }
 
 /// A security violation surfaced by the browser (CSP, CORS, mixed content).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecurityIssue {
     /// `csp`, `cors`, `mixed-content`, ...
     pub kind: String,
@@ -60,7 +60,7 @@ pub struct SecurityIssue {
 }
 
 /// All diagnostics collected for a single rendered page.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BrowserDiagnostics {
     pub console: Vec<ConsoleMessage>,
     pub exceptions: Vec<JsException>,
@@ -71,6 +71,9 @@ pub struct BrowserDiagnostics {
     pub extra_screenshots: Vec<String>,
     /// Set when rendering failed and the crawler fell back to the plain HTTP response.
     pub render_error: Option<String>,
+    /// The visible text of the page's own content (Main region) in the HTML as fetched, before
+    /// JavaScript ran, in characters; set when a rendered HTML document replaced it.
+    pub raw_text_chars: Option<usize>,
     /// Set when the screenshot capture failed (carries the reason).
     pub screenshot_error: Option<String>,
     /// Total wall time of navigate + wait, in milliseconds.
@@ -462,6 +465,28 @@ mod tests {
             url: None,
             line: None,
         }
+    }
+
+    #[test]
+    fn diagnostics_round_trip_with_the_raw_text_size() {
+        let diagnostics = BrowserDiagnostics {
+            console: vec![console(Severity::Warning, "slow")],
+            raw_text_chars: Some(42),
+            render_total_ms: 900,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&diagnostics).expect("serializes");
+        assert_eq!(json["raw_text_chars"], 42);
+        let back: BrowserDiagnostics = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back.raw_text_chars, Some(42));
+        assert_eq!(back.console.len(), 1);
+        assert_eq!(back.render_total_ms, 900);
+
+        // Diagnostics without the size (a failed render, an older record) read as unknown.
+        let mut json = serde_json::to_value(BrowserDiagnostics::default()).expect("serializes");
+        json.as_object_mut().expect("an object").remove("raw_text_chars");
+        let back: BrowserDiagnostics = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back.raw_text_chars, None);
     }
 
     #[test]

@@ -7907,3 +7907,65 @@ fn ai_geo_reads_the_robots_txt_of_the_origin_the_homepage_redirects_to() {
         .expect("crawlerPolicy");
     assert_eq!(policy["status"], "problem", "{policy}");
 }
+
+/// A single-page app: the HTML as fetched has an empty mount point, a script writes the text.
+#[cfg(feature = "browser")]
+const GEO_SPA_PAGE: &str = r#"<!doctype html>
+<html lang="en"><head><title>Pricing | Example</title></head>
+<body><div id="root"></div>
+<script>
+var text = "Our plans cover hosting, backups and support for every size of business. ".repeat(12);
+document.getElementById("root").innerHTML = "<main><h1>Pricing</h1><p>" + text + "</p></main>";
+</script>
+</body></html>"#;
+
+/// In browser mode the rendering check compares the text of the HTML as fetched, recorded while
+/// rendering, with the rendered page (Design §2.4).
+#[cfg(feature = "browser")]
+#[test]
+#[ignore]
+fn ai_geo_compares_the_raw_html_with_the_rendered_page_in_browser_mode() {
+    let tmp = TempDir::new("ai-geo-browser");
+    let site = tmp.path.join("site");
+    std::fs::create_dir_all(&site).expect("site dir");
+    std::fs::write(site.join("index.html"), GEO_SPA_PAGE).expect("index.html");
+    let server = LocalServer::start(&site);
+    let reports = tmp.path.join("reports");
+    let output = run_crawler(&[
+        "--config-file=/dev/null",
+        &format!("--url={}", server.url()),
+        "--single-page",
+        "--browser",
+        "--browser-no-sandbox",
+        LOCAL_ANALYZERS,
+        "--http-cache-dir=",
+        "--no-color",
+        "--ai-cache-dir=",
+        // No usable model: the deterministic checks still run.
+        "--ai-provider=openai",
+        "--ai-model=gpt-test",
+        "--ai-api-key-env=SITEONE_GEO_TEST_KEY_THAT_IS_NOT_SET",
+        "--ai-geo",
+        &format!("--ai-report-dir={}", reports.display()),
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    assert!(
+        stderr.lines().any(|line| line == "  Rendering: Attention"),
+        "stderr: {stderr}"
+    );
+    let json_name = geo_outputs(&reports)
+        .into_iter()
+        .find(|name| name.ends_with(".json"))
+        .expect("the JSON report");
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(reports.join(json_name)).expect("the report")).expect("JSON");
+    let render = &json["render"];
+    assert_eq!(render["mode"], "browser", "{render}");
+    assert_eq!(render["checked"], 1, "{render}");
+    let risk = &render["risks"][0];
+    let raw = risk["mainTextChars"].as_u64().expect("the raw text size");
+    let rendered = risk["renderedTextChars"].as_u64().expect("the rendered text size");
+    assert!(raw < 50, "the HTML as fetched has next to no text: {render}");
+    assert!(rendered > 500, "the rendered page has the text: {render}");
+}

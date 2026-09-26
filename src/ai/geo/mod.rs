@@ -65,7 +65,7 @@ use self::findings::{AnalysisRun, CheckStatus, Checks, OriginPolicy, PageControl
 use self::jsonld::{ExistingMarkup, page_name};
 use self::keys::{KeyPage, key_pages, normalized_url};
 use self::kit::{MarkupPage, SiteMarkup, markup_entries};
-use self::render::plain_render_risks;
+use self::render::{browser_render_risks, plain_render_risks};
 use self::robots_ai::paths_by_origin;
 use self::signals::{PageSignals, main_text_chars, page_signals, pdf_restrictions};
 
@@ -261,7 +261,12 @@ fn prepare(options: &CoreOptions, status: &Status, now: DateTime<Utc>) -> Prepar
         })
         .collect();
     let (access, access_stats) = observed_access(status, &key);
-    let render = plain_render_risks(status, &key);
+    // With --browser the stored bodies are the rendered pages: compare them with their HTML.
+    let render = if options.browser_enabled {
+        browser_render_risks(status, &key)
+    } else {
+        plain_render_risks(status, &key)
+    };
     let declared: Vec<String> = policy
         .iter()
         .flat_map(|origin| origin.sitemaps.iter().cloned())

@@ -18,7 +18,7 @@ use crate::ai::geo::controls::EnginePolicy;
 use crate::ai::geo::discovery::{Discovery, HreflangProblem, SitemapKind, SitemapState};
 use crate::ai::geo::jsonld::ExistingMarkup;
 use crate::ai::geo::keys::KeyPage;
-use crate::ai::geo::render::RenderCheck;
+use crate::ai::geo::render::{RenderCheck, RenderRisk};
 use crate::ai::geo::robots_ai::{AgentAccess, evaluate, robots_of, state_is_known};
 use crate::ai::geo::signals::{PageSignals, PdfRestriction};
 use crate::result::status::RobotsFetchState;
@@ -219,6 +219,7 @@ pub const TITLE_KEYS: &[&str] = &[
     "canonical_elsewhere",
     "pdf_restricted",
     "likely_client_rendered",
+    "text_after_rendering",
     "offer_not_early",
     "unanswered_questions",
     "hidden_content",
@@ -965,10 +966,22 @@ fn indexing_controls(checks: &Checks, found: &mut Found) -> Counts {
 }
 
 fn rendering(checks: &Checks, found: &mut Found) -> Counts {
-    if !checks.render.risks.is_empty() {
-        let pages: Vec<String> = checks.render.risks.iter().map(|risk| risk.url.clone()).collect();
+    // An app shell in the HTML (plain crawl), or text that appears only after rendering (browser).
+    let (after_rendering, app_shells): (Vec<&RenderRisk>, Vec<&RenderRisk>) = checks
+        .render
+        .risks
+        .iter()
+        .partition(|risk| risk.rendered_text_chars.is_some());
+    for (title_key, risks) in [
+        ("likely_client_rendered", app_shells),
+        ("text_after_rendering", after_rendering),
+    ] {
+        if risks.is_empty() {
+            continue;
+        }
+        let pages: Vec<String> = risks.iter().map(|risk| risk.url.clone()).collect();
         found.add(
-            "likely_client_rendered",
+            title_key,
             "",
             CheckStatus::Attention,
             Evidence::Moderate,
@@ -978,7 +991,12 @@ fn rendering(checks: &Checks, found: &mut Found) -> Counts {
             pages,
         );
     }
-    Counts::of_key_pages(checks.key_pages.len(), checks.render.checked, "no_pages_checked")
+    let reason = if checks.render.checked == 0 && !checks.render.not_comparable.is_empty() {
+        "render_not_comparable"
+    } else {
+        "no_pages_checked"
+    };
+    Counts::of_key_pages(checks.key_pages.len(), checks.render.checked, reason)
 }
 
 fn llm_counts(run: &AnalysisRun) -> Counts {
@@ -1425,7 +1443,7 @@ mod tests {
                 .collect(),
             render: RenderCheck {
                 checked: 2,
-                risks: Vec::new(),
+                ..RenderCheck::default()
             },
             markup: urls
                 .iter()
@@ -1891,6 +1909,7 @@ mod tests {
         checks.render.risks.push(RenderRisk {
             url: HOME.to_string(),
             main_text_chars: 12,
+            rendered_text_chars: None,
             markers: vec!["div#root"],
         });
         let risk = only(&checks, CategoryId::Rendering, "likely_client_rendered");
@@ -1902,6 +1921,33 @@ mod tests {
         checks.render.checked = 0;
         checks.render.risks.clear();
         assert_eq!(state(&checks, CategoryId::Rendering).status, CheckStatus::NotAssessed);
+    }
+
+    #[test]
+    fn text_that_appears_only_after_rendering_is_a_moderate_rendering_risk() {
+        let mut checks = clean();
+        checks.render.browser = true;
+        checks.render.risks.push(RenderRisk {
+            url: HOME.to_string(),
+            main_text_chars: 40,
+            rendered_text_chars: Some(3_000),
+            markers: Vec::new(),
+        });
+        let risk = only(&checks, CategoryId::Rendering, "text_after_rendering");
+        assert_eq!(
+            (risk.status, risk.evidence),
+            (CheckStatus::Attention, Evidence::Moderate)
+        );
+        assert_eq!(risk.scope, "OpenAI, Anthropic, Perplexity");
+        assert_eq!(risk.pages, [HOME]);
+
+        // Rendered pages that cannot be compared leave the category not assessed, and say why.
+        checks.render.risks.clear();
+        checks.render.checked = 0;
+        checks.render.not_comparable = vec![HOME.to_string()];
+        let rendering = state(&checks, CategoryId::Rendering);
+        assert_eq!(rendering.status, CheckStatus::NotAssessed);
+        assert_eq!(rendering.reason, "render_not_comparable");
     }
 
     #[test]
@@ -2320,6 +2366,7 @@ mod tests {
         checks.render.risks.push(RenderRisk {
             url: HOME.to_string(),
             main_text_chars: 0,
+            rendered_text_chars: None,
             markers: vec!["div#app"],
         });
         checks.markup[0].markup = ExistingMarkup::default();

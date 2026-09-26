@@ -1115,20 +1115,35 @@ impl GeoDoc {
     }
 
     fn render_section(&self, locale: &ReportLocale) -> Section {
+        let browser = self.render.browser;
+        let checked = if browser {
+            "label.render_compared"
+        } else {
+            "label.render_checked"
+        };
         let mut nodes = vec![
-            Node::Para(line(fill(
-                text(locale, "label.render_checked"),
-                &[self.render.checked.to_string()],
-                0,
-            ))),
+            Node::Para(line(fill(text(locale, checked), &[self.render.checked.to_string()], 0))),
             self.issue_list(locale, CategoryId::Rendering),
         ];
+        if browser && !self.render.not_comparable.is_empty() {
+            let mut para = vec![
+                Inline::Strong(text(locale, "label.render_not_comparable").to_string()),
+                t(": "),
+            ];
+            para.extend(Self::pages_cell(&self.render.not_comparable));
+            nodes.push(Node::Para(para));
+        }
         if !self.render.risks.is_empty() {
+            let last_column = if browser {
+                "label.rendered_chars"
+            } else {
+                "label.markers"
+            };
             nodes.push(Node::Table(
                 vec![
                     text(locale, "label.url").to_string(),
-                    text(locale, "label.main_chars").to_string(),
-                    text(locale, "label.markers").to_string(),
+                    text(locale, if browser { "label.raw_chars" } else { "label.main_chars" }).to_string(),
+                    text(locale, last_column).to_string(),
                 ],
                 self.render
                     .risks
@@ -1137,7 +1152,10 @@ impl GeoDoc {
                         vec![
                             vec![link(risk.url.clone(), risk.url.clone())],
                             line(risk.main_text_chars.to_string()),
-                            line(risk.markers.join(", ")),
+                            match risk.rendered_text_chars {
+                                Some(rendered) => line(rendered.to_string()),
+                                None => line(risk.markers.join(", ")),
+                            },
                         ]
                     })
                     .collect(),
@@ -1839,10 +1857,13 @@ impl GeoDoc {
                 })).collect::<Vec<_>>(),
             },
             "render": {
+                "mode": if self.render.browser { "browser" } else { "plain" },
                 "checked": self.render.checked,
+                "notComparable": self.render.not_comparable,
                 "risks": self.render.risks.iter().map(|risk| json!({
                     "url": risk.url,
                     "mainTextChars": risk.main_text_chars,
+                    "renderedTextChars": risk.rendered_text_chars,
                     "markers": risk.markers,
                 })).collect::<Vec<_>>(),
             },
@@ -2156,6 +2177,10 @@ const EN: &[(&str, &str)] = &[
     ("reason.no_pages_analyzed", "no page was analyzed"),
     ("reason.manual_only", "not visible from the website — please check"),
     ("reason.no_pages_checked", "no key page could be checked"),
+    (
+        "reason.render_not_comparable",
+        "no rendered key page could be compared with its HTML",
+    ),
     ("unit.origins", "origins"),
     ("unit.key_pages", "key pages"),
     ("unit.analyzed_pages", "analyzed pages"),
@@ -2280,6 +2305,16 @@ const EN: &[(&str, &str)] = &[
     ),
     ("label.main_chars", "Visible text (characters)"),
     ("label.markers", "App-shell signs"),
+    (
+        "label.render_compared",
+        "{0} key page(s) were rendered in a browser (--browser), and the text of each was compared with the text in its HTML as fetched, before JavaScript ran.",
+    ),
+    (
+        "label.render_not_comparable",
+        "Not comparable (the rendering failed, or the page was not rendered)",
+    ),
+    ("label.raw_chars", "Text in the HTML (characters)"),
+    ("label.rendered_chars", "Text after rendering (characters)"),
     (
         "label.ai_unavailable",
         "AI not available: {0}. The per-page analysis did not run.",
@@ -2663,6 +2698,14 @@ const EN: &[(&str, &str)] = &[
         "Render the main content on the server: AI crawlers that do not run JavaScript see an empty page.",
     ),
     (
+        "issue.text_after_rendering",
+        "{n} key page(s) show most of their text only after JavaScript runs (rendering risk)",
+    ),
+    (
+        "fix.text_after_rendering",
+        "Put the main content into the HTML the server sends: AI crawlers that do not run JavaScript read only that.",
+    ),
+    (
         "issue.offer_not_early",
         "{n} analyzed page(s) do not state early what they offer or answer",
     ),
@@ -2911,6 +2954,10 @@ const CS: &[(&str, &str)] = &[
     ("reason.no_pages_analyzed", "žádná stránka nebyla analyzována"),
     ("reason.manual_only", "z webu není vidět — zkontrolujte prosím"),
     ("reason.no_pages_checked", "žádnou klíčovou stránku nešlo zkontrolovat"),
+    (
+        "reason.render_not_comparable",
+        "žádnou vykreslenou klíčovou stránku nešlo porovnat s jejím HTML",
+    ),
     ("unit.origins", "originy"),
     ("unit.key_pages", "klíčové stránky"),
     ("unit.analyzed_pages", "analyzované stránky"),
@@ -3041,6 +3088,16 @@ const CS: &[(&str, &str)] = &[
     ),
     ("label.main_chars", "Viditelný text (znaků)"),
     ("label.markers", "Znaky prázdné aplikace"),
+    (
+        "label.render_compared",
+        "Klíčové stránky vykreslené v prohlížeči (--browser), jejichž text byl porovnán s textem v HTML, jak přišlo, před spuštěním JavaScriptu: {0}.",
+    ),
+    (
+        "label.render_not_comparable",
+        "Nešlo porovnat (vykreslení selhalo nebo stránka nebyla vykreslena)",
+    ),
+    ("label.raw_chars", "Text v HTML (znaků)"),
+    ("label.rendered_chars", "Text po vykreslení (znaků)"),
     (
         "label.ai_unavailable",
         "AI není k dispozici: {0}. Analýza jednotlivých stránek neproběhla.",
@@ -3418,6 +3475,14 @@ const CS: &[(&str, &str)] = &[
         "Vykreslujte hlavní obsah na serveru: crawlery AI, které nespouštějí JavaScript, vidí prázdnou stránku.",
     ),
     (
+        "issue.text_after_rendering",
+        "Klíčové stránky, které většinu textu ukážou až po spuštění JavaScriptu (riziko vykreslování): {n}",
+    ),
+    (
+        "fix.text_after_rendering",
+        "Dejte hlavní obsah do HTML, které posílá server: crawlery AI, které nespouštějí JavaScript, čtou jen to.",
+    ),
+    (
         "issue.offer_not_early",
         "Analyzované stránky, které hned neuvádějí, co nabízejí nebo na co odpovídají: {n}",
     ),
@@ -3605,7 +3670,7 @@ mod tests {
     use crate::ai::geo::jsonld::ExistingMarkup;
     use crate::ai::geo::keys::KeyPage;
     use crate::ai::geo::kit::KitEntry;
-    use crate::ai::geo::render::RenderCheck;
+    use crate::ai::geo::render::{RenderCheck, RenderRisk};
     use crate::result::status::RobotsFetchState;
     use serde_json::json;
 
@@ -3664,7 +3729,7 @@ mod tests {
                 .collect(),
             render: RenderCheck {
                 checked: 2,
-                risks: Vec::new(),
+                ..RenderCheck::default()
             },
             markup: pages
                 .iter()
@@ -3946,6 +4011,7 @@ mod tests {
             "no_pages_analyzed",
             "manual_only",
             "no_pages_checked",
+            "render_not_comparable",
         ] {
             all_keys.push(format!("reason.{reason}"));
         }
@@ -4000,6 +4066,56 @@ mod tests {
             text(&ReportLocale::new("cs"), "issue.access_denied"),
             text(&ReportLocale::new("en"), "issue.access_denied")
         );
+    }
+
+    #[test]
+    fn a_browser_comparison_shows_both_text_sizes_and_the_pages_not_compared() {
+        let mut checks = checks(true);
+        checks.render = RenderCheck {
+            browser: true,
+            checked: 1,
+            risks: vec![RenderRisk {
+                url: "https://example.com/sluzby".to_string(),
+                main_text_chars: 12,
+                rendered_text_chars: Some(2_400),
+                markers: Vec::new(),
+            }],
+            not_comparable: vec![HOME.to_string()],
+        };
+        let doc = GeoDoc::new(meta("en"), checks, kit(), Vec::new());
+        let json = doc.to_json();
+        assert_eq!(json["render"]["mode"], "browser");
+        assert_eq!(json["render"]["notComparable"], json!([HOME]));
+        assert_eq!(json["render"]["risks"][0]["mainTextChars"], 12);
+        assert_eq!(json["render"]["risks"][0]["renderedTextChars"], 2_400);
+        for language in ["en", "cs"] {
+            let mut doc = doc.clone();
+            doc.meta.report_language = language.to_string();
+            let locale = ReportLocale::new(language);
+            let md = doc.to_markdown(KIT_DIR);
+            for key in [
+                "label.render_compared",
+                "label.raw_chars",
+                "label.rendered_chars",
+                "issue.text_after_rendering",
+            ] {
+                let fixed = text(&locale, key);
+                let piece = fixed.split(['{', '}']).max_by_key(|piece| piece.len()).unwrap_or(fixed);
+                assert!(md.contains(piece.trim()), "{language}: {key}");
+            }
+            assert!(
+                !md.contains(text(&locale, "label.markers")),
+                "{language}: no app-shell column"
+            );
+            assert!(
+                md.contains("2400") || md.contains("2 400") || md.contains("2,400"),
+                "{language}"
+            );
+        }
+        // A plain crawl says so and shows the app-shell signs instead.
+        let plain = sample("en", true);
+        assert_eq!(plain.to_json()["render"]["mode"], "plain");
+        assert!(plain.to_markdown(KIT_DIR).contains("without running JavaScript"));
     }
 
     #[test]
