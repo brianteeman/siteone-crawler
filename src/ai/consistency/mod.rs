@@ -1737,6 +1737,117 @@ mod tests {
 }
 
 #[cfg(test)]
+mod review_budget_tests {
+    use super::judge::{Candidate, CandidateValue, Origin, groups_message, render_group_within};
+    use super::model::{AnalysisSource, AttributeKey, Occurrence, Page, SourceKind};
+    use crate::ai::grounding::ValueKey;
+    use crate::ai::profile::budget::ContextBudget;
+
+    /// Six values, each stated once on its own page with the path `path(i)`, `field` for every
+    /// crawler text of the occurrence, and the value text `value(i)`.
+    fn case(
+        path: impl Fn(usize) -> String,
+        field: &str,
+        value: impl Fn(usize) -> String,
+    ) -> (Candidate, Vec<Occurrence>, Vec<AnalysisSource>, Vec<Page>) {
+        let pages: Vec<Page> = (0..6)
+            .map(|i| Page {
+                index: i,
+                url: format!("https://example.com{}", path(i)),
+                path: path(i),
+                title: String::new(),
+            })
+            .collect();
+        let sources: Vec<AnalysisSource> = pages
+            .iter()
+            .map(|p| AnalysisSource {
+                id: p.index,
+                kind: SourceKind::Page,
+                url: p.url.clone(),
+                path: p.path.clone(),
+                blocks: Vec::new(),
+                omitted_blocks: 0,
+                truncated_blocks: 0,
+            })
+            .collect();
+        let occ: Vec<Occurrence> = (0..6)
+            .map(|i| Occurrence {
+                id: i,
+                source: i,
+                region: SourceKind::Page,
+                block_ref: "B1".to_string(),
+                attribute_key: AttributeKey::Price,
+                subject: field.to_string(),
+                attribute: field.to_string(),
+                value: value(i),
+                value_key: ValueKey::Exact(format!("num:{i}")),
+                qualifiers: field.to_string(),
+                evidence: format!("{field} {} {field}", value(i)),
+                value_span: (field.len() + 1, field.len() + 1 + value(i).len()),
+                heading_path: vec![field.to_string(), field.to_string()],
+                pages: vec![i],
+            })
+            .collect();
+        let values = (0..6)
+            .map(|i| CandidateValue {
+                id: i + 1,
+                key: ValueKey::Exact(format!("num:{i}")),
+                text: value(i),
+                occurrence_ids: vec![i],
+                source_ids: vec![i],
+                origins: vec![Origin::Page(i)],
+                pages: vec![i],
+                qualified: true,
+            })
+            .collect();
+        let candidate = Candidate {
+            key_id: 0,
+            name: field.to_string(),
+            attribute_key: AttributeKey::Price,
+            values,
+            baseline: None,
+        };
+        (candidate, occ, sources, pages)
+    }
+
+    fn room(ctx: i64) -> usize {
+        ContextBudget::new(ctx, 2_000).scaled(40, 6) - groups_message(&[]).len() - 1
+    }
+
+    #[test]
+    fn long_page_paths_do_not_push_a_group_over_the_review_budget() {
+        // Review: six prices on paths of 1,760 characters at an 8K context sent 9,728 bytes for a
+        // 6,144-byte budget, and without any evidence.
+        let (candidate, occ, sources, pages) = case(
+            |i| format!("/section-{}-{i}", "abcdefghijklmnpqrstuvwxyz".repeat(70)),
+            "Tariff Mini: regular monthly price",
+            |i| format!("{} EUR", 100 * (i + 1)),
+        );
+        let room = room(8_192);
+        let group = render_group_within(1, &candidate, &occ, &sources, &pages, room);
+        assert!(group.len() <= room, "{} > {room}", group.len());
+        assert_eq!(group.matches("<evidence>").count(), 6, "the evidence is kept");
+    }
+
+    #[test]
+    fn the_leanest_group_fits_the_smallest_review_budget() {
+        // Every text as long as it can be and escaping to 4 bytes per character.
+        let hostile = "<".repeat(2_000);
+        let (candidate, occ, sources, pages) = case(
+            |i| format!("/{}{i}", "<".repeat(3_000)),
+            &hostile,
+            |i| format!("{hostile}{i}"),
+        );
+        for ctx in [8_192, 16_000, 32_000] {
+            let room = room(ctx);
+            let group = render_group_within(1, &candidate, &occ, &sources, &pages, room);
+            assert!(group.len() <= room, "ctx {ctx}: {} > {room}", group.len());
+            assert_eq!(group.matches("<value id=").count(), 6, "every value is shown");
+        }
+    }
+}
+
+#[cfg(test)]
 mod country_tests {
     use super::model::{AnalysisSource, Page, SourceBlock, SourceKind};
     use super::source_country;

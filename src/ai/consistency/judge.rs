@@ -398,9 +398,14 @@ struct Detail {
     qualifier_chars: usize,
     path_chars: usize,
     value_chars: usize,
+    /// The page path in `<where>`.
+    where_chars: usize,
 }
 
-/// From the full rendering down to the leanest one `render_group_within` falls back to.
+/// From the full rendering down to the leanest one `render_group_within` falls back to. Every
+/// text is capped, so the leanest form of a group (at most `MAX_VALUES_PER_REVIEW` values, a name
+/// of at most 120 characters) stays below the smallest review budget (6 KB) even when every
+/// character escapes to 4 bytes.
 const DETAILS: [Detail; 5] = [
     Detail {
         occurrences: MAX_OCCURRENCES_SHOWN,
@@ -408,6 +413,7 @@ const DETAILS: [Detail; 5] = [
         qualifier_chars: 200,
         path_chars: 200,
         value_chars: usize::MAX,
+        where_chars: 200,
     },
     Detail {
         occurrences: 3,
@@ -415,6 +421,7 @@ const DETAILS: [Detail; 5] = [
         qualifier_chars: 200,
         path_chars: 120,
         value_chars: usize::MAX,
+        where_chars: 120,
     },
     Detail {
         occurrences: 2,
@@ -422,6 +429,7 @@ const DETAILS: [Detail; 5] = [
         qualifier_chars: 120,
         path_chars: 80,
         value_chars: usize::MAX,
+        where_chars: 80,
     },
     Detail {
         occurrences: 1,
@@ -429,13 +437,15 @@ const DETAILS: [Detail; 5] = [
         qualifier_chars: 80,
         path_chars: 60,
         value_chars: usize::MAX,
+        where_chars: 60,
     },
     Detail {
         occurrences: 1,
         evidence_chars: 0,
-        qualifier_chars: 60,
+        qualifier_chars: 40,
         path_chars: 0,
-        value_chars: 120,
+        value_chars: 80,
+        where_chars: 40,
     },
 ];
 
@@ -456,9 +466,10 @@ pub fn render_group(
 }
 
 /// `render_group` reduced until it fits `max_bytes`: fewer occurrence lines, shorter evidence,
-/// qualifiers and heading paths, and at last no evidence and paths and values cut to 120
-/// characters. Every value is always shown. When even the leanest form does not fit, it is
-/// returned anyway (a batch then holds only this group).
+/// qualifiers, heading paths and page paths, and at last no evidence and headings, and values cut
+/// to 80 characters. Every value is always shown. The leanest form fits every review budget of at
+/// least 6 KB (see `DETAILS`); below that, it is returned anyway (a batch then holds only this
+/// group).
 pub fn render_group_within(
     group_id: usize,
     c: &Candidate,
@@ -513,7 +524,7 @@ fn render_with(
             let lead = line.lead;
             out.push_str(&format!(
                 "<occurrence><where>{}</where><qualifiers>{}</qualifiers>",
-                sanitize_for_prompt(&where_text(line, sources, pages)),
+                sanitize_for_prompt(&where_text(line, sources, pages, detail.where_chars)),
                 sanitize_for_prompt(&cap(&lead.qualifiers, detail.qualifier_chars))
             ));
             if detail.path_chars > 0 {
@@ -600,9 +611,9 @@ fn merge_occurrences<'a>(members: &[&'a Occurrence]) -> Vec<Merged<'a>> {
     lines
 }
 
-/// `/path` of a page, or `header/footer line on N pages`, plus `and N more pages` for a merged
-/// line.
-fn where_text(line: &Merged, sources: &[AnalysisSource], pages: &[Page]) -> String {
+/// `/path` of a page (cut to `max_chars`), or `header/footer line on N pages`, plus `and N more
+/// pages` for a merged line.
+fn where_text(line: &Merged, sources: &[AnalysisSource], pages: &[Page], max_chars: usize) -> String {
     let lead = line.lead;
     let place = match lead.region {
         SourceKind::Chrome => format!(
@@ -616,6 +627,7 @@ fn where_text(line: &Merged, sources: &[AnalysisSource], pages: &[Page]) -> Stri
             .and_then(|&index| pages.iter().find(|p| p.index == index))
             .map(|p| p.path.clone())
             .or_else(|| sources.iter().find(|s| s.id == lead.source).map(|s| s.path.clone()))
+            .map(|path| cap(&path, max_chars))
             .unwrap_or_default(),
     };
     let more = line.pages.len().saturating_sub(lead.pages.len());
