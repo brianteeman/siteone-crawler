@@ -323,6 +323,9 @@ pub struct CoreOptions {
     pub ai_profile: bool,
     pub ai_profile_template: Option<String>,
     pub ai_profile_correct: bool,
+    // ai consistency (fact consistency across pages; nothing runs unless ai_consistency)
+    #[serde(skip)]
+    pub ai_consistency: bool,
     /// Model context window in tokens; input budgets are calibrated at 128000 and scale from this.
     pub ai_context_window: i64,
 
@@ -616,6 +619,7 @@ impl CoreOptions {
             ai_profile: false,
             ai_profile_template: None,
             ai_profile_correct: true,
+            ai_consistency: false,
             ai_context_window: 128000,
 
             // browser rendering settings
@@ -706,6 +710,7 @@ impl CoreOptions {
             "aiReportCdn",
             "aiElaborate",
             "aiProfile",
+            "aiConsistency",
         ]
         .iter()
         .any(|p| options.is_explicitly_set(p));
@@ -740,6 +745,11 @@ impl CoreOptions {
         // no --ai-report is active, clear the default set so a profile-only run does no extra
         // per-page action work; if they DID list actions (or a report is active), both run.
         if core.ai_profile && !options.is_explicitly_set("aiActions") && core.ai_report.is_none() {
+            core.ai_actions.clear();
+        }
+
+        // --ai-consistency is its own pipeline (not an action), cleared the same way as --ai-profile.
+        if core.ai_consistency && !options.is_explicitly_set("aiActions") && core.ai_report.is_none() {
             core.ai_actions.clear();
         }
 
@@ -2211,6 +2221,11 @@ impl CoreOptions {
             "aiProfileCorrect" => {
                 if let Some(b) = value.as_bool() {
                     self.ai_profile_correct = b;
+                }
+            }
+            "aiConsistency" => {
+                if let Some(b) = value.as_bool() {
+                    self.ai_consistency = b;
                 }
             }
             "aiContextWindow" => {
@@ -3863,6 +3878,11 @@ pub fn get_options() -> Options {
                 Some("true"), false, false, None,
             ),
             CrawlerOption::new(
+                "--ai-consistency", None, "aiConsistency", OptionType::Bool, false,
+                "Find possible contradictions in hard facts (contacts, prices, rates, fees, dates, figures, identifiers) across the crawled pages and their shared header/footer. Every finding is a suggestion to verify manually. Writes Markdown + JSON + HTML + CSV (`ai-consistency.<host>.<run-id>.*`) to --ai-report-dir.",
+                Some("false"), false, false, None,
+            ),
+            CrawlerOption::new(
                 "--ai-context-window", None, "aiContextWindow", OptionType::Int, false,
                 "Model context window in tokens. Profile input budgets are calibrated at 128000 and scale proportionally, so small local models get smaller prompts instead of overflowing.",
                 Some("128000"), false, false, Some(vec!["8000".to_string(), "2000000".to_string()]),
@@ -4559,6 +4579,7 @@ mod tests {
             ai_profile: false,
             ai_profile_template: None,
             ai_profile_correct: true,
+            ai_consistency: false,
             ai_context_window: 128000,
 
             // browser rendering settings
@@ -4862,6 +4883,74 @@ mod tests {
     }
 
     #[test]
+    fn ai_consistency_enables_ai_and_clears_the_default_actions_unless_explicit() {
+        let argv = |extra: &[&str]| -> Vec<String> {
+            let mut argv: Vec<String> = [
+                "bin",
+                "--url=https://example.com",
+                "--ai-provider=openai-compatible",
+                "--ai-endpoint=http://localhost:8000/v1",
+                "--ai-model=test-model",
+            ]
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect();
+            argv.extend(extra.iter().map(|arg| arg.to_string()));
+            argv
+        };
+        let core = parse_argv(&argv(&[])).expect("should parse");
+        assert!(!core.ai_consistency, "off by default");
+
+        let core = parse_argv(&argv(&["--ai-consistency"])).expect("should parse");
+        assert!(core.ai_consistency);
+        assert!(core.ai_enabled, "the flag enables AI");
+        assert!(
+            core.ai_actions.is_empty(),
+            "a consistency-only run does no per-page actions"
+        );
+
+        let core = parse_argv(&argv(&["--ai-consistency", "--ai-actions=seo"])).expect("should parse");
+        assert_eq!(core.ai_actions, vec!["seo".to_string()], "explicit actions are kept");
+
+        let core = parse_argv(&argv(&["--ai-consistency", "--ai-report=ia"])).expect("should parse");
+        assert_eq!(core.ai_actions, vec!["extract".to_string()], "the report is kept");
+
+        // The flag alone turns AI on, so the AI configuration is validated (the default
+        // openai-compatible provider needs an endpoint).
+        let error = parse_argv(&[
+            "bin".to_string(),
+            "--url=https://example.com".to_string(),
+            "--ai-consistency".to_string(),
+        ])
+        .expect_err("AI needs an endpoint");
+        assert!(error.to_string().contains("--ai-endpoint"), "{error}");
+    }
+
+    #[test]
+    fn ai_consistency_option_has_the_designed_help_text() {
+        let options = get_options();
+        let group = options.get_group(GROUP_AI_SETTINGS).expect("the AI group");
+        let option = group
+            .options
+            .values()
+            .find(|option| option.name == "--ai-consistency")
+            .expect("the --ai-consistency option");
+        assert_eq!(option.property_to_fill, "aiConsistency");
+        assert_eq!(option.default_value.as_deref(), Some("false"));
+        assert_eq!(
+            option.description,
+            "Find possible contradictions in hard facts (contacts, prices, rates, fees, dates, figures, identifiers) across the crawled pages and their shared header/footer. Every finding is a suggestion to verify manually. Writes Markdown + JSON + HTML + CSV (`ai-consistency.<host>.<run-id>.*`) to --ai-report-dir."
+        );
+        let names: Vec<&str> = group.options.values().map(|option| option.name.as_str()).collect();
+        let at = names.iter().position(|name| *name == "--ai-consistency");
+        assert_eq!(
+            at.and_then(|at| at.checked_sub(1)).map(|before| names[before]),
+            Some("--ai-profile-correct"),
+            "listed after --ai-profile-correct"
+        );
+    }
+
+    #[test]
     fn ai_elaborate_keeps_the_ai_report_extract_action() {
         let argv = vec![
             "bin".to_string(),
@@ -4997,7 +5086,7 @@ mod tests {
                 .values()
                 .map(|group| group.options.len())
                 .sum::<usize>(),
-            224
+            225
         );
     }
 

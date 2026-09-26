@@ -5924,3 +5924,69 @@ fn ai_utility_modes_report_configuration_errors_as_json() {
         "{answer}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// AI fact consistency across pages (`--ai-consistency`)
+// ---------------------------------------------------------------------------
+
+/// Three pages sharing a navigation and a footer with a phone number and a company ID.
+fn write_consistency_site(dir: &Path) {
+    std::fs::create_dir_all(dir).expect("site dir");
+    let nav = "<nav><a href=\"/cenik.html\">Ceník</a> <a href=\"/kontakt.html\">Kontakt</a></nav>";
+    let footer = "<footer><p>Zákaznická linka 800 123 456</p><p>Example s.r.o., IČO 12345678</p></footer>";
+    for (file, title, body) in [
+        ("index.html", "Example", "<p>Vítejte na webu Example.</p>"),
+        (
+            "cenik.html",
+            "Ceník",
+            "<table><tr><th>Tarif</th><th>Cena měsíčně</th></tr><tr><td>Basic</td><td>290 Kč</td></tr></table>",
+        ),
+        ("kontakt.html", "Kontakt", "<p>Zákaznická linka: 800 123 456</p>"),
+    ] {
+        std::fs::write(
+            dir.join(file),
+            format!(
+                "<html lang=\"cs\"><head><title>{title}</title></head><body>{nav}<main><h1>{title}</h1>{body}</main>{footer}</body></html>"
+            ),
+        )
+        .expect("a page");
+    }
+}
+
+#[test]
+fn ai_consistency_dry_run_prints_the_plan() {
+    let tmp = TempDir::new("ai-consistency-dry-run");
+    let site = tmp.path.join("site");
+    write_consistency_site(&site);
+    let server = LocalServer::start(&site);
+    let mock = MockLlm::start(vec![chat_response(500, "{}".to_string())]);
+    let report_dir = format!("--ai-report-dir={}", tmp.path.display());
+    let stderr = crawl_with_ai(
+        &server,
+        &mock,
+        &[
+            "--ai-consistency",
+            "--ai-dry-run",
+            "--ai-input-cost-per-million=1",
+            "--ai-output-cost-per-million=4",
+            report_dir.as_str(),
+        ],
+    );
+    assert_line(
+        &stderr,
+        r"AI consistency dry-run: 3 page\(s\) \+ 1 header/footer chunk\(s\) → 4 extraction call\(s\), ~\d+ grouping and ~\d+ review call\(s\); est\. input ~[1-9]\d* tokens, output [1-9]\d*–[1-9]\d* tokens, cost \$\d+\.\d{4}–\$\d+\.\d{4}; ctx 128000 tok\. No API calls made\.",
+    );
+    assert!(stderr.contains("--ai-cache-dir"), "the cache note: {stderr}");
+    assert!(
+        stderr.contains("1. http://127.0.0.1:"),
+        "the pages are listed: {stderr}"
+    );
+    assert!(mock.request_bodies().is_empty(), "no request reaches the model");
+    let written: Vec<String> = std::fs::read_dir(&tmp.path)
+        .expect("the report dir")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("ai-consistency."))
+        .collect();
+    assert!(written.is_empty(), "a dry run writes no report: {written:?}");
+}

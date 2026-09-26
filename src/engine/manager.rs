@@ -275,7 +275,8 @@ impl Manager {
         // One `ai` event phase brackets every AI pipeline below, so a host sees the whole wait.
         // The per-request lines are progress output (this also covers the later summary action).
         crate::ai::telemetry::set_console_enabled(!options.hide_progress_bar);
-        let runs_ai = !options.ai_actions.is_empty() || options.ai_elaborate || options.ai_profile;
+        let runs_ai =
+            !options.ai_actions.is_empty() || options.ai_elaborate || options.ai_profile || options.ai_consistency;
         if options.ai_enabled && runs_ai {
             crate::events::phase("ai", crate::events::PhaseState::Started);
         }
@@ -289,6 +290,10 @@ impl Manager {
         // AI profile is its own pipeline (may run alongside actions/elaborate, or alone).
         if options.ai_profile {
             crate::ai::profile::run(options.as_ref(), crawler.get_status(), crawler.get_output()).await;
+        }
+        // Fact consistency is its own pipeline (may run alongside the others, or alone).
+        if options.ai_consistency {
+            crate::ai::consistency::run(options.as_ref(), crawler.get_status(), crawler.get_output()).await;
         }
         if options.ai_enabled && runs_ai {
             crate::events::phase("ai", crate::events::PhaseState::Finished);
@@ -384,7 +389,10 @@ impl Manager {
         }
         // The AI totals for a host, once the last AI request is done: the executive summary above
         // runs after the `ai` phase.
-        let runs_ai = !self.options.ai_actions.is_empty() || self.options.ai_elaborate || self.options.ai_profile;
+        let runs_ai = !self.options.ai_actions.is_empty()
+            || self.options.ai_elaborate
+            || self.options.ai_profile
+            || self.options.ai_consistency;
         if self.options.ai_enabled && runs_ai {
             let provider = crate::ai::provider::Provider::parse(&self.options.ai_provider)
                 .unwrap_or(crate::ai::provider::Provider::OpenAiCompatible);
