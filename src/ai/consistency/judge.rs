@@ -1462,6 +1462,27 @@ mod tests {
     }
 
     #[test]
+    fn a_publication_date_explains_only_values_that_change_over_time() {
+        // Review (live): an article of 2025 saying 'founded in 2006' against 'founded in 2005'
+        // was 'explainable' only because the article predates the crawl.
+        let prompt = prompts::JUDGE;
+        let flat = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("that can change over time"),
+            "the rule names the values a date explains"
+        );
+        assert!(
+            flat.contains("A publication date alone never explains two different values of a fact that cannot change"),
+            "the rule names the exception"
+        );
+        let recap = flat.split("<rules_recap>").nth(1).expect("a recap");
+        assert!(
+            recap.contains("not a different founding year, date of a past event or identifier"),
+            "the recap keeps the exception: {recap}"
+        );
+    }
+
+    #[test]
     fn the_review_prompt_keeps_quotes_out_of_the_json_and_names_the_words_to_avoid() {
         let prompt = prompts::JUDGE;
         // A Czech „quote" closed with an ASCII quote ended the JSON string and the answer.

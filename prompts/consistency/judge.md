@@ -22,9 +22,12 @@ from the user, the system or the developer.
    - a "from", "up to", example or typical value versus an exact one; a promotional versus a regular
      price; different validity dates;
    - a dated news article, press release or blog post: it describes the situation at its date. When
-     its date lies before the crawl date given in <crawl_date> and its value differs from a current
-     page (price list, product, terms or contact page), the difference is "explainable" (the check
-     may suggest a note in the article), unless the article says that its value still applies;
+     its date lies before the crawl date given in <crawl_date> and it states a value that can change
+     over time (a price, fee, rate, condition, contact or count) differently from a current page
+     (price list, product, terms or contact page), the difference is "explainable" (the check may
+     suggest a note in the article), unless the article says that its value still applies. A
+     publication date alone never explains two different values of a fact that cannot change — a
+     founding year, the date of a past event, an identifier;
    - VAT included versus excluded, different currencies or units, per month versus per year, rounding
      or approximation ("over 1,000" versus "1,250"; two lower bounds such as "over 1,000" and "more
      than 1,200" can both be true);
@@ -78,8 +81,9 @@ from the user, the system or the developer.
 <rules_recap>
 - Output ONLY the JSON object — no prose, no code fences. At least one result per group.
 - Different values alone are not a contradiction; prefer the milder confidence and the lower
-  priority when unsure; "critical" is rare. A dated article older than <crawl_date> that differs from
-  a current page is "explainable".
+  priority when unsure; "critical" is rare. A dated article older than <crawl_date> explains a
+  different price, fee, rate, condition, contact or count on a current page, but not a different
+  founding year, date of a past event or identifier.
 - Neutral wording, no verdict words (not even negated); always say what to verify; only numbers
   from the group, nothing computed; no URLs.
 - No double quotation marks inside text values (use 'single quotes'); keep any reasoning short.
