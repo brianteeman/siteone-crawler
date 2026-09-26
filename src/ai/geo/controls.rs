@@ -15,6 +15,8 @@ use ego_tree::NodeRef;
 use once_cell::sync::Lazy;
 use scraper::{ElementRef, Html, Node, Selector};
 
+use crate::ai::geo::robots_ai::normalize_path;
+
 /// Which crawlers a directive source addresses.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
@@ -94,7 +96,7 @@ static META_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse("meta[name][
 static NOSNIPPET_SELECTOR: Lazy<Selector> =
     Lazy::new(|| Selector::parse("span[data-nosnippet], div[data-nosnippet], section[data-nosnippet]").unwrap());
 static BASE_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse("base[href]").unwrap());
-static LINK_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse("link[rel][href]").unwrap());
+static LINK_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse("head link[rel][href]").unwrap());
 
 /// The directive sources of a page: its `robots`, `googlebot` and `bingbot` meta tags (other
 /// names are ignored) and each X-Robots-Tag instance of `headers` (as flattened by
@@ -164,10 +166,14 @@ fn parse_source(text: &str, allow_prefixes: bool, scope: Scope, origin: &str, fo
             }
             continue;
         }
+        // A date continues only while it cannot be read yet, and only with a piece that has a
+        // digit: `noai` after `unavailable_after: 2025-01-01` is a directive of its own.
         let continues_a_date = !KNOWN_DIRECTIVES.contains(&directive_name(piece).as_str())
-            && pieces
-                .last()
-                .is_some_and(|last| directive_name(last) == "unavailable_after");
+            && piece.chars().any(|c| c.is_ascii_digit())
+            && pieces.last().is_some_and(|last| {
+                directive_name(last) == "unavailable_after"
+                    && last.split_once(':').is_some_and(|(_, date)| parse_date(date).is_none())
+            });
         match pieces.last_mut() {
             Some(last) if continues_a_date => {
                 last.push_str(", ");
@@ -372,9 +378,10 @@ fn visible_chars(element: ElementRef) -> usize {
     text.split_whitespace().collect::<Vec<_>>().join(" ").chars().count()
 }
 
-/// The page's canonical URL when it names another URL: the first `link rel="canonical"`,
-/// resolved against the page URL (and a `base href`), fragments ignored. `/a` and `/a/` are
-/// different URLs.
+/// The page's canonical URL when it names another URL: the first `link rel="canonical"` in the
+/// head (Google reads it nowhere else), resolved against the page URL (and a `base href`).
+/// Fragments are ignored and percent-escapes compared as RFC 9309 §2.2.2 normalizes them
+/// (`%7E` = `~`, `%c3%a9` = `%C3%A9` = `é`); `/a` and `/a/` are different URLs.
 pub fn canonical_elsewhere(document: &Html, page_url: &str) -> Option<String> {
     let mut page = url::Url::parse(page_url).ok()?;
     page.set_fragment(None);
@@ -400,7 +407,17 @@ pub fn canonical_elsewhere(document: &Html, page_url: &str) -> Option<String> {
     }
     let mut canonical = base.join(href).ok()?;
     canonical.set_fragment(None);
-    (canonical != page).then(|| canonical.to_string())
+    (comparable(&canonical) != comparable(&page)).then(|| canonical.to_string())
+}
+
+/// A URL for comparison: its origin as the `url` crate writes it, then its normalized path and
+/// query.
+fn comparable(url: &url::Url) -> String {
+    let path = match url.query() {
+        Some(query) => format!("{}?{}", url.path(), query),
+        None => url.path().to_string(),
+    };
+    format!("{}{}", &url[..url::Position::BeforePath], normalize_path(&path))
 }
 
 #[cfg(test)]
@@ -599,6 +616,30 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_directive_after_a_date_stays_a_directive_of_its_own() {
+        let found = header_sources(&["unavailable_after: 2025-01-01, noai, noimageai"]);
+        assert!(
+            matches!(found[0].directives[0], Directive::UnavailableAfter(_)),
+            "{found:?}"
+        );
+        assert_eq!(
+            found[0].directives[1..],
+            [
+                Directive::Other("noai".to_string()),
+                Directive::Other("noimageai".to_string())
+            ]
+        );
+        assert!(google_policy(&found, now()).expired);
+
+        let with_comma = header_sources(&["unavailable_after: Wednesday, 03-Nov-2021 15:00:00 GMT, noai"]);
+        assert!(
+            matches!(with_comma[0].directives[0], Directive::UnavailableAfter(_)),
+            "{with_comma:?}"
+        );
+        assert_eq!(with_comma[0].directives[1], Directive::Other("noai".to_string()));
+    }
+
+    #[test]
     fn bing_treats_nocache_together_with_noarchive_as_nocache() {
         let noarchive = bing_policy(&header_sources(&["noarchive"]), now());
         assert!(noarchive.noarchive && !noarchive.nocache, "{noarchive:?}");
@@ -665,6 +706,19 @@ mod tests {
         );
         assert_eq!(canonical("", "https://example.com/a"), None);
         assert_eq!(canonical_elsewhere(&html("", ""), "https://example.com/a"), None);
+
+        // The same URL written with other percent-escapes is not elsewhere.
+        assert_eq!(canonical("/café", "https://example.com/caf%c3%a9"), None);
+        assert_eq!(canonical("/%7Ejoe", "https://example.com/~joe"), None);
+        assert_eq!(canonical("/a?x=%2F", "https://example.com/a?x=%2f"), None);
+        // Google reads a canonical link only in the head.
+        assert_eq!(
+            canonical_elsewhere(
+                &html("", r#"<link rel="canonical" href="/other">"#),
+                "https://example.com/a"
+            ),
+            None
+        );
 
         let with_base = html(
             r#"<base href="https://cdn.example.com/x/"><link rel="Canonical alternate" href="page">"#,
