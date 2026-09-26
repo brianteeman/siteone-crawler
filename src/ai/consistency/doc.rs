@@ -49,6 +49,8 @@ pub struct ConsistencyDoc {
     pub not_judged: Vec<NotJudgedGroup>,
     /// Facts stated with one exact value in several places.
     pub consistent: Vec<ConsistentFact>,
+    /// Every fact key the grouping made, with what became of it.
+    pub keys: Vec<KeyOut>,
     pub sources: Vec<SourceOut>,
     /// Every kept fact occurrence.
     pub occurrences: Vec<OccurrenceOut>,
@@ -156,6 +158,8 @@ pub struct CompletenessReason {
 #[serde(rename_all = "camelCase")]
 pub struct Finding {
     pub id: String,
+    /// The fact key (`keys`) the values belong to.
+    pub key_id: usize,
     pub priority: Priority,
     pub confidence: Confidence,
     pub attribute_key: AttributeKey,
@@ -219,6 +223,7 @@ pub struct PageFinding {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExplainedGroup {
+    pub key_id: usize,
     pub key: String,
     pub attribute_key: AttributeKey,
     pub disposition: &'static str,
@@ -234,6 +239,7 @@ pub struct ExplainedGroup {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NotJudgedGroup {
+    pub key_id: usize,
     pub key: String,
     pub attribute_key: AttributeKey,
     pub status: &'static str,
@@ -259,11 +265,28 @@ pub struct SourceOut {
     pub failed: bool,
 }
 
+/// One fact key of the grouping: the facts found to be the same property of the same subject.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyOut {
+    pub id: usize,
+    pub attribute_key: AttributeKey,
+    pub name: String,
+    /// Other names of its facts.
+    pub aliases: Vec<String>,
+    pub occurrence_ids: Vec<usize>,
+    /// `candidate` (compared: see `findings`, `explained`, `notJudged`), `consistent`, `one_place`
+    /// (all in one place: nothing to compare) or `one_uncertain_value` (see `judge::key_outcome`).
+    pub outcome: &'static str,
+}
+
 /// One kept fact occurrence with its block reference.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OccurrenceOut {
     pub id: usize,
+    /// The fact key (`keys`) it was grouped into.
+    pub key_id: Option<usize>,
     pub source: usize,
     pub region: SourceKind,
     pub block_ref: String,
@@ -1849,6 +1872,7 @@ mod tests {
     fn finding(key: &str, priority: Priority, confidence: Confidence, attribute_key: AttributeKey) -> Finding {
         Finding {
             id: String::new(),
+            key_id: 0,
             priority,
             confidence,
             attribute_key,
@@ -1952,6 +1976,7 @@ mod tests {
             caution: text(locale, "caution").to_string(),
             by_page: by_page(&findings),
             explained: vec![ExplainedGroup {
+                key_id: 1,
                 key: "Doprava zdarma – hranice".to_string(),
                 attribute_key: AttributeKey::FreeShippingThreshold,
                 disposition: "explainable",
@@ -1961,6 +1986,7 @@ mod tests {
                 values: vec![value("1 500 Kč", Vec::new()), value("60 €", Vec::new())],
             }],
             not_judged: vec![NotJudgedGroup {
+                key_id: 2,
                 key: "Pobočka – otevírací doba".to_string(),
                 attribute_key: AttributeKey::OpeningHours,
                 status: "insufficient_context",
@@ -1976,6 +2002,7 @@ mod tests {
                 pages: 10,
                 occurrence_ids: vec![5, 6, 7],
             }],
+            keys: Vec::new(),
             sources: Vec::new(),
             occurrences: Vec::new(),
             failed_sources: Vec::new(),

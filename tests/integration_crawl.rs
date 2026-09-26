@@ -6537,6 +6537,97 @@ fn ai_consistency_reports_a_value_the_review_left_out_twice() {
     assert_eq!(json["counts"]["notReviewed"], 1);
 }
 
+#[test]
+fn ai_consistency_json_keeps_every_grouping_decision() {
+    // Three pages with two prices each; the grouping merges the two labels of the first page.
+    let tmp = TempDir::new("ai-consistency-keys");
+    let site = tmp.path.join("site");
+    std::fs::create_dir_all(&site).expect("the site dir");
+    let page = |h1: &str, link: &str| {
+        format!(
+            "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>{h1}</title></head><body><main>\
+             <h1>{h1}</h1><p>Price 100 CZK</p><p>Price 200 CZK</p>{link}</main></body></html>"
+        )
+    };
+    let links = "<p><a href=\"/b\">B</a> <a href=\"/c\">C</a></p>";
+    std::fs::write(site.join("index.html"), page("Alpha", links)).expect("index");
+    std::fs::write(site.join("b.html"), page("Beta", "")).expect("b");
+    std::fs::write(site.join("c.html"), page("Gamma", "")).expect("c");
+    let server = LocalServer::start(&site);
+    let route = |envelope: &'static str, marker: Option<&'static str>, content: serde_json::Value| MockRoute {
+        envelope,
+        marker,
+        response: chat_response(200, chat_answer(&content.to_string())),
+    };
+    let facts = |subject: &str| {
+        serde_json::json!({"facts": [
+            {"block": "B2", "attribute_key": "price", "subject": format!("{subject} first"), "attribute": "price",
+             "value": "100 CZK", "qualifiers": "", "quote": "Price 100 CZK", "normalized": ""},
+            {"block": "B3", "attribute_key": "price", "subject": format!("{subject} second"), "attribute": "price",
+             "value": "200 CZK", "qualifiers": "", "quote": "Price 200 CZK", "normalized": ""},
+        ]})
+    };
+    let mock = MockLlm::start_routed(
+        vec![
+            route("<page_data>", Some("<title>Alpha</title>"), facts("Alpha")),
+            route("<page_data>", Some("<title>Beta</title>"), facts("Beta")),
+            route("<page_data>", Some("<title>Gamma</title>"), facts("Gamma")),
+            route(
+                "<labels>",
+                None,
+                serde_json::json!({"groups": [{"ids": [1, 2], "name": "HIDDEN_ALPHA_MERGE"}]}),
+            ),
+        ],
+        Vec::new(),
+    );
+    let report_dir = tmp.path.join("reports");
+    let output = run_crawler(&[
+        "--config-file=/dev/null",
+        &format!("--url={}", server.url()),
+        LOCAL_ANALYZERS,
+        "--http-cache-dir=",
+        "--no-color",
+        "--ai-provider=openai-compatible",
+        &format!("--ai-endpoint={}", mock.url()),
+        "--ai-model=m",
+        "--ai-cache-dir=",
+        "--ai-api-key=sk-test",
+        "--ai-consistency",
+        &format!("--ai-report-dir={}", report_dir.display()),
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    let json_path = std::fs::read_dir(&report_dir)
+        .expect("the report dir")
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .find(|path| path.extension().is_some_and(|e| e == "json"))
+        .expect("the JSON report");
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(json_path).expect("the report")).expect("JSON");
+    let keys = json["keys"].as_array().unwrap_or_else(|| panic!("no keys in {json}"));
+    assert_eq!(keys.len(), json["meta"]["keys"].as_u64().unwrap_or_default() as usize);
+    assert_eq!(keys.len(), 5, "one merged key and four single ones: {json}");
+    let merged = keys
+        .iter()
+        .find(|k| k["name"] == "HIDDEN_ALPHA_MERGE")
+        .unwrap_or_else(|| panic!("the grouping decision is in the JSON: {json}"));
+    assert_eq!(merged["occurrenceIds"].as_array().map(Vec::len), Some(2));
+    assert_eq!(merged["outcome"], "one_place", "both values are on one page");
+    assert!(merged["aliases"].is_array());
+    assert!(keys.iter().all(|k| k["outcome"] == "one_place"), "{json}");
+    // Every occurrence names its key.
+    for occurrence in json["occurrences"].as_array().expect("occurrences") {
+        let key = occurrence["keyId"].as_u64().expect("keyId") as usize;
+        assert!(
+            keys[key]["occurrenceIds"]
+                .as_array()
+                .expect("ids")
+                .contains(&occurrence["id"]),
+            "{occurrence}"
+        );
+    }
+}
+
 // --- The evaluation corpus of `--ai-consistency` (tests/fixtures/consistency/expected.json) ---
 
 fn consistency_corpus_dir() -> std::path::PathBuf {

@@ -219,38 +219,7 @@ pub fn split_keys(keys: &[FactKey], occ: &[Occurrence]) -> (Vec<Candidate>, Vec<
     let mut candidates = Vec::new();
     let mut consistent = Vec::new();
     for key in keys {
-        let mut members: Vec<&Occurrence> = key
-            .occurrence_ids
-            .iter()
-            .filter_map(|id| by_id.get(id).copied())
-            .collect();
-        members.sort_by_key(|o| o.id);
-        members.dedup_by_key(|o| o.id);
-        let mut buckets: Vec<(ValueKey, Vec<&Occurrence>)> = Vec::new();
-        let mut index: HashMap<&ValueKey, usize> = HashMap::new();
-        for o in &members {
-            match index.get(&o.value_key) {
-                Some(&at) => buckets[at].1.push(o),
-                None => {
-                    index.insert(&o.value_key, buckets.len());
-                    buckets.push((o.value_key.clone(), vec![o]));
-                }
-            }
-        }
-        let mut values: Vec<CandidateValue> = buckets
-            .into_iter()
-            .map(|(key, list)| candidate_value(key, &list))
-            .collect();
-        values.sort_by(|a, b| {
-            b.pages
-                .len()
-                .cmp(&a.pages.len())
-                .then_with(|| a.occurrence_ids.first().cmp(&b.occurrence_ids.first()))
-        });
-        for (i, value) in values.iter_mut().enumerate() {
-            value.id = i + 1;
-        }
-        let places = values.iter().flat_map(|v| &v.origins).collect::<BTreeSet<_>>().len();
+        let (values, places) = key_values(key, &by_id);
         if values.len() >= 2 && places >= 2 {
             candidates.push(Candidate {
                 key_id: key.id,
@@ -275,6 +244,59 @@ pub fn split_keys(keys: &[FactKey], occ: &[Occurrence]) -> (Vec<Candidate>, Vec<
         }
     }
     (candidates, consistent)
+}
+
+/// What `split_keys` makes of a key, for the audit trail: `candidate` (compared; its review
+/// result is a finding, an explained or a not-judged group), `consistent`, `one_place` (all its
+/// occurrences in one place: nothing to compare) or `one_uncertain_value` (one value the crawler
+/// could not pin down, in several places: never taken as consistent).
+pub fn key_outcome(key: &FactKey, occ: &[Occurrence]) -> &'static str {
+    let by_id: HashMap<usize, &Occurrence> = occ.iter().map(|o| (o.id, o)).collect();
+    let (values, places) = key_values(key, &by_id);
+    match (values.as_slice(), places) {
+        (_, 0 | 1) => "one_place",
+        ([_, _, ..], _) => "candidate",
+        ([single], _) if matches!(single.key, ValueKey::Exact(_)) => "consistent",
+        _ => "one_uncertain_value",
+    }
+}
+
+/// The distinct values of a key's occurrences (by comparison key; the most widespread first,
+/// numbered `1…`) and the number of places stating them.
+fn key_values(key: &FactKey, by_id: &HashMap<usize, &Occurrence>) -> (Vec<CandidateValue>, usize) {
+    let mut members: Vec<&Occurrence> = key
+        .occurrence_ids
+        .iter()
+        .filter_map(|id| by_id.get(id).copied())
+        .collect();
+    members.sort_by_key(|o| o.id);
+    members.dedup_by_key(|o| o.id);
+    let mut buckets: Vec<(ValueKey, Vec<&Occurrence>)> = Vec::new();
+    let mut index: HashMap<&ValueKey, usize> = HashMap::new();
+    for o in &members {
+        match index.get(&o.value_key) {
+            Some(&at) => buckets[at].1.push(o),
+            None => {
+                index.insert(&o.value_key, buckets.len());
+                buckets.push((o.value_key.clone(), vec![o]));
+            }
+        }
+    }
+    let mut values: Vec<CandidateValue> = buckets
+        .into_iter()
+        .map(|(key, list)| candidate_value(key, &list))
+        .collect();
+    values.sort_by(|a, b| {
+        b.pages
+            .len()
+            .cmp(&a.pages.len())
+            .then_with(|| a.occurrence_ids.first().cmp(&b.occurrence_ids.first()))
+    });
+    for (i, value) in values.iter_mut().enumerate() {
+        value.id = i + 1;
+    }
+    let places = values.iter().flat_map(|v| &v.origins).collect::<BTreeSet<_>>().len();
+    (values, places)
 }
 
 fn candidate_value(key: ValueKey, list: &[&Occurrence]) -> CandidateValue {

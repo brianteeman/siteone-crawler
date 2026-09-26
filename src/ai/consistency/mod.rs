@@ -47,14 +47,15 @@ use crate::result::status::Status;
 use crate::utils;
 
 use self::doc::{
-    ConsistencyDoc, Counts, ExplainedGroup, FailedSource, Finding, FindingValue, Meta, NotJudgedGroup, OccurrenceOut,
-    OccurrenceRef, SCHEMA, SourceOut,
+    ConsistencyDoc, Counts, ExplainedGroup, FailedSource, Finding, FindingValue, KeyOut, Meta, NotJudgedGroup,
+    OccurrenceOut, OccurrenceRef, SCHEMA, SourceOut,
 };
 use self::extract::{CAT_EXTRACT, build_extract_request, parse_facts, verify_facts};
 use self::judge::{
     CAT_REVIEW, Candidate, CandidateValue, ReviewResult, ValidatedResult, allocate, build_review_request, cohorts,
-    covered_values, groups_message, pack_batches, parse_reviews, render_group_within, review_call_max_tokens,
-    review_groups_per_call, split_keys, uncovered_values, validate_with_date, with_values_first,
+    covered_values, groups_message, key_outcome, pack_batches, parse_reviews, render_group_within,
+    review_call_max_tokens, review_groups_per_call, split_keys, uncovered_values, validate_with_date,
+    with_values_first,
 };
 use self::keys::{
     CAT_GROUP, GroupOutcome, LabelItem, build_group_request, group_key, label_items, max_items_by_output, parse_groups,
@@ -563,6 +564,7 @@ pub async fn run(options: &CoreOptions, status: &Arc<Mutex<Status>>, output: &Ar
             not_reviewed_reason,
             over_cap: &over_cap,
             consistent,
+            keys: &keys,
             occurrences: &occurrences,
             pages: &pages,
             sources: source_outs,
@@ -1126,6 +1128,7 @@ struct Assembly<'a> {
     not_reviewed_reason: &'static str,
     over_cap: &'a [Candidate],
     consistent: Vec<model::ConsistentFact>,
+    keys: &'a [model::FactKey],
     occurrences: &'a [Occurrence],
     pages: &'a [Page],
     sources: Vec<SourceOut>,
@@ -1156,6 +1159,7 @@ fn assemble(locale: &ReportLocale, meta: Meta, a: Assembly) -> ConsistencyDoc {
         if results.is_empty() {
             counts.not_reviewed += 1;
             not_judged.push(NotJudgedGroup {
+                key_id: candidate.key_id,
                 key: candidate.name.clone(),
                 attribute_key: candidate.attribute_key,
                 status: a.not_reviewed_reason,
@@ -1207,6 +1211,7 @@ fn assemble(locale: &ReportLocale, meta: Meta, a: Assembly) -> ConsistencyDoc {
                     }
                     findings.push(Finding {
                         id: String::new(),
+                        key_id: candidate.key_id,
                         priority,
                         confidence: *confidence,
                         attribute_key: candidate.attribute_key,
@@ -1227,6 +1232,7 @@ fn assemble(locale: &ReportLocale, meta: Meta, a: Assembly) -> ConsistencyDoc {
                         counts.explained += 1;
                     }
                     explained.push(ExplainedGroup {
+                        key_id: candidate.key_id,
                         key: candidate.name.clone(),
                         attribute_key: candidate.attribute_key,
                         disposition: if not_comparable {
@@ -1243,6 +1249,7 @@ fn assemble(locale: &ReportLocale, meta: Meta, a: Assembly) -> ConsistencyDoc {
                 _ => {
                     counts.insufficient += 1;
                     not_judged.push(NotJudgedGroup {
+                        key_id: candidate.key_id,
                         key: candidate.name.clone(),
                         attribute_key: candidate.attribute_key,
                         status: "insufficient_context",
@@ -1257,6 +1264,7 @@ fn assemble(locale: &ReportLocale, meta: Meta, a: Assembly) -> ConsistencyDoc {
         if !left_out.is_empty() {
             counts.not_reviewed += 1;
             not_judged.push(NotJudgedGroup {
+                key_id: candidate.key_id,
                 key: candidate.name.clone(),
                 attribute_key: candidate.attribute_key,
                 status: "not_reviewed_left_out",
@@ -1268,6 +1276,7 @@ fn assemble(locale: &ReportLocale, meta: Meta, a: Assembly) -> ConsistencyDoc {
     for candidate in a.over_cap {
         counts.not_reviewed += 1;
         not_judged.push(NotJudgedGroup {
+            key_id: candidate.key_id,
             key: candidate.name.clone(),
             attribute_key: candidate.attribute_key,
             status: "not_reviewed_cap",
@@ -1280,6 +1289,23 @@ fn assemble(locale: &ReportLocale, meta: Meta, a: Assembly) -> ConsistencyDoc {
         finding.id = format!("F{}", i + 1);
     }
     let completeness = doc::completeness(&meta, &counts, a.failed_sources.len(), meta.sources);
+    let key_of: HashMap<usize, usize> = a
+        .keys
+        .iter()
+        .flat_map(|k| k.occurrence_ids.iter().map(move |&o| (o, k.id)))
+        .collect();
+    let keys = a
+        .keys
+        .iter()
+        .map(|k| KeyOut {
+            id: k.id,
+            attribute_key: k.attribute_key,
+            name: k.name.clone(),
+            aliases: k.aliases.clone(),
+            occurrence_ids: k.occurrence_ids.clone(),
+            outcome: key_outcome(k, a.occurrences),
+        })
+        .collect();
     let occurrences = a
         .occurrences
         .iter()
@@ -1290,6 +1316,7 @@ fn assemble(locale: &ReportLocale, meta: Meta, a: Assembly) -> ConsistencyDoc {
             };
             OccurrenceOut {
                 id: o.id,
+                key_id: key_of.get(&o.id).copied(),
                 source: o.source,
                 region: o.region,
                 block_ref: o.block_ref.clone(),
@@ -1319,6 +1346,7 @@ fn assemble(locale: &ReportLocale, meta: Meta, a: Assembly) -> ConsistencyDoc {
         explained,
         not_judged,
         consistent: a.consistent,
+        keys,
         sources: a.sources,
         occurrences,
         failed_sources: a.failed_sources,
@@ -1551,6 +1579,7 @@ mod tests {
                     not_reviewed_reason: "not_reviewed_call_failed",
                     over_cap: &[],
                     consistent: Vec::new(),
+                    keys: &[],
                     occurrences: &occurrences,
                     pages: &pages,
                     sources: Vec::new(),
