@@ -7,9 +7,9 @@
 // crawler ignore `*`, the longest matching pattern wins and Allow wins a tie. Like Google, it also
 // reads the misspelled keys Google accepts, a two-word line without the colon, and only the first
 // 500 KiB of the file and 16,663 bytes of a line. Patterns and paths are compared after the
-// percent-encoding normalization of RFC 9309 §2.2.2, with a byte-level backtracking matcher
-// (no regex per rule). Used for the crawler-policy verdicts and for the safety check of a
-// proposed robots.txt.
+// percent-encoding normalization of RFC 9309 §2.2.2, with a matcher that is linear in the input
+// (no regex per rule, no backtracking). Used for the crawler-policy verdicts and for the safety
+// check of a proposed robots.txt.
 
 use std::collections::BTreeMap;
 
@@ -20,6 +20,8 @@ use crate::result::status::RobotsFetchState;
 const MAX_PARSED_BYTES: usize = 500 * 1024;
 /// Google ignores the bytes of a line after 16,663 (2083 × 8 − 1, see google/robotstxt).
 const MAX_LINE_BYTES: usize = 2083 * 8 - 1;
+/// `policy_equivalent` gives up (and fails) above this many rule matches: tokens × paths × rules.
+const MAX_EQUIVALENCE_MATCHES: usize = 20_000_000;
 
 /// What a robots.txt line is, as Google's parser reads its key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,7 +245,7 @@ impl AiRobots {
         let mut best: Option<(&Group, &Rule)> = None;
         for group in self.groups_for(token) {
             for rule in &group.rules {
-                if rule.pattern.is_empty() || !pattern_matches(rule.pattern.as_bytes(), path.as_bytes()) {
+                if rule.pattern.is_empty() || !pattern_matches(&rule.pattern, &path) {
                     continue;
                 }
                 let wins = best.is_none_or(|(_, current)| {
@@ -380,39 +382,33 @@ fn push_encoded(out: &mut String, byte: u8) {
 }
 
 /// Whether a normalized pattern matches the start of a normalized path: `*` matches any run of
-/// bytes, a trailing `$` anchors the end. Backtracks to the last `*` only, so the work stays
-/// within pattern length × path length.
-fn pattern_matches(pattern: &[u8], path: &[u8]) -> bool {
-    let (pattern, anchored) = match pattern.strip_suffix(b"$") {
+/// characters, a trailing `$` anchors the end. The literal pieces between the `*`s are matched at
+/// their first occurrence, which is exact for patterns whose only wildcard is `*` and keeps the
+/// work linear in the input (`str::find`), however hostile the pattern.
+fn pattern_matches(pattern: &str, path: &str) -> bool {
+    let (pattern, anchored) = match pattern.strip_suffix('$') {
         Some(rest) => (rest, true),
         None => (pattern, false),
     };
-    let (mut p, mut s) = (0, 0);
-    // Where to resume after the last `*`: the pattern position after it and the path bytes it took.
-    let mut resume: Option<(usize, usize)> = None;
-    loop {
-        if p == pattern.len() {
-            if !anchored || s == path.len() {
-                return true;
-            }
-        } else if pattern[p] == b'*' {
-            p += 1;
-            resume = Some((p, s));
-            continue;
-        } else if s < path.len() && pattern[p] == path[s] {
-            p += 1;
-            s += 1;
-            continue;
-        }
-        // A mismatch: let the last `*` take one more byte.
-        match resume {
-            Some((after_star, taken)) if taken < path.len() => {
-                resume = Some((after_star, taken + 1));
-                p = after_star;
-                s = taken + 1;
-            }
-            _ => return false,
-        }
+    let mut pieces = pattern.split('*');
+    let Some(mut rest) = path.strip_prefix(pieces.next().unwrap_or_default()) else {
+        return false;
+    };
+    let pieces: Vec<&str> = pieces.collect();
+    let Some((last, middle)) = pieces.split_last() else {
+        // No `*`: a prefix of the path, or the whole path when anchored.
+        return !anchored || rest.is_empty();
+    };
+    for piece in middle {
+        let Some(at) = rest.find(piece) else {
+            return false;
+        };
+        rest = &rest[at + piece.len()..];
+    }
+    if anchored {
+        rest.ends_with(last)
+    } else {
+        rest.contains(last)
     }
 }
 
@@ -440,7 +436,9 @@ pub fn evaluate(robots: Option<&AiRobots>, agent: &AiAgent, paths: &[String]) ->
 /// Checks that `after` gives every crawler the same allow/deny answers as `before` (`None` = no
 /// robots.txt). Checked are `tokens`, `*` and every agent named in `before` (with the fallback of
 /// a table agent applied), on `paths`, `/` and one literal path per rule pattern of either file.
-/// `Err` describes the first answer that would change.
+/// `Err` describes the first answer that would change, or says that the files have too many rules
+/// to check them all (`MAX_EQUIVALENCE_MATCHES`): the check fails closed rather than run for
+/// minutes.
 pub fn policy_equivalent(
     before: Option<&AiRobots>,
     after: &AiRobots,
@@ -463,6 +461,18 @@ pub fn policy_equivalent(
     all_tokens.dedup();
     all_paths.sort();
     all_paths.dedup();
+    let rules: usize = before
+        .into_iter()
+        .chain([after])
+        .flat_map(|robots| &robots.groups)
+        .map(|group| group.rules.len())
+        .sum();
+    if all_tokens.len().saturating_mul(all_paths.len()).saturating_mul(rules) > MAX_EQUIVALENCE_MATCHES {
+        return Err(format!(
+            "robots.txt has too many rules ({}) to check that the proposal changes nothing else",
+            rules
+        ));
+    }
     for token in &all_tokens {
         for path in &all_paths {
             let was = allowed_with_fallback(before, token, path);
@@ -701,6 +711,79 @@ Disallow: /example/page/disallowed.gif\n",
         assert!(robots.is_allowed("anybot", &long));
         assert!(!robots.is_allowed("anybot", &format!("{long}b")));
         assert!(!robots.is_allowed("anybot", "/xaxaxaxaxaxaxaxaxaxab"));
+    }
+
+    #[test]
+    fn hostile_patterns_are_matched_in_linear_time() {
+        // One `*` before a long literal that almost matches: a backtracking matcher retries the
+        // literal at every position of the path.
+        let long = "a".repeat(16_000);
+        let robots = AiRobots::parse(&format!("User-agent: *\nDisallow: /*{long}b\n"));
+        let path = format!("/{long}");
+        let started = std::time::Instant::now();
+        for _ in 0..5 {
+            assert!(robots.is_allowed("anybot", &path));
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The definition of a robots.txt pattern, tried every way: `*` takes any number of bytes, and
+    /// the pattern must match a prefix of the path (the whole path when anchored).
+    fn matches_by_definition(pattern: &[u8], path: &[u8], anchored: bool) -> bool {
+        match pattern.split_first() {
+            None => !anchored || path.is_empty(),
+            Some((b'*', rest)) => (0..=path.len()).any(|taken| matches_by_definition(rest, &path[taken..], anchored)),
+            Some((byte, rest)) => path.first() == Some(byte) && matches_by_definition(rest, &path[1..], anchored),
+        }
+    }
+
+    #[test]
+    fn the_matcher_agrees_with_the_definition() {
+        // A small deterministic generator (LCG), so the cases are the same on every run.
+        let mut seed: u64 = 0x5eed;
+        let mut next = move |bound: u64| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) % bound
+        };
+        for _ in 0..50_000 {
+            let pattern: String = (0..next(8)).map(|_| ['a', 'b', '/', '*'][next(4) as usize]).collect();
+            let anchored = next(3) == 0;
+            let path: String = (0..next(10)).map(|_| ['a', 'b', '/'][next(3) as usize]).collect();
+            let full = if anchored {
+                format!("{pattern}$")
+            } else {
+                pattern.clone()
+            };
+            assert_eq!(
+                pattern_matches(&full, &path),
+                matches_by_definition(pattern.as_bytes(), path.as_bytes(), anchored),
+                "pattern {full:?} on {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_equivalence_fails_closed_when_the_check_would_be_too_large() {
+        let rules: String = (0..2_000).map(|i| format!("Disallow: /p{i}/\n")).collect();
+        let before = AiRobots::parse(&format!("User-agent: *\n{rules}"));
+        let after = AiRobots::parse(&format!("{}\nUser-agent: GPTBot\nDisallow: /\n", before.raw()));
+        let started = std::time::Instant::now();
+        let result = policy_equivalent(Some(&before), &after, &table_tokens_except(&["GPTBot"]), &[]);
+        assert!(
+            result.as_ref().is_err_and(|why| why.contains("too many rules")),
+            "{result:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
