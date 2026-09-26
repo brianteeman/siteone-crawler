@@ -6,10 +6,12 @@
 
 pub mod access;
 pub mod agents;
+pub mod analyze;
 pub mod controls;
 pub mod discovery;
 pub mod jsonld;
 pub mod keys;
+pub mod prompts;
 pub mod render;
 pub mod robots_ai;
 pub mod signals;
