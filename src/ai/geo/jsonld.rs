@@ -21,6 +21,7 @@ use unicode_normalization::char::is_combining_mark;
 
 use crate::ai::blocks::{Block, Region};
 use crate::ai::geo::controls::in_site_chrome;
+use crate::ai::geo::keys::normalized_url;
 use crate::ai::grounding::{find_token_bounded, numbers_in};
 
 const SCHEMA_ORG: &str = "https://schema.org";
@@ -644,15 +645,23 @@ pub fn page_name(document: &Html, site_name: &str) -> Option<String> {
 
 /// A BreadcrumbList for a page from its crawled ancestors (`crawled`: URL as crawled → name):
 /// the homepage and every ancestor path that was crawled — with a trailing slash or without it,
-/// preferring the page's own style — then the page itself. `None` for fewer than 2 elements or a
-/// page missing from `crawled`.
+/// preferring the page's own style — then the page itself. URLs are matched in their normalized
+/// form (the crawler keeps `/služby/` as written, the `url` crate encodes it) and shown as
+/// crawled. `None` for fewer than 2 elements or a page missing from `crawled`.
 pub fn breadcrumb(page_url: &str, crawled: &HashMap<String, String>) -> Option<Value> {
+    let mut known: Vec<(&String, &String)> = crawled.iter().filter(|(_, name)| !name.trim().is_empty()).collect();
+    known.sort();
+    let mut by_normalized: HashMap<String, (&String, &String)> = HashMap::new();
+    for (url, name) in known {
+        by_normalized.entry(normalized_url(url)).or_insert((url, name));
+    }
     let page = url::Url::parse(page_url).ok()?;
-    let page_name = crawled.get(page_url).filter(|name| !name.trim().is_empty())?;
+    let page_key = normalized_url(page_url);
+    let (page_crawled, page_name) = *by_normalized.get(&page_key)?;
     let origin = &page[..url::Position::BeforePath];
     let parts: Vec<&str> = page.path_segments()?.filter(|segment| !segment.is_empty()).collect();
     let slash_first = page.path().ends_with('/');
-    let mut trail: Vec<(String, &String)> = Vec::new();
+    let mut trail: Vec<(&String, &String)> = Vec::new();
     for depth in 0..parts.len() {
         let candidates = if depth == 0 {
             vec![format!("{origin}/")]
@@ -665,15 +674,16 @@ pub fn breadcrumb(page_url: &str, crawled: &HashMap<String, String>) -> Option<V
                 vec![path, with_slash]
             }
         };
-        if let Some((url, name)) = candidates.into_iter().find_map(|url| {
-            let name = crawled.get(&url).filter(|name| !name.trim().is_empty())?;
-            Some((url, name))
-        }) && url != page_url
+        if let Some(level) = candidates
+            .iter()
+            .map(|url| normalized_url(url))
+            .filter(|key| *key != page_key)
+            .find_map(|key| by_normalized.get(&key).copied())
         {
-            trail.push((url, name));
+            trail.push(level);
         }
     }
-    trail.push((page_url.to_string(), page_name));
+    trail.push((page_crawled, page_name));
     if trail.len() < 2 {
         return None;
     }
@@ -692,18 +702,27 @@ pub fn breadcrumb(page_url: &str, crawled: &HashMap<String, String>) -> Option<V
     }))
 }
 
-/// A FAQPage from visible questions with their answers: a question needs at least one answer
-/// block, and every answer block must follow the question in document order; other pairs are
-/// dropped. `None` when no pair is left.
+/// A FAQPage from visible questions with their answers, in document order. A pair is kept only
+/// when its question and answer blocks are the page's own content (Main region), it has an
+/// answer, and every answer block lies between its question and the next pair's question — so
+/// pairs can neither cross nor share an answer, and no question can be another's answer. `None`
+/// when no pair is left.
 pub fn faq(page_url: &str, pairs: &[(Block, Vec<Block>)]) -> Option<Value> {
-    let questions: Vec<Value> = pairs
+    let mut ordered: Vec<&(Block, Vec<Block>)> = pairs.iter().collect();
+    ordered.sort_by_key(|(question, _)| question.id);
+    let questions: Vec<Value> = ordered
         .iter()
-        .filter(|(question, answers)| {
+        .enumerate()
+        .filter(|(at, (question, answers))| {
+            let next_question = ordered.get(at + 1).map_or(usize::MAX, |(next, _)| next.id);
             !question.text.trim().is_empty()
+                && question.region == Region::Main
                 && !answers.is_empty()
-                && answers.iter().all(|answer| answer.id > question.id)
+                && answers
+                    .iter()
+                    .all(|answer| answer.region == Region::Main && answer.id > question.id && answer.id < next_question)
         })
-        .filter_map(|(question, answers)| {
+        .filter_map(|(_, (question, answers))| {
             let texts: Vec<&str> = answers
                 .iter()
                 .map(|answer| answer.text.trim())
@@ -1188,6 +1207,67 @@ mod tests {
             }))
         );
         assert_eq!(faq(url, &pairs[1..]), None, "no question keeps an answer");
+    }
+
+    #[test]
+    fn faq_pairs_may_not_cross_or_leave_the_page_content() {
+        let question = |id: usize, text: &str| block(id, BlockKind::Heading, text);
+        let answer = |id: usize, text: &str| block(id, BlockKind::Paragraph, text);
+        let mut in_chrome = question(20, "Newsletter?");
+        in_chrome.region = Region::Chrome;
+        let pairs = vec![
+            // Given out of document order: the markup follows the page.
+            (question(10, "Kde vás najdu?"), vec![answer(11, "V Praze.")]),
+            // An answer after the next question: an off-by-one pairing.
+            (
+                question(3, "Kolik to stojí?"),
+                vec![answer(4, "290 Kč."), answer(8, "Zdarma.")],
+            ),
+            (question(7, "Je to zdarma?"), vec![answer(8, "Zdarma.")]),
+            // An answer that is the next question's block.
+            (
+                question(12, "Mohu platit kartou?"),
+                vec![answer(13, "Ano."), question(14, "A hotově?")],
+            ),
+            (question(14, "A hotově?"), vec![answer(15, "Také.")]),
+            (in_chrome, vec![answer(21, "Ano.")]),
+        ];
+        let built = faq("https://example.com/faq", &pairs).expect("some pairs are valid");
+        let names: Vec<&str> = built["mainEntity"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|question| question["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["Je to zdarma?", "Kde vás najdu?", "A hotově?"]);
+    }
+
+    #[test]
+    fn breadcrumb_levels_match_crawled_urls_in_any_encoding() {
+        // The crawler keeps URLs as the pages wrote them, without percent-encoding.
+        let crawled: HashMap<String, String> = [
+            ("https://example.com/", "Example"),
+            ("https://example.com/služby/", "Služby"),
+            ("https://example.com/služby/ceník", "Ceník"),
+        ]
+        .iter()
+        .map(|(url, name)| (url.to_string(), name.to_string()))
+        .collect();
+        let urls = |page: &str| -> Vec<String> {
+            breadcrumb(page, &crawled).unwrap_or_else(|| panic!("no breadcrumb for {page}"))["itemListElement"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["item"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let expected = [
+            "https://example.com/",
+            "https://example.com/služby/",
+            "https://example.com/služby/ceník",
+        ];
+        assert_eq!(urls("https://example.com/služby/ceník"), expected);
+        assert_eq!(urls("https://example.com/slu%C5%BEby/cen%C3%ADk"), expected);
     }
 
     #[test]
