@@ -1,11 +1,13 @@
 // SiteOne Crawler - robots.txt evaluation per AI crawler (RFC 9309)
 // (c) Jan Reges <jan.reges@siteone.cz>
 //
-// Reads robots.txt the way RFC 9309 and Google's documented parser do: a group is one or more
-// consecutive user-agent lines followed by rules (only an allow or disallow line ends the list of
-// user agents), the groups of one product token merge, a named group makes a crawler ignore `*`,
-// the longest matching pattern wins and Allow wins a tie. Patterns and paths are compared after
-// the percent-encoding normalization of RFC 9309 §2.2.2, with a byte-level backtracking matcher
+// Reads robots.txt the way RFC 9309 and Google's parser (github.com/google/robotstxt) do: a group
+// is one or more consecutive user-agent lines followed by rules (only an allow or disallow line
+// ends the list of user agents), the groups of one product token merge, a named group makes a
+// crawler ignore `*`, the longest matching pattern wins and Allow wins a tie. Like Google, it also
+// reads the misspelled keys Google accepts, a two-word line without the colon, and only the first
+// 500 KiB of the file and 16,663 bytes of a line. Patterns and paths are compared after the
+// percent-encoding normalization of RFC 9309 §2.2.2, with a byte-level backtracking matcher
 // (no regex per rule). Used for the crawler-policy verdicts and for the safety check of a
 // proposed robots.txt.
 
@@ -13,6 +15,22 @@ use std::collections::BTreeMap;
 
 use crate::ai::geo::agents::{AiAgent, find_agent};
 use crate::result::status::RobotsFetchState;
+
+/// Google ignores the content of a robots.txt after 500 KiB.
+const MAX_PARSED_BYTES: usize = 500 * 1024;
+/// Google ignores the bytes of a line after 16,663 (2083 × 8 − 1, see google/robotstxt).
+const MAX_LINE_BYTES: usize = 2083 * 8 - 1;
+
+/// What a robots.txt line is, as Google's parser reads its key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Field {
+    UserAgent,
+    Allow,
+    Disallow,
+    Sitemap,
+    ContentSignal,
+    Other,
+}
 
 /// One allow or disallow line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,14 +75,33 @@ impl AiRobots {
         let mut content_signals = Vec::new();
         // The last group still takes user-agent lines until its first rule.
         let mut taking_agents = false;
-        for line in raw.trim_start_matches('\u{feff}').split(['\n', '\r']) {
-            let line = line.split('#').next().unwrap_or_default().trim();
-            let Some((key, value)) = line.split_once(':') else {
+        // For `ends_with_ruleless_group`, over the whole file: the last user-agent line in any
+        // spelling Google accepts, and the last allow or disallow line that a strict parser reads.
+        let (mut last_agent_line, mut last_strict_rule_line) = (None, None);
+        let text = raw.trim_start_matches('\u{feff}');
+        let mut offset = 0;
+        for (index, line) in text.split(['\n', '\r']).enumerate() {
+            let start = offset;
+            offset += line.len() + 1;
+            let Some((field, key, _, has_colon)) = record(prefix(line, MAX_LINE_BYTES)) else {
                 continue;
             };
-            let value = value.trim();
-            match key.trim().to_ascii_lowercase().as_str() {
-                "user-agent" => {
+            if field == Field::UserAgent {
+                last_agent_line = Some(index);
+            }
+            if has_colon && (key.eq_ignore_ascii_case("allow") || key.eq_ignore_ascii_case("disallow")) {
+                last_strict_rule_line = Some(index);
+            }
+            if start >= MAX_PARSED_BYTES {
+                continue;
+            }
+            // The line that crosses the 500 KiB limit counts up to the limit only.
+            let Some((field, key, value, _)) = record(prefix(line, MAX_LINE_BYTES.min(MAX_PARSED_BYTES - start)))
+            else {
+                continue;
+            };
+            match field {
+                Field::UserAgent => {
                     if !taking_agents {
                         groups.push(Group::default());
                         taking_agents = true;
@@ -73,24 +110,39 @@ impl AiRobots {
                         group.agents.push(product_token(value));
                     }
                 }
-                field @ ("allow" | "disallow") => {
+                Field::Allow | Field::Disallow => {
                     // Rules before the first user-agent line belong to no group.
                     let Some(group) = groups.last_mut() else {
                         continue;
                     };
                     taking_agents = false;
+                    let allow = field == Field::Allow;
                     group.rules.push(Rule {
-                        allow: field == "allow",
+                        allow,
                         value: value.to_string(),
                         pattern: normalize_path(value),
                     });
+                    // Google: allowing `/dir/index.htm(l)` also allows `/dir/` itself.
+                    if allow
+                        && let Some(slash) = value.rfind('/')
+                        && value[slash..].starts_with("/index.htm")
+                    {
+                        group.rules.push(Rule {
+                            allow,
+                            value: value.to_string(),
+                            pattern: format!("{}$", normalize_path(&value[..=slash])),
+                        });
+                    }
                 }
-                "sitemap" => sitemaps.push(value.to_string()),
-                "content-signal" | "content-usage" => content_signals.push(line.to_string()),
-                _ => {}
+                Field::Sitemap => sitemaps.push(value.to_string()),
+                Field::ContentSignal => content_signals.push(format!("{}: {}", key, value)),
+                Field::Other => {}
             }
         }
-        let ends_with_ruleless_group = groups.last().is_some_and(|group| group.rules.is_empty());
+        let ends_with_ruleless_group = match (last_agent_line, last_strict_rule_line) {
+            (Some(agent), Some(rule)) => agent > rule,
+            (agent, _) => agent.is_some(),
+        };
         Self {
             groups,
             sitemaps,
@@ -136,8 +188,9 @@ impl AiRobots {
         tokens
     }
 
-    /// Whether the last group has user agents but no allow or disallow rule, so that a group
-    /// appended to the file would merge into it.
+    /// Whether a group appended to the file could merge into the last one: a user-agent line (in
+    /// any spelling Google accepts) comes after the last `Allow:` / `Disallow:` line that a strict
+    /// RFC 9309 parser reads. Checked over the whole file, also past the 500 KiB that are parsed.
     pub fn ends_with_ruleless_group(&self) -> bool {
         self.ends_with_ruleless_group
     }
@@ -204,6 +257,52 @@ impl AiRobots {
         }
         best
     }
+}
+
+/// A robots.txt line as Google's parser reads it: the comment is dropped, the key ends at the first
+/// colon — or, without a colon, the line must be exactly two words — and the key is recognized by
+/// its start, including the misspellings Google accepts. Returns the field, the key, the value
+/// and whether a colon separated them.
+fn record(line: &str) -> Option<(Field, &str, &str, bool)> {
+    let line = line.split('#').next().unwrap_or_default().trim();
+    let (key, value, has_colon) = match line.split_once(':') {
+        Some((key, value)) => (key.trim(), value.trim(), true),
+        None => {
+            let mut words = line.split_ascii_whitespace();
+            match (words.next(), words.next(), words.next()) {
+                (Some(key), Some(value), None) => (key, value, false),
+                _ => return None,
+            }
+        }
+    };
+    if key.is_empty() {
+        return None;
+    }
+    let lower = key.to_ascii_lowercase();
+    let starts = |prefixes: &[&str]| prefixes.iter().any(|prefix| lower.starts_with(prefix));
+    let field = if starts(&["user-agent", "useragent", "user agent"]) {
+        Field::UserAgent
+    } else if starts(&["allow"]) {
+        Field::Allow
+    } else if starts(&["disallow", "dissallow", "dissalow", "disalow", "diasllow", "disallaw"]) {
+        Field::Disallow
+    } else if starts(&["sitemap", "site-map"]) {
+        Field::Sitemap
+    } else if lower == "content-signal" || lower == "content-usage" {
+        Field::ContentSignal
+    } else {
+        Field::Other
+    };
+    Some((field, key, value, has_colon))
+}
+
+/// The longest prefix of `text` of at most `max_bytes` bytes that ends on a character boundary.
+fn prefix(text: &str, max_bytes: usize) -> &str {
+    let mut end = max_bytes.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// The product token of a user-agent value: `*` for the global group, otherwise its leading
@@ -816,6 +915,71 @@ Disallow: /example/page/disallowed.gif\n",
         );
         assert!(!AiRobots::parse("").ends_with_ruleless_group());
         assert!(!AiRobots::parse("Sitemap: https://e.com/s.xml\n").ends_with_ruleless_group());
+    }
+
+    #[test]
+    fn googles_accepted_typos_and_missing_colons_are_read() {
+        let robots = AiRobots::parse(
+            "useragent: a\nDisalow: /1\n\nUser agent: b\nDissallow: /2\n\nUser-agents: c\nDisallow /3\n\n\
+User-agent d\nDisallow: /4\nAllowed: /4/open\nDisallow /5 extra\nsite-map: https://example.com/s.xml\n",
+        );
+        assert!(!robots.is_allowed("a", "/1"));
+        assert!(!robots.is_allowed("b", "/2"));
+        assert!(!robots.is_allowed("c", "/3"));
+        assert!(!robots.is_allowed("d", "/4"));
+        assert!(robots.is_allowed("d", "/4/open/x"));
+        // Without a colon, only exactly two words make a record.
+        assert!(robots.is_allowed("d", "/5"));
+        assert_eq!(robots.sitemaps(), ["https://example.com/s.xml"]);
+        assert_eq!(robots.named_tokens(), ["a", "b", "c", "d"]);
+    }
+
+    #[test]
+    fn a_trailing_user_agent_line_in_any_spelling_leaves_the_group_open() {
+        for tail in [
+            "useragent: *",
+            "User agent: Example",
+            "User-agent Googlebot",
+            "User-Agent; Googlebot",
+        ] {
+            let robots = AiRobots::parse(&format!("User-agent: *\nDisallow: /private/\n\n{tail}\n"));
+            assert!(robots.ends_with_ruleless_group(), "{tail}");
+        }
+        // A rule only Google's parser reads does not close the group for a strict parser.
+        assert!(AiRobots::parse("User-agent: X\nDisalow: /x\n").ends_with_ruleless_group());
+        assert!(AiRobots::parse("User-agent: X\nDisallow /x\n").ends_with_ruleless_group());
+        assert!(!AiRobots::parse("User-agent: X\nDisallow: /x\n# end\n").ends_with_ruleless_group());
+
+        let before = AiRobots::parse("User-agent: *\nDisallow: /private/\n\nuseragent: *\n");
+        let after = AiRobots::parse(&format!("{}User-agent: GPTBot\nDisallow: /\n", before.raw()));
+        let result = policy_equivalent(Some(&before), &after, &table_tokens_except(&["GPTBot"]), &[]);
+        assert!(result.is_err(), "{result:?}");
+    }
+
+    #[test]
+    fn only_the_first_500_kib_and_16663_bytes_of_a_line_are_read() {
+        let padding = format!("# {}\n", "x".repeat(600 * 1024));
+        let late = AiRobots::parse(&format!("User-agent: *\nDisallow: /a\n{padding}Disallow: /b\n"));
+        assert!(!late.is_allowed("anybot", "/a"));
+        assert!(late.is_allowed("anybot", "/b"), "a rule after 500 KiB is ignored");
+        assert!(late.raw().ends_with("Disallow: /b\n"), "the raw file is kept whole");
+
+        let long = AiRobots::parse(&format!("User-agent: *\nDisallow: /{}\n", "a".repeat(20_000)));
+        // "Disallow: /" takes 11 of the 16,663 bytes of the line.
+        assert!(!long.is_allowed("anybot", &format!("/{}", "a".repeat(16_652))));
+        assert!(long.is_allowed("anybot", &format!("/{}", "a".repeat(16_651))));
+    }
+
+    #[test]
+    fn allowing_an_index_page_allows_its_directory() {
+        let robots = AiRobots::parse("User-agent: *\nDisallow: /dir/\nAllow: /dir/index.html\n");
+        assert!(robots.is_allowed("anybot", "/dir/"));
+        assert!(robots.is_allowed("anybot", "/dir/index.html"));
+        assert!(!robots.is_allowed("anybot", "/dir/other.html"));
+        assert_eq!(
+            robots.explain("anybot", "/dir/").as_deref(),
+            Some("User-agent: * → Allow: /dir/index.html")
+        );
     }
 
     #[test]
