@@ -436,10 +436,59 @@ fn collapse(text: &str) -> String {
     out
 }
 
-/// Text for Markdown: one line, no raw HTML, and no cell break inside a table.
+/// Text for Markdown: one line in which nothing from the site or the model can open a link, an
+/// image, emphasis, code or raw HTML, nor break a table cell.
 fn md_text(text: &str, in_table: bool) -> String {
-    let out = collapse(text).replace('<', "&lt;");
-    if in_table { out.replace('|', "\\|") } else { out }
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in collapse(text).chars() {
+        match c {
+            '\\' | '`' | '*' | '_' | '[' | ']' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '|' if in_table => out.push_str("\\|"),
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// A link target for Markdown: an http(s) URL as the `url` crate writes it, or a relative path of
+/// the kit (letters, digits and `._~/-` only), with the characters that could end the target,
+/// start raw HTML or split a table cell percent-encoded; `None` for anything else.
+fn md_target(href: &str) -> Option<String> {
+    let target = match url::Url::parse(href) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") => url.to_string(),
+        Ok(_) => return None,
+        Err(_) => {
+            let relative = !href.is_empty()
+                && !href.starts_with('/')
+                && href
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '~' | '/' | '-'));
+            if !relative {
+                return None;
+            }
+            href.to_string()
+        }
+    };
+    let mut out = String::with_capacity(target.len());
+    for c in target.chars() {
+        match c {
+            '(' => out.push_str("%28"),
+            ')' => out.push_str("%29"),
+            '|' => out.push_str("%7C"),
+            '\\' => out.push_str("%5C"),
+            '<' => out.push_str("%3C"),
+            '>' => out.push_str("%3E"),
+            '`' => out.push_str("%60"),
+            c if c.is_whitespace() => out.push_str("%20"),
+            c => out.push(c),
+        }
+    }
+    Some(out)
 }
 
 fn md_inline(inline: &Inline, in_table: bool) -> String {
@@ -451,10 +500,9 @@ fn md_inline(inline: &Inline, in_table: bool) -> String {
             let code = if in_table { code.replace('|', "\\|") } else { code };
             format!("`{code}`")
         }
-        Inline::Link(text, href) if safe_href(href) => {
-            let label = md_text(text, in_table).replace('[', "(").replace(']', ")");
-            let target = href.replace(' ', "%20").replace('(', "%28").replace(')', "%29");
-            format!("[{label}]({target})")
+        Inline::Link(text, href) if safe_href(href) && md_target(href).is_some() => {
+            let target = md_target(href).unwrap_or_default();
+            format!("[{}]({target})", md_text(text, in_table))
         }
         Inline::Link(text, href) => {
             if text == href {
@@ -3760,6 +3808,55 @@ mod tests {
         assert!(
             md.contains("\\| \\*\\*bold\\*\\*") || md.contains("\\| **bold**"),
             "a pipe in a table cell is escaped"
+        );
+    }
+
+    #[test]
+    fn markdown_cannot_carry_links_html_or_table_breaks_from_the_site() {
+        let mut checks = checks(true);
+        checks.policy = vec![origin_policy(
+            "https://example.com",
+            &RobotsFetchState::Ok {
+                status: 200,
+                content: "User-agent: *\nDisallow:\n\nSitemap: javascript&colon;alert(document.domain)\n\
+                          Sitemap: javascript\\:alert(1)\nSitemap: <img\tsrc=x\tonerror=\"alert&lpar;1&rpar;\"><\n"
+                    .to_string(),
+                valid_utf8: true,
+            },
+            &["/".to_string()],
+        )];
+        checks.markup[1].markup.invisible_values = vec![(
+            "WebPage.name".to_string(),
+            "![x](https://attacker.example/p.gif) [Verify your site](https://phish.example)".to_string(),
+        )];
+        checks.access.push(AccessIssue {
+            url: "https://example.com/a|b?x=1|2".to_string(),
+            kind: AccessKind::Slow(5.0),
+            detail: "5 s".to_string(),
+        });
+        let doc = GeoDoc::new(meta("en"), checks, kit(), Vec::new());
+        let md = doc.to_markdown(KIT_DIR);
+        // Every live link (a `](` not escaped) points to http(s) or into the kit directory.
+        let mut rest = md.as_str();
+        while let Some(at) = rest.find("](") {
+            let escaped = at > 0 && rest.as_bytes()[at - 1] == b'\\';
+            let target = &rest[at + 2..];
+            if !escaped {
+                assert!(
+                    target.starts_with("http://") || target.starts_with("https://") || target.starts_with(KIT_DIR),
+                    "unsafe link target: {}",
+                    &target[..target.len().min(60)]
+                );
+                assert!(
+                    !target.starts_with("https://attacker.example") && !target.starts_with("https://phish.example")
+                );
+            }
+            rest = &rest[at + 2..];
+        }
+        assert!(!md.contains("<img"), "no raw HTML");
+        assert!(
+            md.contains("(https://example.com/a%7Cb?x=1%7C2)"),
+            "a pipe in a link target cannot split a table cell"
         );
     }
 
