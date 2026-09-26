@@ -28,6 +28,10 @@ use crate::types::ContentTypeId;
 /// tolerance for a `Last-Modified` without a response `Date`).
 const LASTMOD_FUTURE_TOLERANCE_HOURS: i64 = 24;
 
+/// Identical `lastmod` values are a pattern (the generation time) from this many on; two pages
+/// may well have changed together.
+const LASTMOD_IDENTICAL_MIN: usize = 3;
+
 static ALTERNATE_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse("link[rel][hreflang][href]").unwrap());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,7 +65,8 @@ pub struct LastmodStats {
     pub invalid: usize,
     /// `lastmod` values more than a day after the crawl.
     pub future: usize,
-    /// At least two valid `lastmod` values, all the same moment: likely the generation time.
+    /// At least `LASTMOD_IDENTICAL_MIN` valid `lastmod` values, all the same moment: likely the
+    /// generation time.
     pub all_identical: bool,
 }
 
@@ -134,8 +139,10 @@ pub struct HreflangIssue {
 pub enum HreflangProblem {
     /// The target answered another status than 200.
     Status(i32),
-    /// The target was not crawled (outside the crawl's scope or limits).
+    /// The target on the same site (with or without `www.`) was not crawled.
     NotCrawled,
+    /// The target is on another site, which the crawl does not cover: not checked.
+    OtherSite,
 }
 
 /// The discovery and freshness checks.
@@ -268,7 +275,7 @@ pub fn lastmod_stats(entries: &[SitemapEntry], now: DateTime<Utc>) -> LastmodSta
             None => stats.invalid += 1,
         }
     }
-    stats.all_identical = moments.len() >= 2 && moments.iter().all(|moment| *moment == moments[0]);
+    stats.all_identical = moments.len() >= LASTMOD_IDENTICAL_MIN && moments.iter().all(|moment| *moment == moments[0]);
     stats
 }
 
@@ -472,6 +479,7 @@ pub fn discovery(status: &Status, key: &[KeyPage], declared: &[String], now: Dat
                 continue;
             }
             let problem = match by_url.get(&target) {
+                None if !same_site(&base, &target) => HreflangProblem::OtherSite,
                 None => HreflangProblem::NotCrawled,
                 Some(alternate) if alternate.status_code != 200 => HreflangProblem::Status(alternate.status_code),
                 Some(_) => continue,
@@ -487,6 +495,15 @@ pub fn discovery(status: &Status, key: &[KeyPage], declared: &[String], now: Dat
 
     found.sitemaps = files.into_values().collect();
     found
+}
+
+/// The same host, with or without `www.`.
+fn same_site(page: &url::Url, target: &str) -> bool {
+    let site = |host: &str| host.trim_start_matches("www.").to_string();
+    url::Url::parse(target)
+        .ok()
+        .and_then(|target| target.host_str().map(site))
+        .is_some_and(|host| page.host_str().map(site) == Some(host))
 }
 
 /// Where a redirect leads: the end of its crawled chain, or else its `Location`.
@@ -1080,6 +1097,8 @@ mod tests {
 
         let single = lastmod_stats(&entries(&[Some("2026-09-01")]), now());
         assert!(!single.all_identical, "one date is not a pattern");
+        let two = lastmod_stats(&entries(&[Some("2026-09-01"), Some("2026-09-01")]), now());
+        assert!(!two.all_identical, "two pages launched together are no pattern either");
     }
 
     #[test]
@@ -1090,6 +1109,7 @@ mod tests {
             <link rel="alternate" hreflang="de" href="/de/">
             <link rel="alternate" hreflang="sk" href="/sk/">
             <link rel="alternate" hreflang="fr" href="https://example.fr/">
+            <link rel="alternate" hreflang="it" href="https://www.example.com/it/">
             <link rel="alternate" hreflang="x-default" href="/">
             <link rel="alternate" type="application/rss+xml" href="/feed.xml">"#;
         add(
@@ -1123,7 +1143,9 @@ mod tests {
             [
                 ("de", "https://example.com/de/", &HreflangProblem::Status(404)),
                 ("sk", "https://example.com/sk/", &HreflangProblem::Status(301)),
-                ("fr", "https://example.fr/", &HreflangProblem::NotCrawled),
+                // Another site is outside the crawl: not checked rather than a problem.
+                ("fr", "https://example.fr/", &HreflangProblem::OtherSite),
+                ("it", "https://www.example.com/it/", &HreflangProblem::NotCrawled),
             ]
         );
         assert!(
