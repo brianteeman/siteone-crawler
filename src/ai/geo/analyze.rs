@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::NaiveDate;
 use once_cell::sync::Lazy;
-use scraper::{Html, Selector};
+use scraper::{ElementRef, Html, Node, Selector};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
@@ -427,20 +427,61 @@ pub fn analyzed_page(url: &str, html: &str) -> AnalyzedPage {
         h1: document
             .select(&H1_SELECTOR)
             .filter(|h1| !in_site_chrome(*h1))
-            .map(|h1| collapse(h1.text().collect()))
+            .map(|h1| collapse(shown_text(h1)))
             .find(|text| !text.is_empty()),
     }
 }
 
-/// Text compared without whitespace differences and invisible soft hyphens or zero-width spaces
-/// (which `blocks_from_html` drops).
+/// The text of an element as its blocks show it: without the text of scripts, styles, SVG and
+/// other non-text elements, and of hidden inline elements (a block of their own), with a `<br>`
+/// as a space.
+fn shown_text(element: ElementRef) -> String {
+    const NOT_TEXT: &[&str] = &["script", "style", "template", "noscript", "svg", "iframe"];
+    let hidden = |node: ego_tree::NodeRef<Node>| {
+        node.value().as_element().is_some_and(|element| {
+            NOT_TEXT.contains(&element.name())
+                || element.attr("hidden").is_some()
+                || element
+                    .attr("aria-hidden")
+                    .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
+                || element.attr("style").is_some_and(|style| {
+                    style
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .collect::<String>()
+                        .to_ascii_lowercase()
+                        .contains("display:none")
+                })
+        })
+    };
+    let mut text = String::new();
+    for node in element.descendants() {
+        let shown = !node
+            .ancestors()
+            .take_while(|ancestor| ancestor.id() != element.id())
+            .any(hidden)
+            && !hidden(node);
+        if !shown {
+            continue;
+        }
+        match node.value() {
+            Node::Text(part) => text.push_str(part),
+            Node::Element(child) if child.name() == "br" => text.push(' '),
+            _ => {}
+        }
+    }
+    text
+}
+
+/// Text compared without any whitespace and without the invisible soft hyphens and zero-width
+/// spaces that `blocks_from_html` drops.
 fn same_text(a: &str, b: &str) -> bool {
-    let words = |text: &str| -> Vec<String> {
-        text.split_whitespace()
-            .map(|word| word.chars().filter(|c| !matches!(c, '\u{ad}' | '\u{200b}')).collect())
+    let compact = |text: &str| -> String {
+        text.chars()
+            .filter(|c| !c.is_whitespace() && !matches!(c, '\u{ad}' | '\u{200b}'))
             .collect()
     };
-    words(a) == words(b)
+    compact(a) == compact(b)
 }
 
 /// The `<signals>` line: the page's existing structured data, its effective snippet controls per
@@ -1746,6 +1787,41 @@ mod tests {
             answered_label(&en, Answered::No, &shortened),
             "not found in the inspected blocks"
         );
+    }
+
+    #[test]
+    fn the_h1_is_found_whatever_markup_its_text_has() {
+        for heading in [
+            "Jak na<br>hypotéku",
+            "<svg><title>ikona</title></svg>Jak na hypotéku",
+            "Jak na hypotéku<span hidden>SEO text</span>",
+            "Jak na <script>var x = 1;</script>hypotéku",
+        ] {
+            let html = format!(
+                "<html lang=\"cs\"><body><main><article><h1>{heading}</h1><p>Jan Novák</p>\
+                 <p>25. září 2026</p><p>Text článku.</p></article></main></body></html>"
+            );
+            let (page, blocks) = page_of(&html);
+            let (_, coverage) = request(&page, &blocks, false, 1_000_000);
+            let h1 = blocks
+                .iter()
+                .find(|block| block.kind == BlockKind::Heading)
+                .expect("an H1 block");
+            assert_eq!(coverage.h1, Some(h1.id), "{heading}");
+            let analysis = analyze(
+                &page,
+                &blocks,
+                &format!(
+                    r#""byline":{{"author":"{}","date":"{}"}}"#,
+                    r(&blocks, "Jan Novák"),
+                    r(&blocks, "25. září 2026")
+                ),
+            );
+            assert!(
+                analysis.byline.author.is_some() && analysis.byline.date.is_some(),
+                "{heading}"
+            );
+        }
     }
 
     #[test]
