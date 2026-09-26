@@ -1101,6 +1101,48 @@ How it selects what matters, at any site size: it ranks the full page universe, 
 - `--ai-elaborate-max-output-kb=<n>` (default `45`) — target prose size; above it, synthesis switches to a sectioned map-reduce to fit the model's output-token cap.
 - `--ai-max-pages`, `--ai-include`, `--ai-exclude`, `--ai-max-concurrency`, `--ai-dry-run` apply as for other AI features. `--ai-elaborate` is its own pipeline (not an `--ai-actions` value): used alone it runs only the profile; combine it with explicit `--ai-actions=...` to run other AI actions too.
 
+#### Fact consistency across pages (`--ai-consistency`)
+
+`--ai-consistency` looks for **possible contradictions in hard facts** across the crawled pages and the header/footer they share: contacts (phone, e-mail, postal address, opening hours), prices, fees, interest rates and APR, conditions (free-shipping threshold, delivery, return, warranty and cancellation periods, age limits), dates, figures the site claims (customers, branches, years in business, product parameters) and identifiers (company ID, VAT ID, bank account). Typical catches: a customer line with two transposed digits in the footer of three pages out of sixty, or a loan's APR stated as 4.81 % on one page and 4.91 % on another for the same conditions.
+
+```bash
+./siteone-crawler --url=https://example.com/ \
+  --ai-consistency --ai-report-language=en --http-cache-dir= \
+  --ai-provider=openai-compatible --ai-endpoint=http://localhost:8000/v1 \
+  --ai-model=your-model
+```
+
+How it works:
+
+- **Sources.** Each selected page is split into numbered evidence blocks (paragraphs, list items, table rows with their column headers), each with its heading path; on a long page the fact-bearing blocks are kept and the rest is counted as not inspected. The header/footer is analyzed once, as its unique fact-bearing lines, each with the exact set of pages that shows it — a footer that differs in one digit on 3 pages is its own line with its own 3 pages.
+- **Extraction.** One small call per page (and per few header/footer lines) picks at most 5 facts, usually 2–4. A fact is kept only when it cites a block the crawler supplied, its quote occurs in that block and its value occurs in the quote on token boundaries (`5 %` never matches inside `15 %`). The evidence in the report is always the crawler's own copy of that block, never text from the model.
+- **Grouping.** Facts are bucketed by a fixed attribute key (phone, price, interest rate, APR, company ID, …; a fee shares the bucket of prices and another figure that of product parameters, since the same fact gets either name); the model groups the labels that name the same property of the same subject, in chunks sized to `--ai-context-window`, over several rounds so that distant synonyms still meet.
+- **Comparison.** Differing values are found in code, with a normalization that preserves meaning: `+420` ≠ `+421`, `<18` ≠ `>18`, `od 290 Kč` ≠ `290 Kč`, and `5,000 %` is read by the page language. An uncertain equivalence is shown as a difference to review but never counted as "consistent".
+- **Review.** The model judges each group of differing values with a lenient rubric: first look for a legitimate reason (another product, variant, tariff, region or period; a "from" versus an exact price; VAT; rounding; a blog post dated before the crawl; several valid contact channels). It may call a difference likely or possibly inconsistent, explainable, not comparable, or not judgeable from the evidence. The priority gate, the numbers in its prose and the tone are checked in code; a text that fails the check is replaced by neutral standard wording.
+
+**Outputs.** Four files in `--ai-report-dir` (default `tmp/`), written as one no-clobber set: `ai-consistency.<host>.<run-id>.md`, `.json` (schema `siteone-crawler/ai-consistency/2`, with the whole audit trail: every source, every kept fact with its block, every group with its disposition and reason, the counts and the completeness state), a self-contained light/dark `.html` with priority filters, and `.csv` with one row per finding × value × affected URL (`finding_id,priority,confidence,attribute,subject,value,qualifiers,url,region,heading_path`) for assigning edits.
+
+**How to read a finding.** Each finding has a priority badge — **Critical** (check first), **High**, **Medium** or **Low** — and a confidence, *Likely inconsistent* or *Possibly inconsistent*. Critical is reserved for a likely difference in money or legal identity (price, fee, interest rate, APR, company ID, VAT ID, bank account, registration number); contacts are at most High, and most findings are Medium. Then come the fixed caution line ("Possible inconsistency — please verify manually. The values may apply to different circumstances."), a title and explanation, possible legitimate reasons, what to check, and a table of the differing values: each value as written, where it occurs (a page, or a header/footer line shown on N pages), the conditions and heading path stated with it, the crawler's evidence and all affected URLs. After the findings the report lists them **by page**, then the **differences with a plausible explanation**, the groups that **could not be judged** (with their raw values), the **same values** seen in several places, and **coverage & method**.
+
+**Lenient by design.** A difference is a *perceived* inconsistency, not a proven error: values can differ for legitimate reasons, and the automated review can misread the context or miss a difference. The report says so in a disclaimer before anything else, never calls a value wrong, and asks for a manual check on every finding. When nothing is found it says "No potential inconsistencies were identified among the compared facts" and immediately states what was compared — never a bare "all good".
+
+**Completeness state**, shown next to the summary:
+
+| State | Meaning |
+|---|---|
+| Complete within scope | Every selected source was analyzed, the grouping finished and every difference was reviewed. |
+| Partial | The report names the reasons: sources that failed, pages without a body or with reduced input, header/footer lines left out, labels never compared with each other, differences not reviewed (cap, failed call, too small `--ai-max-tokens`). |
+| Insufficient evidence | Fewer than 3 sources yielded facts, or at least half of the sources failed. |
+
+**Cost and large sites.** About one small extraction call per page, plus 1–4 for the header/footer and a few grouping and review calls; at 1,000 pages that is ≈ 1,000 extraction calls plus 5–30 grouping and 5–30 review calls. `--ai-max-pages` (default `100`) caps the pages, keeping the highest-ranked ones, and `--ai-include` / `--ai-exclude` focus the check (e.g. `--ai-exclude='/blog/'`). `--ai-dry-run` prints the call counts and a token estimate (and a cost range when `--ai-input-cost-per-million` / `--ai-output-cost-per-million` are set) without any API call, and `--ai-cache-dir` makes a rerun over the same pages cheap.
+
+**A fresh comparison.** The crawler's HTTP cache may serve pages fetched earlier; the report's coverage section says so, with the cache TTL. Run with `--http-cache-dir=` to compare the live website.
+
+- `--ai-context-window` sizes every batch (page input, grouping chunks, review batches), and `--ai-max-tokens` bounds the answers; `--ai-max-concurrency` runs the calls in parallel.
+- Thinking models work too. A review call covers at most 8 groups and asks for an output ceiling sized to them (at least 8,000 tokens, never more than `--ai-max-tokens`), so a reasoning loop stops early; a call cut at the limit is split and asked again, and groups an answer left out are asked for once more. Raise `--ai-timeout` for a slow endpoint.
+- `--ai-report-language=<BCP-47>` sets the language of the model's prose; the fixed texts are built in for English and Czech (other languages use English). Values and evidence are always quoted as written.
+- `--ai-consistency` is its own pipeline (not an `--ai-actions` value): used alone it runs only the consistency check; combine it with explicit `--ai-actions=...`, `--ai-report`, `--ai-elaborate` or `--ai-profile` to run those too.
+
 #### AI executive summary (`summary` action)
 
 `--ai-actions=summary` runs **after** the deterministic analysis and produces a visually styled box at the top of the HTML report's **Summary** tab, below the Website Quality Score. It works by evaluating five areas in parallel — security, accessibility, SEO, performance, infrastructure — each grounded in compact *aggregated* crawl data (never raw per-URL lists), then synthesizing one cross-area, prioritized list of up to 15 actionable recommendations (fewer for a clean site — never padded) with severity, impact, and evidence.

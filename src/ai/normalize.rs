@@ -314,6 +314,38 @@ pub fn repair_json(raw: &str) -> String {
     repair_json_with_status(raw).json
 }
 
+/// The list an answer holds: an outer JSON array, or the array under `key` of an outer JSON object
+/// (`null` there reads as an empty list), each also after `repair_json`. Anything else — prose,
+/// `{}`, an object without `key`, `key` holding something else — is an error, so the caller can
+/// retry the call; the inner array of an object without `key` is never taken for the answer.
+pub fn json_list(raw: &str, key: &str) -> Result<Vec<serde_json::Value>, String> {
+    use serde_json::Value;
+    let cleaned = strip_code_fences(&strip_think(raw));
+    let outer_is_array = cleaned
+        .find(['{', '['])
+        .is_some_and(|at| cleaned.get(at..).is_some_and(|rest| rest.starts_with('[')));
+    for candidate in [
+        normalize_json_array(raw),
+        normalize_json_response(raw),
+        repair_json(raw),
+    ] {
+        let Ok(value) = serde_json::from_str::<Value>(&candidate) else {
+            continue;
+        };
+        match value {
+            Value::Array(items) if outer_is_array => return Ok(items),
+            Value::Object(mut object) => match object.remove(key) {
+                Some(Value::Array(items)) => return Ok(items),
+                Some(Value::Null) => return Ok(Vec::new()),
+                Some(_) => return Err(format!("\"{key}\" is not an array")),
+                None => continue,
+            },
+            _ => continue,
+        }
+    }
+    Err(format!("the answer is not a JSON object with \"{key}\""))
+}
+
 /// Drop a trailing comma (and following whitespace) already written to `out`.
 fn trim_trailing_comma(out: &mut String) {
     let trimmed = out.trim_end();
@@ -354,6 +386,32 @@ fn match_literal(bytes: &[char], pos: usize) -> Option<(&'static str, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_list_reads_an_outer_array_or_the_array_under_its_key() {
+        use serde_json::json;
+        assert_eq!(json_list("[1, 2]", "facts").unwrap(), vec![json!(1), json!(2)]);
+        assert_eq!(json_list("Sure:\n```json\n[1]\n```", "facts").unwrap(), vec![json!(1)]);
+        assert_eq!(
+            json_list(r#"{"facts":[{"a":1}]}"#, "facts").unwrap(),
+            vec![json!({"a":1})]
+        );
+        assert_eq!(
+            json_list(r#"<think>[x] {y}</think>{"facts":[3,]}"#, "facts").unwrap(),
+            vec![json!(3)]
+        );
+        assert_eq!(
+            json_list(r#"{"facts":null}"#, "facts").unwrap(),
+            Vec::<serde_json::Value>::new()
+        );
+        assert_eq!(json_list("[]", "facts").unwrap(), Vec::<serde_json::Value>::new());
+        // An inner array of an object without the key is not the answer.
+        assert!(json_list(r#"{"items":[1]}"#, "facts").is_err());
+        assert!(json_list(r#"{"facts":"none"}"#, "facts").is_err());
+        assert!(json_list("{}", "facts").is_err());
+        assert!(json_list("No facts.", "facts").is_err());
+        assert!(json_list("", "facts").is_err());
+    }
 
     #[test]
     fn strips_well_formed_think_block() {

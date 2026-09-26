@@ -6169,3 +6169,968 @@ fn robots_txt_fetch_state_is_not_attempted_for_an_origin_never_fetched() {
         serde_json::json!({"state": "unavailable", "statusOrError": "HTTP 503"})
     );
 }
+
+// ---------------------------------------------------------------------------
+// AI fact consistency across pages (`--ai-consistency`)
+// ---------------------------------------------------------------------------
+
+/// Three pages sharing a navigation and a footer with a phone number and a company ID.
+fn write_consistency_site(dir: &Path) {
+    std::fs::create_dir_all(dir).expect("site dir");
+    let nav = "<nav><a href=\"/cenik.html\">Ceník</a> <a href=\"/kontakt.html\">Kontakt</a></nav>";
+    let footer = "<footer><p>Zákaznická linka 800 123 456</p><p>Example s.r.o., IČO 12345678</p></footer>";
+    for (file, title, body) in [
+        ("index.html", "Example", "<p>Vítejte na webu Example.</p>"),
+        (
+            "cenik.html",
+            "Ceník",
+            "<table><tr><th>Tarif</th><th>Cena měsíčně</th></tr><tr><td>Basic</td><td>290 Kč</td></tr></table>",
+        ),
+        ("kontakt.html", "Kontakt", "<p>Zákaznická linka: 800 123 456</p>"),
+    ] {
+        std::fs::write(
+            dir.join(file),
+            format!(
+                "<html lang=\"cs\"><head><title>{title}</title></head><body>{nav}<main><h1>{title}</h1>{body}</main>{footer}</body></html>"
+            ),
+        )
+        .expect("a page");
+    }
+}
+
+#[test]
+fn ai_consistency_dry_run_prints_the_plan() {
+    let tmp = TempDir::new("ai-consistency-dry-run");
+    let site = tmp.path.join("site");
+    write_consistency_site(&site);
+    let server = LocalServer::start(&site);
+    let mock = MockLlm::start(vec![chat_response(500, "{}".to_string())]);
+    let report_dir = format!("--ai-report-dir={}", tmp.path.display());
+    let stderr = crawl_with_ai(
+        &server,
+        &mock,
+        &[
+            "--ai-consistency",
+            "--ai-dry-run",
+            "--ai-input-cost-per-million=1",
+            "--ai-output-cost-per-million=4",
+            report_dir.as_str(),
+        ],
+    );
+    assert_line(
+        &stderr,
+        r"AI consistency dry-run: 3 page\(s\) \+ 1 header/footer chunk\(s\) → 4 extraction call\(s\), ~\d+ grouping and ~\d+ review call\(s\); est\. input ~[1-9]\d* tokens, output [1-9]\d*–[1-9]\d* tokens, cost \$\d+\.\d{4}–\$\d+\.\d{4}; ctx 128000 tok\. No API calls made\.",
+    );
+    assert!(stderr.contains("--ai-cache-dir"), "the cache note: {stderr}");
+    assert!(
+        stderr.contains("1. http://127.0.0.1:"),
+        "the pages are listed: {stderr}"
+    );
+    assert!(mock.request_bodies().is_empty(), "no request reaches the model");
+    let written: Vec<String> = std::fs::read_dir(&tmp.path)
+        .expect("the report dir")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("ai-consistency."))
+        .collect();
+    assert!(written.is_empty(), "a dry run writes no report: {written:?}");
+}
+
+/// The routed answers for the corpus in `tests/fixtures/consistency/`: the facts of each page
+/// and of the header/footer lines (citing the crawler's block ids), one grouping of the phone
+/// labels (the other buckets group nothing), and a review that finds the transposed digit.
+fn consistency_corpus_routes() -> Vec<MockRoute> {
+    let route = |envelope: &'static str, marker: Option<&'static str>, content: serde_json::Value| MockRoute {
+        envelope,
+        marker,
+        response: chat_response(200, chat_answer(&content.to_string())),
+    };
+    let fact = |block: &str, key: &str, subject: &str, attribute: &str, value: &str, quote: &str| {
+        serde_json::json!({
+            "block": block, "attribute_key": key, "subject": subject, "attribute": attribute,
+            "value": value, "qualifiers": "", "quote": quote, "normalized": ""
+        })
+    };
+    vec![
+        route(
+            "<page_data>",
+            Some("/kontakt</url>"),
+            serde_json::json!({"facts": [fact("B3", "phone", "Zákaznická linka", "telefon", "800 123 456", "Zákaznická linka: 800 123 456")]}),
+        ),
+        route(
+            "<page_data>",
+            Some("/reklamace</url>"),
+            serde_json::json!({"facts": [fact("B2", "phone", "Zákaznická linka", "telefon pro reklamace", "800 123 465", "zákaznickou linku 800 123 465")]}),
+        ),
+        route(
+            "<page_data>",
+            Some("/cenik</url>"),
+            serde_json::json!({"facts": [
+                fact("B3", "price", "Tarif Basic", "cena měsíčně", "290 Kč", "Cena měsíčně: 290 Kč"),
+                fact("B4", "price", "Tarif Premium", "cena měsíčně", "490 Kč", "Cena měsíčně: 490 Kč"),
+            ]}),
+        ),
+        route(
+            "<page_data>",
+            Some("/o-nas</url>"),
+            serde_json::json!({"facts": [fact("B3", "company_id", "Example s.r.o.", "IČO", "12345678", "IČO 12345678")]}),
+        ),
+        route("<page_data>", Some("/</url>"), serde_json::json!({"facts": []})),
+        route(
+            "<chrome_data>",
+            None,
+            serde_json::json!({"facts": [
+                fact("L1", "company_id", "Example s.r.o.", "IČO", "12345678", "IČO 12345678"),
+                fact("L2", "phone", "Zákaznická linka", "telefon", "800 123 456", "Zákaznická linka 800 123 456"),
+                fact("L3", "phone", "Zákaznická linka", "telefon", "800 123 465", "Zákaznická linka 800 123 465"),
+            ]}),
+        ),
+        route(
+            "<labels>",
+            Some("<attribute_key>phone</attribute_key>"),
+            serde_json::json!({"groups": [{"ids": [1, 2], "name": "Zákaznická linka – telefon"}]}),
+        ),
+        route("<labels>", None, serde_json::json!({"groups": []})),
+        route(
+            "<groups>",
+            None,
+            serde_json::json!({"results": [{
+                "group": 1,
+                "values": [1, 2],
+                "confidence": "likely_inconsistent",
+                "priority": "high",
+                "title": "Zákaznická linka: dvě různá čísla",
+                "explanation": "Většina stránek uvádí 800 123 456, stránka Reklamace a její patička 800 123 465.",
+                "benign_explanations": ["Reklamace mohou mít vlastní linku."],
+                "check": "Ověřte, které číslo zákaznické linky je aktuální, a sjednoťte ho v patičce i na stránce Reklamace."
+            }]}),
+        ),
+    ]
+}
+
+#[test]
+fn ai_consistency_end_to_end_on_the_corpus() {
+    const KEY: &str = "sk-SENTINEL-consistency-0123456789";
+    const DISCLAIMER_CS: &str = "Tato zpráva je automatické porovnání faktů nalezených na webu.";
+    const CAUTION_CS: &str = "Možný nesoulad — ověřte prosím ručně. Hodnoty se mohou vztahovat k různým situacím.";
+    let tmp = TempDir::new("ai-consistency-e2e");
+    let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/consistency");
+    let server = LocalServer::start(&corpus);
+    let mock = MockLlm::start_routed(consistency_corpus_routes(), Vec::new());
+    let report_dir = tmp.path.join("reports");
+    let events_path = tmp.path.join("events.ndjson");
+    let output = run_crawler(&[
+        "--config-file=/dev/null",
+        &format!("--url={}", server.url()),
+        LOCAL_ANALYZERS,
+        "--http-cache-dir=",
+        "--no-color",
+        "--ai-provider=openai-compatible",
+        &format!("--ai-endpoint={}", mock.url()),
+        "--ai-model=m",
+        "--ai-cache-dir=",
+        &format!("--ai-api-key={KEY}"),
+        "--ai-consistency",
+        "--ai-report-language=cs",
+        &format!("--ai-report-dir={}", report_dir.display()),
+        &format!("--events-file={}", events_path.display()),
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+
+    // Four files, one stem.
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&report_dir)
+        .expect("the report dir")
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("ai-consistency."))
+        })
+        .collect();
+    files.sort();
+    let extensions: Vec<&str> = files
+        .iter()
+        .filter_map(|path| path.extension().and_then(|e| e.to_str()))
+        .collect();
+    assert_eq!(extensions, vec!["csv", "html", "json", "md"], "{files:?}\n{stderr}");
+    let read = |extension: &str| {
+        let path = files
+            .iter()
+            .find(|path| path.extension().is_some_and(|e| e == extension))
+            .expect("the file");
+        std::fs::read_to_string(path).expect("a UTF-8 file")
+    };
+    let (md, json_text, html, csv) = (read("md"), read("json"), read("html"), read("csv"));
+
+    // The phone finding: both values, the header/footer line with its exact page count, the
+    // crawler's own evidence, and the review's prose.
+    let json: serde_json::Value = serde_json::from_str(&json_text).expect("the JSON report");
+    assert_eq!(json["schema"], "siteone-crawler/ai-consistency/2");
+    assert_eq!(json["completeness"]["state"], "complete", "{json_text}");
+    let findings = json["findings"].as_array().expect("findings");
+    assert_eq!(findings.len(), 1, "{json_text}");
+    let finding = &findings[0];
+    assert_eq!(finding["id"], "F1");
+    assert_eq!(finding["attributeKey"], "phone");
+    assert_eq!(finding["priority"], "high");
+    assert_eq!(finding["confidence"], "likely");
+    assert_eq!(finding["proseReplaced"], false, "{finding}");
+    let values: Vec<&str> = finding["values"]
+        .as_array()
+        .expect("values")
+        .iter()
+        .map(|v| v["text"].as_str().expect("a text"))
+        .collect();
+    assert_eq!(values, vec!["800 123 456", "800 123 465"]);
+    let common = &finding["values"][0];
+    assert_eq!(common["urls"].as_array().map(Vec::len), Some(4), "{common}");
+    let line = &common["occurrences"][0];
+    assert_eq!(line["region"], "chrome", "{common}");
+    assert_eq!(line["urls"].as_array().map(Vec::len), Some(4), "{line}");
+    assert_eq!(line["evidence"], "Zákaznická linka 800 123 456");
+    let page = &common["occurrences"][1];
+    assert_eq!(page["region"], "page");
+    assert_eq!(page["path"], "/kontakt");
+    assert_eq!(page["evidence"], "Zákaznická linka: 800 123 456");
+    assert_eq!(page["headingPath"], serde_json::json!(["Kontakt", "Zákaznický servis"]));
+    let variant = &finding["values"][1];
+    assert_eq!(
+        variant["urls"],
+        serde_json::json!([format!("{}reklamace", server.url())])
+    );
+    assert_eq!(variant["occurrences"].as_array().map(Vec::len), Some(2), "{variant}");
+
+    // The company ID is consistent; the two tariffs are no finding.
+    let consistent = json["consistent"].as_array().expect("consistent");
+    assert_eq!(consistent.len(), 1, "{json_text}");
+    assert_eq!(consistent[0]["value"], "12345678");
+    assert_eq!(consistent[0]["attributeKey"], "company_id");
+    assert_eq!(consistent[0]["sources"], 2);
+    assert_eq!(consistent[0]["pages"], 5);
+    assert_eq!(json["meta"]["pagesAnalyzed"], 5);
+    assert_eq!(json["meta"]["chromeLinesAnalyzed"], 3);
+    assert_eq!(json["meta"]["factsKept"], 8);
+    assert_eq!(json["meta"]["language"], "cs");
+
+    // The Czech disclaimer first, then the finding with its caution line.
+    for (format, text) in [("md", &md), ("html", &html)] {
+        let disclaimer = text
+            .find(DISCLAIMER_CS)
+            .unwrap_or_else(|| panic!("{format}: no disclaimer"));
+        let finding = text
+            .find("Zákaznická linka: dvě různá čísla")
+            .unwrap_or_else(|| panic!("{format}: no finding"));
+        assert!(disclaimer < finding, "{format}: the disclaimer comes first");
+        assert_eq!(text.matches(CAUTION_CS).count(), 1, "{format}: the caution line");
+        let evidence = if format == "html" {
+            "Zákaznická linka <mark>800 123 456</mark>"
+        } else {
+            "Zákaznická linka 800 123 456"
+        };
+        assert!(text.contains(evidence), "{format}: the evidence");
+        assert!(text.contains("12345678"), "{format}: the consistent company ID");
+    }
+
+    // One CSV row per finding × value × page.
+    let rows: Vec<&str> = csv.lines().collect();
+    assert_eq!(
+        rows[0],
+        "\u{feff}finding_id,priority,confidence,attribute,subject,value,qualifiers,url,region,heading_path"
+    );
+    assert_eq!(rows.len(), 1 + 5, "{csv}");
+    // A page's own occurrence describes the row of that page.
+    for row in [
+        format!(
+            "F1,high,likely,phone,Zákaznická linka – telefon,800 123 456,,{}kontakt,page,Kontakt > Zákaznický servis",
+            server.url()
+        ),
+        format!(
+            "F1,high,likely,phone,Zákaznická linka – telefon,800 123 456,,{}o-nas,chrome,Kontakt",
+            server.url()
+        ),
+        format!(
+            "F1,high,likely,phone,Zákaznická linka – telefon,800 123 465,,{}reklamace,page,Reklamace",
+            server.url()
+        ),
+    ] {
+        assert!(rows.contains(&row.as_str()), "no {row:?} in {csv}");
+    }
+
+    // The events announce the four files, and every stage's progress runs to its end.
+    let text = std::fs::read_to_string(&events_path).expect("the event file");
+    let events: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("one JSON object per line"))
+        .collect();
+    assert_no_nulls(&events);
+    for kind in [
+        "ai-consistency-md",
+        "ai-consistency-json",
+        "ai-consistency-html",
+        "ai-consistency-csv",
+    ] {
+        let artifact = events_of(&events, "artifact")
+            .into_iter()
+            .find(|a| a["kind"] == kind)
+            .unwrap_or_else(|| panic!("no {kind}"));
+        assert!(
+            std::path::Path::new(artifact["path"].as_str().expect("a path")).is_file(),
+            "{artifact}"
+        );
+    }
+    assert_eq!(assert_progress_runs_to_the_end(&events, "consistency:extract"), 6);
+    assert_eq!(assert_progress_runs_to_the_end(&events, "consistency:group"), 2);
+    assert_eq!(assert_progress_runs_to_the_end(&events, "consistency:review"), 1);
+    for request in events_of(&events, "aiRequest") {
+        assert!(
+            request["task"].as_str().is_some_and(|t| t.starts_with("consistency:")),
+            "{request}"
+        );
+    }
+
+    // The configured key appears nowhere.
+    for (name, text) in [
+        ("stdout", &stdout),
+        ("stderr", &stderr),
+        ("events", &text),
+        ("md", &md),
+        ("json", &json_text),
+        ("html", &html),
+        ("csv", &csv),
+    ] {
+        assert!(!text.contains(KEY), "the key in {name}");
+    }
+}
+
+/// A review answer that leaves a group out (live: a Czech „quote" closed with an ASCII quote
+/// ended the JSON early) is followed by one more call for the groups it left out; each review call
+/// asks for an output ceiling sized to its groups, not the whole `--ai-max-tokens`.
+#[test]
+fn ai_consistency_review_asks_again_for_the_groups_an_answer_left_out() {
+    let tmp = TempDir::new("ai-consistency-reask");
+    let site = tmp.path.join("site");
+    std::fs::create_dir_all(&site).expect("the site dir");
+    let page = |h1: &str, phone: &str, price: &str, link: &str| {
+        format!(
+            "<!DOCTYPE html><html lang=\"cs\"><head><meta charset=\"utf-8\"><title>{h1}</title></head><body><main>\
+             <h1>{h1}</h1><p>Zákaznická linka {phone}</p><p>Tarif Mini: {price} měsíčně</p>{link}</main></body></html>"
+        )
+    };
+    // Three sources with facts (fewer is insufficient evidence); two differing values per key.
+    let links = "<a href=\"/b\">B</a> <a href=\"/c\">C</a>";
+    std::fs::write(site.join("index.html"), page("Alfa", "800 111 222", "100 Kč", links)).expect("index");
+    std::fs::write(site.join("b.html"), page("Beta", "800 111 223", "120 Kč", "")).expect("b");
+    std::fs::write(site.join("c.html"), page("Gama", "800 111 222", "100 Kč", "")).expect("c");
+    let server = LocalServer::start(&site);
+    let route = |envelope: &'static str, marker: Option<&'static str>, content: serde_json::Value| MockRoute {
+        envelope,
+        marker,
+        response: chat_response(200, chat_answer(&content.to_string())),
+    };
+    let facts = |phone: &str, price: &str| {
+        serde_json::json!({"facts": [
+            {"block": "B2", "attribute_key": "phone", "subject": "Firma", "attribute": "zákaznická linka",
+             "value": phone, "qualifiers": "", "quote": format!("Zákaznická linka {phone}"), "normalized": ""},
+            {"block": "B3", "attribute_key": "price", "subject": "Tarif Mini", "attribute": "cena měsíčně",
+             "value": price, "qualifiers": "", "quote": format!("Tarif Mini: {price}"), "normalized": ""},
+        ]})
+    };
+    let review = |group: usize, title: &str| {
+        serde_json::json!({"results": [{
+            "group": group, "values": [1, 2], "confidence": "possibly_inconsistent", "priority": "medium",
+            "title": title, "explanation": "Hodnoty se liší.", "benign_explanations": [],
+            "check": "Ověřte, která hodnota je aktuální."
+        }]})
+    };
+    let mock = MockLlm::start_routed(
+        vec![
+            route(
+                "<page_data>",
+                Some("<title>Alfa</title>"),
+                facts("800 111 222", "100 Kč"),
+            ),
+            route(
+                "<page_data>",
+                Some("<title>Beta</title>"),
+                facts("800 111 223", "120 Kč"),
+            ),
+            route(
+                "<page_data>",
+                Some("<title>Gama</title>"),
+                facts("800 111 222", "100 Kč"),
+            ),
+            // The first batch holds both groups; its answer covers only group 1.
+            route(
+                "<groups>",
+                Some("<group id=\"1\">"),
+                review(1, "Tarif Mini: ceny se liší"),
+            ),
+            route(
+                "<groups>",
+                Some("<group id=\"2\">"),
+                review(2, "Zákaznická linka: čísla se liší"),
+            ),
+        ],
+        Vec::new(),
+    );
+    let report_dir = tmp.path.join("reports");
+    let output = run_crawler(&[
+        "--config-file=/dev/null",
+        &format!("--url={}", server.url()),
+        LOCAL_ANALYZERS,
+        "--http-cache-dir=",
+        "--no-color",
+        "--ai-provider=openai-compatible",
+        &format!("--ai-endpoint={}", mock.url()),
+        "--ai-model=m",
+        "--ai-cache-dir=",
+        "--ai-api-key=sk-test",
+        "--ai-consistency",
+        &format!("--ai-report-dir={}", report_dir.display()),
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    let reviews: Vec<serde_json::Value> = mock
+        .request_bodies()
+        .iter()
+        .filter(|body| body.contains("<groups>"))
+        .map(|body| serde_json::from_str(body).expect("a JSON request"))
+        .collect();
+    assert_eq!(
+        reviews.len(),
+        2,
+        "one batch and one call for the group it left out: {stderr}"
+    );
+    let user = |request: &serde_json::Value| {
+        request["messages"][1]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert!(user(&reviews[0]).contains("<group id=\"1\">") && user(&reviews[0]).contains("<group id=\"2\">"));
+    assert!(!user(&reviews[1]).contains("<group id=\"1\">") && user(&reviews[1]).contains("<group id=\"2\">"));
+    // max(8,000, 2,000 + 1,500 × groups) of the 32,000 configured.
+    assert_eq!(reviews[0]["max_tokens"], 8_000, "{}", reviews[0]);
+    assert_eq!(reviews[1]["max_tokens"], 8_000);
+    let json_path = std::fs::read_dir(&report_dir)
+        .expect("the report dir")
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .find(|path| path.extension().is_some_and(|e| e == "json"))
+        .expect("the JSON report");
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(json_path).expect("the report")).expect("JSON");
+    let keys: Vec<&str> = json["findings"]
+        .as_array()
+        .expect("findings")
+        .iter()
+        .map(|f| f["attributeKey"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(keys, vec!["price", "phone"], "{json}");
+    assert_eq!(json["completeness"]["state"], "complete", "{}", json["completeness"]);
+    assert_eq!(json["counts"]["notReviewed"], 0);
+}
+
+// --- The evaluation corpus of `--ai-consistency` (tests/fixtures/consistency/expected.json) ---
+
+fn consistency_corpus_dir() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/consistency")
+}
+
+fn consistency_expected() -> serde_json::Value {
+    let text = std::fs::read_to_string(consistency_corpus_dir().join("expected.json")).expect("expected.json");
+    serde_json::from_str(&text).expect("expected.json is JSON")
+}
+
+/// Whether `token` occurs in `text`, lowercased and without whitespace, with no digit right before
+/// or after it; an all-digit token also matches when the digits of `text` end with it (so
+/// `800123456` matches `+420 800 123 456`).
+fn consistency_token_matches(text: &str, token: &str) -> bool {
+    let token = token.to_lowercase();
+    if !token.is_empty() && token.chars().all(|c| c.is_ascii_digit()) {
+        let digits: String = text.chars().filter(char::is_ascii_digit).collect();
+        if digits.ends_with(&token) {
+            return true;
+        }
+    }
+    let text: String = text
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_lowercase();
+    text.match_indices(&token).any(|(at, m)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + m.len()..].chars().next();
+        !before.is_some_and(|c| c.is_ascii_digit()) && !after.is_some_and(|c| c.is_ascii_digit())
+    })
+}
+
+/// How one `--ai-consistency` report compares with `expected.json` (see its `about`).
+#[derive(Debug, Default)]
+struct ConsistencyScore {
+    /// The `finding` cases found, and those missed.
+    found: Vec<String>,
+    missed: Vec<String>,
+    /// Findings that match no `finding` case (and no case tolerates).
+    false_positives: Vec<String>,
+    /// `no_finding` cases a finding breaks (`<case> by <finding>`), and those a `maxPriority`
+    /// tolerates.
+    violations: Vec<String>,
+    tolerated: Vec<String>,
+    /// Further findings of an already found case (`<case> by <finding>`): the same difference
+    /// reported under a second key, when the grouping split its labels.
+    duplicates: Vec<String>,
+    /// The `consistent` cases found, and those missed.
+    consistent_found: Vec<String>,
+    consistent_missed: Vec<String>,
+    /// Differences of a found case: its priority, its attribute key, a page not in the finding.
+    notes: Vec<String>,
+    finding_cases: usize,
+}
+
+impl ConsistencyScore {
+    fn recall(&self) -> (usize, usize) {
+        (self.found.len(), self.finding_cases)
+    }
+}
+
+fn score_consistency_report(report: &serde_json::Value, expected: &serde_json::Value) -> ConsistencyScore {
+    const PRIORITIES: [&str; 4] = ["low", "medium", "high", "critical"];
+    let rank = |p: &str| PRIORITIES.iter().position(|q| *q == p).unwrap_or(0);
+    let text = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_string();
+    let findings: Vec<&serde_json::Value> = report["findings"].as_array().into_iter().flatten().collect();
+    let values = |f: &serde_json::Value| -> Vec<String> {
+        f["values"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|v| text(&v["text"]))
+            .collect()
+    };
+    // The index of the value of `f` each token matches (a distinct value per token), if all do.
+    let matches_all = |f: &serde_json::Value, tokens: &[String]| -> bool {
+        let values = values(f);
+        let mut used = Vec::new();
+        tokens.iter().all(|token| {
+            let hit = (0..values.len()).find(|i| !used.contains(i) && consistency_token_matches(&values[*i], token));
+            hit.map(|i| used.push(i)).is_some()
+        })
+    };
+    let describe = |f: &serde_json::Value| {
+        format!(
+            "{} {}: {} ({}/{})",
+            text(&f["id"]),
+            text(&f["attributeKey"]),
+            values(f).join(" | "),
+            text(&f["priority"]),
+            text(&f["confidence"])
+        )
+    };
+    let strings = |v: &serde_json::Value| -> Vec<String> { v.as_array().into_iter().flatten().map(text).collect() };
+    let mut score = ConsistencyScore::default();
+    let mut explained: Vec<String> = Vec::new();
+    for case in expected["cases"].as_array().into_iter().flatten() {
+        let id = text(&case["id"]);
+        match case["kind"].as_str().unwrap_or_default() {
+            "finding" => {
+                score.finding_cases += 1;
+                let tokens = strings(&case["values"]);
+                let Some(finding) = findings.iter().find(|f| matches_all(f, &tokens)) else {
+                    score.missed.push(id);
+                    continue;
+                };
+                let fid = text(&finding["id"]);
+                explained.push(fid.clone());
+                for other in findings
+                    .iter()
+                    .filter(|f| f["id"] != finding["id"] && matches_all(f, &tokens))
+                {
+                    score.duplicates.push(format!("{id} by {}", text(&other["id"])));
+                    explained.push(text(&other["id"]));
+                }
+                let priority = text(&finding["priority"]);
+                if !strings(&case["priorities"]).contains(&priority) {
+                    score.notes.push(format!(
+                        "{id}: priority {priority} in {fid}, expected one of {}",
+                        strings(&case["priorities"]).join("/")
+                    ));
+                }
+                let key = text(&finding["attributeKey"]);
+                if !strings(&case["attributeKeys"]).contains(&key) {
+                    score.notes.push(format!(
+                        "{id}: attribute key {key} in {fid}, expected one of {}",
+                        strings(&case["attributeKeys"]).join("/")
+                    ));
+                }
+                for page in strings(&case["pagesInFinding"]) {
+                    let in_finding = finding["values"].as_array().into_iter().flatten().any(|v| {
+                        v["occurrences"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .any(|o| o["region"] == "page" && o["path"] == page.as_str())
+                    });
+                    if !in_finding {
+                        score.notes.push(format!(
+                            "{id}: the page text of {page} is not among the occurrences of {fid}"
+                        ));
+                    }
+                }
+                score.found.push(id);
+            }
+            "no_finding" => {
+                let max = case["maxPriority"].as_str().map(rank);
+                for finding in &findings {
+                    let broken = case["pairs"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|pair| matches_all(finding, &strings(pair)));
+                    if !broken {
+                        continue;
+                    }
+                    let (fid, priority) = (text(&finding["id"]), text(&finding["priority"]));
+                    if max.is_some_and(|max| rank(&priority) <= max) {
+                        score.tolerated.push(format!("{id} by {fid} ({priority})"));
+                        explained.push(fid);
+                    } else {
+                        score.violations.push(format!("{id} by {fid}"));
+                    }
+                }
+            }
+            "consistent" => {
+                let token = text(&case["value"]);
+                let same = report["consistent"].as_array().into_iter().flatten().any(|c| {
+                    c["sources"].as_u64().unwrap_or(0) >= 2 && consistency_token_matches(&text(&c["value"]), &token)
+                });
+                if same {
+                    score.consistent_found.push(id);
+                } else {
+                    score.consistent_missed.push(id);
+                }
+            }
+            _ => {}
+        }
+    }
+    score.false_positives = findings
+        .iter()
+        .filter(|f| !explained.contains(&text(&f["id"])))
+        .map(|f| describe(f))
+        .collect();
+    score
+}
+
+/// The live evaluation of `--ai-consistency` on the corpus (Task 14 of the plan): serves
+/// `tests/fixtures/consistency/`, crawls it from `/mapa` with a real model and prints recall, false
+/// positives and missed cases against `expected.json`. Needs `SITEONE_LIVE_AI_ENDPOINT` and
+/// `SITEONE_LIVE_AI_MODEL`; optional `SITEONE_LIVE_AI_API_KEY`, `SITEONE_LIVE_AI_EXTRA_BODY`
+/// (e.g. `{"chat_template_kwargs":{"enable_thinking":false}}`), `SITEONE_LIVE_AI_CONTEXT_WINDOW`
+/// (default 131072), `SITEONE_LIVE_AI_MAX_TOKENS` (default 32000), `SITEONE_LIVE_AI_LANGUAGE`
+/// (default `cs`), `SITEONE_LIVE_AI_CACHE_DIR` (default: no cache) and
+/// `SITEONE_LIVE_AI_REPORT_DIR` (keep the report there). Run with
+/// `cargo test --test integration_crawl consistency_corpus_live -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn consistency_corpus_live() {
+    let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    let endpoint = var("SITEONE_LIVE_AI_ENDPOINT").expect("set SITEONE_LIVE_AI_ENDPOINT");
+    let model = var("SITEONE_LIVE_AI_MODEL").expect("set SITEONE_LIVE_AI_MODEL");
+    let tmp = TempDir::new("ai-consistency-live");
+    let report_dir =
+        var("SITEONE_LIVE_AI_REPORT_DIR").map_or_else(|| tmp.path.join("reports"), std::path::PathBuf::from);
+    let expected = consistency_expected();
+    let server = LocalServer::start(&consistency_corpus_dir());
+    let mut args = vec![
+        "--config-file=/dev/null".to_string(),
+        format!("--url={}{}", server.url(), expected["start"].as_str().expect("start")),
+        LOCAL_ANALYZERS.to_string(),
+        "--http-cache-dir=".to_string(),
+        "--no-color".to_string(),
+        "--ai-provider=openai-compatible".to_string(),
+        format!("--ai-endpoint={endpoint}"),
+        format!("--ai-model={model}"),
+        format!(
+            "--ai-api-key={}",
+            var("SITEONE_LIVE_AI_API_KEY").unwrap_or_else(|| "EMPTY".to_string())
+        ),
+        format!(
+            "--ai-cache-dir={}",
+            var("SITEONE_LIVE_AI_CACHE_DIR").unwrap_or_default()
+        ),
+        format!(
+            "--ai-context-window={}",
+            var("SITEONE_LIVE_AI_CONTEXT_WINDOW").unwrap_or_else(|| "131072".to_string())
+        ),
+        format!(
+            "--ai-max-tokens={}",
+            var("SITEONE_LIVE_AI_MAX_TOKENS").unwrap_or_else(|| "32000".to_string())
+        ),
+        format!(
+            "--ai-report-language={}",
+            var("SITEONE_LIVE_AI_LANGUAGE").unwrap_or_else(|| "cs".to_string())
+        ),
+        "--ai-consistency".to_string(),
+        format!("--ai-report-dir={}", report_dir.display()),
+    ];
+    if let Some(body) = var("SITEONE_LIVE_AI_EXTRA_BODY") {
+        args.push(format!("--ai-extra-body={body}"));
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let started = std::time::Instant::now();
+    let output = run_crawler(&args);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    eprintln!(
+        "{}",
+        stderr
+            .lines()
+            .filter(|l| l.contains("AI "))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    let mut reports: Vec<std::path::PathBuf> = std::fs::read_dir(&report_dir)
+        .expect("the report dir")
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("ai-consistency.") && name.ends_with(".json"))
+        })
+        .collect();
+    reports.sort_by_key(|path| std::fs::metadata(path).and_then(|m| m.modified()).ok());
+    let path = reports.last().expect("a JSON report");
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).expect("the report")).expect("the JSON report");
+    let score = score_consistency_report(&report, &expected);
+    let (found, cases) = score.recall();
+    let meta = &report["meta"];
+    let findings = report["findings"].as_array().map_or(0, Vec::len);
+    let replaced = report["findings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(report["explained"].as_array().into_iter().flatten())
+        .filter(|f| f["proseReplaced"] == true)
+        .count();
+    eprintln!("\n=== consistency corpus: {} ===", path.display());
+    eprintln!(
+        "recall {found}/{cases}; false positives {}; violations {}; tolerated {}; duplicates {}; consistent {}/{}",
+        score.false_positives.len(),
+        score.violations.len(),
+        score.tolerated.len(),
+        score.duplicates.len(),
+        score.consistent_found.len(),
+        score.consistent_found.len() + score.consistent_missed.len()
+    );
+    eprintln!(
+        "completeness {} {}; pages {}; facts {}/{} kept ({} ungrounded); keys {}; candidates {}; reviewed {}; findings {findings} (prose replaced {replaced}); counts {}; llm calls {}; {:.0} s",
+        report["completeness"]["state"],
+        report["completeness"]["reasons"],
+        meta["pagesAnalyzed"],
+        meta["factsKept"],
+        meta["factsExtracted"],
+        meta["factsUngrounded"],
+        meta["keys"],
+        meta["candidates"],
+        meta["reviewed"],
+        report["counts"],
+        meta["llmCalls"],
+        started.elapsed().as_secs_f64()
+    );
+    for (label, list) in [
+        ("found", &score.found),
+        ("MISSED", &score.missed),
+        ("FALSE POSITIVE", &score.false_positives),
+        ("VIOLATION", &score.violations),
+        ("tolerated", &score.tolerated),
+        ("duplicate", &score.duplicates),
+        ("consistent", &score.consistent_found),
+        ("consistent MISSED", &score.consistent_missed),
+        ("note", &score.notes),
+    ] {
+        for item in list {
+            eprintln!("  {label}: {item}");
+        }
+    }
+    for finding in report["findings"].as_array().into_iter().flatten() {
+        eprintln!(
+            "  [{}] {} {}/{}: {} — {}",
+            finding["id"].as_str().unwrap_or_default(),
+            finding["attributeKey"].as_str().unwrap_or_default(),
+            finding["priority"].as_str().unwrap_or_default(),
+            finding["confidence"].as_str().unwrap_or_default(),
+            finding["title"].as_str().unwrap_or_default(),
+            finding["check"].as_str().unwrap_or_default()
+        );
+    }
+    for group in report["explained"].as_array().into_iter().flatten() {
+        eprintln!(
+            "  (explained {}) {}: {}",
+            group["disposition"].as_str().unwrap_or_default(),
+            group["key"].as_str().unwrap_or_default(),
+            group["reason"].as_str().unwrap_or_default()
+        );
+    }
+    for group in report["notJudged"].as_array().into_iter().flatten() {
+        eprintln!(
+            "  (not judged {}) {}",
+            group["status"].as_str().unwrap_or_default(),
+            group["key"].as_str().unwrap_or_default()
+        );
+    }
+}
+
+#[test]
+fn consistency_token_matching_respects_digit_boundaries() {
+    assert!(consistency_token_matches("800 123 456", "800123456"));
+    assert!(consistency_token_matches("+420 800 123 456", "800123456"));
+    assert!(!consistency_token_matches("800 123 465", "800123456"));
+    assert!(consistency_token_matches("od 290 Kč", "290kč"));
+    assert!(consistency_token_matches("od 290 Kč", "od290kč"));
+    assert!(!consistency_token_matches("1 490 Kč", "490kč"));
+    assert!(consistency_token_matches("RPSN 4,81 %", "4,81%"));
+    assert!(!consistency_token_matches("14,81 %", "4,81%"));
+    assert!(consistency_token_matches("přes 12\u{a0}000", "12000"));
+    assert!(consistency_token_matches("€12", "€12"));
+    assert!(!consistency_token_matches("€120", "€12"));
+}
+
+#[test]
+fn consistency_corpus_expectations_occur_in_the_corpus() {
+    let expected = consistency_expected();
+    let mut corpus = String::new();
+    for entry in ["", "blog", "en"] {
+        for file in std::fs::read_dir(consistency_corpus_dir().join(entry)).expect("the corpus") {
+            let path = file.expect("an entry").path();
+            if path.extension().is_some_and(|e| e == "html") {
+                corpus.push_str(&std::fs::read_to_string(&path).expect("a page"));
+                corpus.push('\n');
+            }
+        }
+    }
+    let start = expected["start"].as_str().expect("start");
+    assert!(consistency_corpus_dir().join(format!("{start}.html")).is_file());
+    let cases = expected["cases"].as_array().expect("cases");
+    assert!(cases.len() >= 10, "the corpus covers the designed cases");
+    for case in cases {
+        let id = case["id"].as_str().expect("an id");
+        let tokens: Vec<&str> = match case["kind"].as_str().expect("a kind") {
+            "finding" => case["values"].as_array().expect("values").iter().collect(),
+            "no_finding" => case["pairs"]
+                .as_array()
+                .expect("pairs")
+                .iter()
+                .flat_map(|p| p.as_array().expect("a pair"))
+                .collect(),
+            "consistent" => vec![&case["value"]],
+            other => panic!("{id}: unknown kind {other}"),
+        }
+        .into_iter()
+        .map(|t| t.as_str().expect("a token"))
+        .collect();
+        for token in tokens {
+            assert!(
+                consistency_token_matches(&corpus, token),
+                "{id}: {token} is not in the corpus"
+            );
+        }
+        for page in case["pagesInFinding"].as_array().into_iter().flatten() {
+            let page = page.as_str().expect("a path").trim_start_matches('/');
+            assert!(
+                consistency_corpus_dir().join(format!("{page}.html")).is_file(),
+                "{id}: {page}"
+            );
+        }
+    }
+    // The mocked end-to-end test crawls from `/`: the first five pages never link to the others.
+    for page in ["index", "kontakt", "reklamace", "cenik", "o-nas"] {
+        let html = std::fs::read_to_string(consistency_corpus_dir().join(format!("{page}.html"))).expect("a page");
+        for other in [
+            "/mapa",
+            "/sluzby",
+            "/pujcka",
+            "/instalace",
+            "/doprava",
+            "/obchod",
+            "/kariera",
+            "/blog",
+            "/en/",
+        ] {
+            assert!(!html.contains(&format!("href=\"{other}")), "{page} links to {other}");
+        }
+    }
+}
+
+/// A finding of a report, as the scorer sees it.
+fn consistency_finding(id: &str, key: &str, priority: &str, values: &[(&str, &[&str])]) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "attributeKey": key,
+        "priority": priority,
+        "confidence": "possible",
+        "values": values.iter().map(|(text, pages)| serde_json::json!({
+            "text": text,
+            "occurrences": pages.iter().map(|p| serde_json::json!({
+                "region": if p.is_empty() { "chrome" } else { "page" },
+                "path": p,
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+#[test]
+fn consistency_corpus_scoring_counts_found_missed_and_false_positives() {
+    let report = serde_json::json!({
+        "findings": [
+            consistency_finding("F1", "phone", "high", &[("800 123 456", &["", "/kontakt"]), ("800 123 465", &[""])]),
+            consistency_finding("F2", "price", "medium", &[("250 Kč", &["/blog/novy-cenik-2023"]), ("290 Kč", &["/cenik"])]),
+            consistency_finding("F3", "apr", "medium", &[("RPSN 4,81 %", &["/pujcka"]), ("4,91 %", &["/pujcka-dotazy"])]),
+            // The same phone difference again, under a second key (the grouping split the labels).
+            consistency_finding("F5", "phone", "medium", &[("800 123 456", &["/kontakt"]), ("800 123 465", &["/reklamace"])]),
+            consistency_finding("F4", "customers_count", "low", &[("přes 12 000", &["/sluzby"]), ("více než 10 000", &["/kariera"])]),
+        ],
+        "consistent": [{"value": "12345678", "sources": 2, "attributeKey": "company_id"}],
+    });
+    let score = score_consistency_report(&report, &consistency_expected());
+    assert_eq!(
+        score.found,
+        vec!["phone-transposed-digits", "apr-same-loan-same-example"]
+    );
+    assert_eq!(
+        score.missed,
+        vec![
+            "installation-price-end-of-long-page",
+            "free-shipping-threshold",
+            "founded-year"
+        ]
+    );
+    assert_eq!(score.false_positives.len(), 1, "{:?}", score.false_positives);
+    assert!(
+        score.false_positives[0].starts_with("F2 price"),
+        "{:?}",
+        score.false_positives
+    );
+    assert_eq!(score.violations, vec!["blog-price-2023 by F2"]);
+    assert_eq!(score.tolerated, vec!["customers-approximation by F4 (low)"]);
+    assert_eq!(score.duplicates, vec!["phone-transposed-digits by F5"]);
+    assert_eq!(score.consistent_found, vec!["company-id"]);
+    assert!(score.consistent_missed.is_empty());
+    assert!(
+        score
+            .notes
+            .iter()
+            .any(|n| n.contains("apr-same-loan-same-example") && n.contains("priority medium")),
+        "{:?}",
+        score.notes
+    );
+    assert!(
+        score
+            .notes
+            .iter()
+            .any(|n| n.contains("phone-transposed-digits") && n.contains("/reklamace")),
+        "the page text of /reklamace is not in the finding: {:?}",
+        score.notes
+    );
+    assert_eq!(score.recall(), (2, 5));
+}

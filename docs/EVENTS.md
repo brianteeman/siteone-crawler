@@ -74,8 +74,8 @@ captured from vLLM (and answered the first request with HTTP 429).
 | `ms` | int? | Duration, on the `finished` of `crawl`. |
 | `detail` | string? | Reserved for a human-readable note. |
 
-The phases follow each other: `crawl`, then `ai` (only when `--ai-actions`, `--ai-elaborate` or
-`--ai-profile` is used), then `analysis` (analyzers, the AI executive summary of the `summary`
+The phases follow each other: `crawl`, then `ai` (only when `--ai-actions`, `--ai-elaborate`,
+`--ai-profile` or `--ai-consistency` is used), then `analysis` (analyzers, the AI executive summary of the `summary`
 action, exporters).
 
 ```json
@@ -116,7 +116,7 @@ on stderr:
 | `label` | string? | Human-readable name of that task. |
 | `done` | int? | Units of the task finished when the response arrived (the request's own unit is not counted yet, so the console shows `done + 1`). |
 | `total` | int? | Units of the task. |
-| `category` | string | The accounting category of the summary's AI token lines, e.g. `SEO analysis`, `AI report (extract)`, `AI profile (synthesis)`. |
+| `category` | string | The accounting category of the summary's AI token lines, e.g. `SEO analysis`, `AI report (extract)`, `AI profile (synthesis)`, `AI consistency (review)`. |
 | `subject` | string? | What the request is about: a page path (`/about.html`), an area, a section, a chapter heading, a selection round or the host. |
 | `provider` | string | `openai`, `anthropic`, `gemini` or `openai-compatible`. |
 | `model` | string | The configured model. |
@@ -193,9 +193,12 @@ failed). Several tasks may be in progress at the same time.
 | `profile:chapters` | Profile: chapters | chapter (its heading) — the chapter's page selection, synthesis and correction |
 | `profile:executive` | Profile: executive summary | one call (host) |
 | `profile:correct` | Profile: correction | one call (`executive summary`) |
+| `consistency:extract` | Consistency: facts | page (page path), or a chunk of header/footer lines (`header/footer lines 1/2`) |
+| `consistency:group` | Consistency: grouping | grouping call (`<attribute key> (<n> labels)`, e.g. `phone (12 labels)`); a later round restarts the task as `Consistency: grouping (round N)` with that round's calls |
+| `consistency:review` | Consistency: review | review batch of at most 8 groups (`groups 1–4`); a batch cut at the output limit is split and asked again, and the groups an answer left out are asked for once more, within the same unit |
 
 Stages that do not run (dry run, forced profile type, a small site that needs no selection,
-English headings) start no task.
+English headings, a consistency check with no differing values to review) start no task.
 
 ### aiUsage
 
@@ -243,9 +246,10 @@ in the `analysis` phase. Emitted whenever the run uses AI, also when no request 
 | `ai-report-json`, `ai-report-html` | AI report (JSON), AI report (HTML) |
 | `ai-elaborate-md`, `ai-elaborate-json`, `ai-elaborate-html` | Brand profile (Markdown), (JSON), (HTML) |
 | `ai-profile-md`, `ai-profile-json`, `ai-profile-html` | AI profile (Markdown), (JSON), (HTML) |
+| `ai-consistency-md`, `ai-consistency-json`, `ai-consistency-html`, `ai-consistency-csv` | AI consistency (Markdown), (JSON), (HTML), (CSV) |
 
-Every AI output file gets its own event as soon as it is written. The AI report, brand elaborate and
-AI profile files are written as a set that is rolled back when one of them fails, so their events
+Every AI output file gets its own event as soon as it is written. The AI report, brand elaborate,
+AI profile and AI consistency files are written as a set that is rolled back when one of them fails, so their events
 follow once the whole set exists.
 
 ```json
@@ -263,8 +267,9 @@ follow once the whole set exists.
 Labels of kind `ai`: `AI phase skipped` (no API key, an unreadable key, no page to analyse),
 `AI report skipped` (an invalid report configuration), `AI custom check skipped` (no prompt),
 `llms.txt export failed`, `AI executive summary failed`, `Brand elaborate failed`,
-`AI profile failed`, `AI report export failed`, `Brand elaborate export failed`,
-`AI profile export failed`. A single page whose AI request failed is not an issue: it is an
+`AI profile failed`, `AI consistency failed` (also when the report is only partial because some
+calls failed), `AI report export failed`, `Brand elaborate export failed`, `AI profile export failed`,
+`AI consistency export failed`. A single page whose AI request failed is not an issue: it is an
 `aiRequest` with `"outcome":"error"`, still counted in `aiProgress`.
 
 ```json

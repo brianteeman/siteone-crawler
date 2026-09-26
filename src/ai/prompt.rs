@@ -59,6 +59,36 @@ pub fn truncate_bytes(input: &str, max_bytes: usize) -> String {
     format!("{}{}", &input[..end], TRUNCATION_MARKER)
 }
 
+/// Like `truncate_bytes`, but the kept text ends before a space that does not sit between two
+/// digits, so the cut never leaves a fragment of a word or of a number that the text does not
+/// state (`1 290` is never cut to `1`). A text that fits is returned unchanged; `""` when no such
+/// space fits in the budget.
+pub fn truncate_bytes_between_words(input: &str, max_bytes: usize) -> String {
+    if input.len() <= max_bytes {
+        return input.to_string();
+    }
+    let Some(room) = max_bytes.checked_sub(TRUNCATION_MARKER.len()) else {
+        return String::new();
+    };
+    let mut cut = None;
+    let mut previous: Option<char> = None;
+    let mut chars = input.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        if at > room {
+            break;
+        }
+        let next = chars.peek().map(|&(_, n)| n);
+        if c.is_whitespace() && !(previous.is_some_and(char::is_numeric) && next.is_some_and(char::is_numeric)) {
+            cut = Some(at);
+        }
+        previous = Some(c);
+    }
+    match cut.and_then(|at| input.get(..at)) {
+        Some(kept) => format!("{}{TRUNCATION_MARKER}", kept.trim_end()),
+        None => String::new(),
+    }
+}
+
 /// Byte length of `input` after `sanitize_for_prompt`, without building the escaped string. Use it
 /// to measure what a value will occupy in the final request.
 pub fn escaped_len(input: &str) -> usize {
@@ -141,6 +171,46 @@ mod tests {
         assert_eq!(truncate_bytes("a long text that does not fit", 5), "");
         assert_eq!(truncate_bytes("fits", 5), "fits");
         assert_eq!(truncate_bytes("", 0), "");
+    }
+
+    #[test]
+    fn truncate_bytes_between_words_never_cuts_a_word_or_a_number() {
+        let text = format!(
+            "Cena služby je 1 290 Kč měsíčně {}",
+            "a platí od 1. ledna 2027 ".repeat(8)
+        );
+        let mut cuts = 0;
+        for max in 0..=text.len() + 2 {
+            let cut = truncate_bytes_between_words(&text, max);
+            assert!(cut.len() <= max, "max {max}");
+            if text.len() <= max {
+                assert_eq!(cut, text);
+                continue;
+            }
+            if cut.is_empty() {
+                continue;
+            }
+            cuts += 1;
+            let kept = cut.strip_suffix(TRUNCATION_MARKER).expect("the marker");
+            assert!(text.starts_with(kept), "max {max}");
+            let rest = &text[kept.len()..];
+            assert!(rest.starts_with(' '), "max {max}: cut inside a word: {kept:?}");
+            assert!(
+                !(kept.ends_with(|c: char| c.is_ascii_digit()) && rest[1..].starts_with(|c: char| c.is_ascii_digit())),
+                "max {max}: cut inside a number: {kept:?}"
+            );
+        }
+        assert!(cuts > 100, "the cut was exercised {cuts} times");
+        let at = TRUNCATION_MARKER.len() + "Cena služby je 1 2".len();
+        assert_eq!(
+            truncate_bytes_between_words(&text, at),
+            format!("Cena služby je{TRUNCATION_MARKER}")
+        );
+        assert_eq!(
+            truncate_bytes_between_words(&"x".repeat(500), 300),
+            "",
+            "no space to cut at"
+        );
     }
 
     #[test]

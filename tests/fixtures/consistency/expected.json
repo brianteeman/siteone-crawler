@@ -1,0 +1,187 @@
+{
+  "about": "Expected outcomes of --ai-consistency on this corpus, scored by the ignored test consistency_corpus_live. The first five pages (index, kontakt, reklamace, cenik, o-nas) are also the corpus of the mocked end-to-end test, which starts at / and never reaches the other pages: they are linked only from /mapa, where the live evaluation starts. A token matches a value of the report when it occurs in the value's text, lowercased and without whitespace, with no digit right before or after it; an all-digit token also matches when the value's digits end with it (+420 800 123 456 matches 800123456). A 'finding' case is found (recall) when one finding has a value matching each of its tokens; its priority should be one of 'priorities' and its attribute key one of 'attributeKeys' (a difference is reported, not counted as a miss), and 'pagesInFinding' names pages whose own text, not only their footer, should be among the finding's occurrences (reported too). A 'no_finding' case lists token pairs that no finding may show together (only a finding above 'maxPriority', when set); a 'consistent' case expects its token among the same-value facts. A further finding that matches an already found case is a duplicate (the grouping split its labels into two keys), not a false positive; every other finding that matches no 'finding' case, and that no 'maxPriority' tolerates, is a false positive.",
+  "start": "mapa",
+  "cases": [
+    {
+      "id": "phone-transposed-digits",
+      "kind": "finding",
+      "description": "The customer line 800 123 456 in the shared footer and on /kontakt; /reklamace shows 800 123 465 in its footer variant and in its text, which explicitly names it 'naši zákaznickou linku' (our customer line).",
+      "attributeKeys": [
+        "phone"
+      ],
+      "values": [
+        "800123456",
+        "800123465"
+      ],
+      "priorities": [
+        "medium",
+        "high"
+      ],
+      "pagesInFinding": [
+        "/reklamace"
+      ]
+    },
+    {
+      "id": "apr-same-loan-same-example",
+      "kind": "finding",
+      "description": "Půjčka Plus, the same representative example (100 000 Kč, 60 months, 4,5 % p.a.): RPSN 4,81 % on /pujcka, 4,91 % on /pujcka-dotazy.",
+      "attributeKeys": [
+        "apr",
+        "interest_rate"
+      ],
+      "values": [
+        "4,81%",
+        "4,91%"
+      ],
+      "priorities": [
+        "high",
+        "critical"
+      ]
+    },
+    {
+      "id": "installation-price-end-of-long-page",
+      "kind": "finding",
+      "description": "Standard installation: 1 490 Kč on /sluzby, 1 690 Kč in the last paragraph of the long page /instalace (beyond the extraction budget of small context windows).",
+      "attributeKeys": [
+        "price",
+        "fee"
+      ],
+      "values": [
+        "1490kč",
+        "1690kč"
+      ],
+      "priorities": [
+        "medium",
+        "high",
+        "critical"
+      ]
+    },
+    {
+      "id": "free-shipping-threshold",
+      "kind": "finding",
+      "description": "Free shipping from 1 500 Kč on /doprava, over 1 000 Kč in the terms on /obchodni-podminky.",
+      "attributeKeys": [
+        "free_shipping_threshold",
+        "minimum_order",
+        "other"
+      ],
+      "values": [
+        "1500kč",
+        "1000kč"
+      ],
+      "priorities": [
+        "medium",
+        "high"
+      ]
+    },
+    {
+      "id": "founded-year",
+      "kind": "finding",
+      "description": "On the market since 2005 (/o-nas) versus since 2006 (/kariera).",
+      "attributeKeys": [
+        "founded_year",
+        "years_in_business",
+        "other_figure",
+        "other"
+      ],
+      "values": [
+        "2005",
+        "2006"
+      ],
+      "priorities": [
+        "low",
+        "medium",
+        "high"
+      ]
+    },
+    {
+      "id": "tariff-table",
+      "kind": "no_finding",
+      "description": "Basic 290 Kč and Premium 490 Kč are two tariffs of one table.",
+      "pairs": [
+        [
+          "290kč",
+          "490kč"
+        ]
+      ]
+    },
+    {
+      "id": "from-price-vs-tariff",
+      "kind": "no_finding",
+      "description": "'Tarify od 290 Kč' (from) on /sluzby versus the Premium tariff at 490 Kč: a from-price is no contradiction.",
+      "pairs": [
+        [
+          "od290kč",
+          "490kč"
+        ]
+      ]
+    },
+    {
+      "id": "blog-price-2023",
+      "kind": "no_finding",
+      "description": "A blog post published 12. 1. 2023 announces Basic 250 Kč and Premium 450 Kč from 1. 2. 2023; the current price list says 290 Kč and 490 Kč.",
+      "pairs": [
+        [
+          "250kč",
+          "290kč"
+        ],
+        [
+          "450kč",
+          "490kč"
+        ]
+      ]
+    },
+    {
+      "id": "czk-vs-eur-market",
+      "kind": "no_finding",
+      "description": "The English page lists EUR prices for Germany and Austria; the Czech price list is in CZK.",
+      "pairs": [
+        [
+          "€12",
+          "290kč"
+        ],
+        [
+          "€20",
+          "490kč"
+        ],
+        [
+          "€12",
+          "€20"
+        ]
+      ]
+    },
+    {
+      "id": "department-line",
+      "kind": "no_finding",
+      "description": "The sales department line 800 123 400 for business customers on /obchod is not the customer line.",
+      "pairs": [
+        [
+          "800123400",
+          "800123456"
+        ],
+        [
+          "800123400",
+          "800123465"
+        ]
+      ]
+    },
+    {
+      "id": "customers-approximation",
+      "kind": "no_finding",
+      "description": "'přes 12 000 zákazníků' (/sluzby) and 'více než 10 000 zákazníků' (/kariera) are compatible lower bounds; at most a low-priority note.",
+      "pairs": [
+        [
+          "12000",
+          "10000"
+        ]
+      ],
+      "maxPriority": "low"
+    },
+    {
+      "id": "company-id",
+      "kind": "consistent",
+      "description": "IČO 12345678 in the shared footer and on /o-nas.",
+      "value": "12345678"
+    }
+  ]
+}
