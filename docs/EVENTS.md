@@ -195,7 +195,7 @@ failed). Several tasks may be in progress at the same time.
 | `profile:correct` | Profile: correction | one call (`executive summary`) |
 | `consistency:extract` | Consistency: facts | page (page path), or a chunk of header/footer lines (`header/footer lines 1/2`) |
 | `consistency:group` | Consistency: grouping | grouping call (`<attribute key> (<n> labels)`, e.g. `phone (12 labels)`); a later round restarts the task as `Consistency: grouping (round N)` with that round's calls |
-| `consistency:review` | Consistency: review | review batch (`groups 1–4`); a batch cut at the output limit is split and asked again within the same unit |
+| `consistency:review` | Consistency: review | review batch of at most 8 groups (`groups 1–4`); a batch cut at the output limit is split and asked again, and the groups an answer left out are asked for once more, within the same unit |
 
 Stages that do not run (dry run, forced profile type, a small site that needs no selection,
 English headings, a consistency check with no differing values to review) start no task.

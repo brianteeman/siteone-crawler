@@ -65,13 +65,13 @@ pub fn max_items_by_output(group_max_tokens: u32) -> usize {
     (group_max_tokens.saturating_sub(OUTPUT_BASE_TOKENS) / OUTPUT_TOKENS_PER_ITEM).clamp(2, MAX_ITEMS_PER_CALL) as usize
 }
 
-/// The labels of the occurrences with `key`, merged when their subjects and attributes are equal
-/// after `normalize_label`. A merged label shows its most common spelling (ties: the smallest) and
-/// keeps the other spellings of its subject as aliases, and the value of its first occurrence as
-/// the example. Ordered by the normalized subject, then attribute.
+/// The labels of the occurrences in the bucket `key` (`AttributeKey::bucket`), merged when their
+/// subjects and attributes are equal after `normalize_label`. A merged label shows its most common
+/// spelling (ties: the smallest) and keeps the other spellings of its subject as aliases, and the
+/// value of its first occurrence as the example. Ordered by the normalized subject, then attribute.
 pub fn label_items(occ: &[Occurrence], key: AttributeKey) -> Vec<LabelItem> {
     let mut merged: HashMap<(String, String), Vec<&Occurrence>> = HashMap::new();
-    for o in occ.iter().filter(|o| o.attribute_key == key) {
+    for o in occ.iter().filter(|o| o.attribute_key.bucket() == key) {
         merged
             .entry((normalize_label(&o.subject), normalize_label(&o.attribute)))
             .or_default()
@@ -575,6 +575,21 @@ mod tests {
     }
 
     #[test]
+    fn the_price_bucket_holds_fees_too() {
+        use AttributeKey::*;
+        let occ = vec![
+            occ(0, Price, "Standardní instalace", "cena", "1 690 Kč"),
+            occ(1, Fee, "Standardní instalace", "cena", "1 490 Kč"),
+            occ(2, Fee, "Servisní výjezd", "poplatek", "690 Kč"),
+        ];
+        let items = label_items(&occ, Price);
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(items[0].occurrence_ids, vec![2]);
+        assert_eq!(items[1].occurrence_ids, vec![0, 1], "one label across price and fee");
+        assert!(label_items(&occ, Fee).is_empty(), "a fee is no bucket of its own");
+    }
+
+    #[test]
     fn label_items_merge_equal_normalized_labels_and_keep_their_spellings() {
         use AttributeKey::*;
         let occ = vec![
@@ -636,6 +651,21 @@ mod tests {
              2. Mortgage · interest rate from (e.g. 4.69 %) [aliases: Home loan]\n\
              </items>\n</labels>"
         );
+    }
+
+    #[test]
+    fn the_group_prompt_matches_a_channel_named_as_subject_or_as_attribute() {
+        // Live: "Example s.r.o. · Zákaznická linka" (the footer) and "zákaznická linka · telefonní
+        // číslo" (a page saying "call our customer line") were kept apart.
+        assert!(prompts::GROUP.contains("the subject of one label and the attribute of another"));
+        assert!(prompts::GROUP.contains("customer line · phone number"));
+        // A label that only leaves out a condition ("cena" / "cena jednorázově") is the same
+        // property (live: kept apart, so a differing installation price was never compared).
+        assert!(prompts::GROUP.contains("only leaves out a condition the other one states"));
+        // Department lines stay apart.
+        assert!(prompts::GROUP.contains("a general company line versus a department line"));
+        // Live (thinking, crawler.siteone.io): 3,806 reasoning tokens for 71 labels of a 6,000 budget.
+        assert!(prompts::GROUP.contains("keep it short"));
     }
 
     #[test]

@@ -12,13 +12,15 @@ pub const EXTRACT: &str = include_str!("../../../prompts/consistency/extract.md"
 pub const GROUP: &str = include_str!("../../../prompts/consistency/group.md");
 
 /// Review: whether the values of each group may contradict each other; `judge_system` appends the
-/// output language.
+/// crawl date and the output language.
 pub const JUDGE: &str = include_str!("../../../prompts/consistency/judge.md");
 
-/// The review system prompt: `JUDGE` plus the (escaped) language of the prose it writes.
-pub fn judge_system(language: &str) -> String {
+/// The review system prompt: `JUDGE` plus the (escaped) date of the crawl, against which dated
+/// articles are judged, and the language of the prose it writes.
+pub fn judge_system(language: &str, crawl_date: &str) -> String {
     format!(
-        "{JUDGE}\n\n<output_language>\nWrite \"title\", \"explanation\", \"benign_explanations\" and \"check\" in the language '{}'. Quote values exactly as they appear in <groups>.\n</output_language>",
+        "{JUDGE}\n\n<crawl_date>{}</crawl_date>\n\n<output_language>\nWrite \"title\", \"explanation\", \"benign_explanations\" and \"check\" in the language '{}'. Quote values exactly as they appear in <groups>.\n</output_language>",
+        crate::ai::prompt::sanitize_for_prompt(crawl_date),
         crate::ai::prompt::sanitize_for_prompt(language)
     )
 }

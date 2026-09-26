@@ -53,7 +53,8 @@ use self::doc::{
 use self::extract::{CAT_EXTRACT, build_extract_request, parse_facts, verify_facts};
 use self::judge::{
     CAT_REVIEW, Candidate, CandidateValue, ReviewResult, ValidatedResult, allocate, build_review_request, cohorts,
-    groups_message, pack_batches, parse_reviews, render_group_within, review_groups_per_call, split_keys, validate,
+    groups_message, pack_batches, parse_reviews, render_group_within, review_call_max_tokens, review_groups_per_call,
+    split_keys, validate_with_date,
 };
 use self::keys::{
     CAT_GROUP, GroupOutcome, LabelItem, build_group_request, group_key, label_items, max_items_by_output, parse_groups,
@@ -326,12 +327,8 @@ pub async fn run(options: &CoreOptions, status: &Arc<Mutex<Status>>, output: &Ar
         return;
     }
 
-    // --- S2: grouping, per attribute key. ---
-    let buckets: Vec<(AttributeKey, Vec<LabelItem>)> = AttributeKey::ALL
-        .into_iter()
-        .map(|key| (key, label_items(&occurrences, key)))
-        .filter(|(_, items)| !items.is_empty())
-        .collect();
+    // --- S2: grouping, per attribute bucket. ---
+    let buckets = bucket_items(&occurrences);
     let failed_group_calls = Arc::new(AtomicUsize::new(0));
     let ask = {
         let (client, sem, failed) = (client.clone(), sem.clone(), failed_group_calls.clone());
@@ -369,6 +366,7 @@ pub async fn run(options: &CoreOptions, status: &Arc<Mutex<Status>>, output: &Ar
         not_cross_compared += outcome.not_cross_compared;
         for mut key in outcome.keys {
             key.id = keys.len();
+            key.attribute_key = key_attribute(key.attribute_key, &key.occurrence_ids, &occurrences);
             keys.push(key);
         }
     }
@@ -393,6 +391,7 @@ pub async fn run(options: &CoreOptions, status: &Arc<Mutex<Status>>, output: &Ar
             &pages,
             &budgets,
             locale.code(),
+            &chrono::Local::now().format("%Y-%m-%d").to_string(),
             per_call,
         )
         .await
@@ -524,6 +523,33 @@ pub async fn run(options: &CoreOptions, status: &Arc<Mutex<Status>>, output: &Ar
         );
         st.set_ai_consistency_doc(doc);
     }
+}
+
+/// The grouping buckets (`AttributeKey::bucket`) that have facts, with their labels.
+fn bucket_items(occurrences: &[Occurrence]) -> Vec<(AttributeKey, Vec<LabelItem>)> {
+    AttributeKey::ALL
+        .into_iter()
+        .filter(|key| key.bucket() == *key)
+        .map(|key| (key, label_items(occurrences, key)))
+        .filter(|(_, items)| !items.is_empty())
+        .collect()
+}
+
+/// The attribute key of a grouped key of `bucket`: the most common among its occurrences (a key
+/// of the price bucket stating only fees is a fee); a tie goes to the bucket.
+fn key_attribute(bucket: AttributeKey, occurrence_ids: &[usize], occurrences: &[Occurrence]) -> AttributeKey {
+    let mut counts: BTreeMap<AttributeKey, usize> = BTreeMap::new();
+    for o in occurrences.iter().filter(|o| occurrence_ids.contains(&o.id)) {
+        *counts.entry(o.attribute_key).or_default() += 1;
+    }
+    let most = counts.values().copied().max().unwrap_or(0);
+    if counts.get(&bucket).copied().unwrap_or(0) == most {
+        return bucket;
+    }
+    counts
+        .into_iter()
+        .find(|(_, n)| *n == most)
+        .map_or(bucket, |(key, _)| key)
 }
 
 /// The TTL of the crawler's HTTP cache when it is on (`∞` without expiry); None when off.
@@ -800,8 +826,9 @@ where
 }
 
 /// S4: review the groups in batches (`judge::pack_batches`), in parallel under the semaphore;
-/// each batch is one unit of `consistency:review`. Returns the valid results of each group, in
-/// order (none when its call failed or gave no valid result).
+/// each batch is one unit of `consistency:review`. Dated articles are judged against
+/// `crawl_date`. Returns the valid results of each group, in order (none when its call failed or
+/// gave no valid result).
 #[allow(clippy::too_many_arguments)]
 async fn review_all(
     client: &Arc<AiClient>,
@@ -812,6 +839,7 @@ async fn review_all(
     pages: &[Page],
     budgets: &Budgets,
     language: &str,
+    crawl_date: &str,
     per_call: usize,
 ) -> Vec<Vec<ValidatedResult>> {
     let room = budgets.review_batch_bytes.saturating_sub(groups_message(&[]).len() + 1);
@@ -836,7 +864,7 @@ async fn review_all(
                 shared.clone(),
                 rendered.clone(),
                 range,
-                language.to_string(),
+                (language.to_string(), crawl_date.to_string()),
                 budgets.review_max_tokens,
             ),
         )));
@@ -853,8 +881,10 @@ async fn review_all(
     results
 }
 
-/// One review batch; an answer cut at the output limit splits the batch in half and asks again
-/// for each half (at most `MAX_SPLIT_DEPTH` times). Returns the valid results with the index of
+/// One review batch. An answer cut at the output limit splits the batch in half and asks again
+/// for each half (at most `MAX_SPLIT_DEPTH` times); the groups a usable answer left out (live: a
+/// broken quote ended the JSON early) are asked for once more, in a call of their own. Each call
+/// asks for `review_call_max_tokens` of its groups. Returns the valid results with the index of
 /// their group in `groups`.
 async fn review_batch(
     client: Arc<AiClient>,
@@ -862,16 +892,25 @@ async fn review_batch(
     groups: Arc<Vec<Candidate>>,
     rendered: Arc<Vec<String>>,
     range: Range<usize>,
-    language: String,
+    (language, crawl_date): (String, String),
     max_tokens: u32,
 ) -> Vec<(usize, ValidatedResult)> {
     let mut out = Vec::new();
-    let mut queue = vec![(range, 0)];
-    while let Some((range, depth)) = queue.pop() {
-        let (Some(batch), Some(texts)) = (groups.get(range.clone()), rendered.get(range.clone())) else {
+    // The groups of a call (indexes into `groups`), its split depth, and whether it asks again
+    // for groups an answer left out.
+    let mut queue: Vec<(Vec<usize>, usize, bool)> = vec![(range.collect(), 0, false)];
+    while let Some((ids, depth, again)) = queue.pop() {
+        let batch: Vec<Candidate> = ids.iter().filter_map(|&i| groups.get(i).cloned()).collect();
+        let texts: Vec<String> = ids.iter().filter_map(|&i| rendered.get(i).cloned()).collect();
+        if ids.is_empty() || batch.len() != ids.len() || texts.len() != ids.len() {
             continue;
-        };
-        let req = build_review_request(&groups_message(texts), &language, max_tokens);
+        }
+        let req = build_review_request(
+            &groups_message(&texts),
+            &language,
+            &crawl_date,
+            review_call_max_tokens(ids.len(), max_tokens),
+        );
         let answer = {
             let _permit = sem.clone().acquire_owned().await.ok();
             client
@@ -880,16 +919,28 @@ async fn review_batch(
         };
         match answer {
             Ok((results, _)) => {
+                let mut answered = vec![false; ids.len()];
                 for result in results {
-                    if let Some(valid) = validate(result, batch, texts) {
-                        out.push((range.start + valid.0, valid));
+                    if let Some(valid) = validate_with_date(result, &batch, &texts, &crawl_date) {
+                        answered[valid.0] = true;
+                        out.push((ids[valid.0], valid));
                     }
                 }
+                let left_out: Vec<usize> = ids
+                    .iter()
+                    .zip(&answered)
+                    .filter(|(_, answered)| !**answered)
+                    .map(|(&id, _)| id)
+                    .collect();
+                // Asking for all of them again would repeat the same (cached) request.
+                if !again && !left_out.is_empty() && left_out.len() < ids.len() {
+                    queue.push((left_out, depth, true));
+                }
             }
-            Err(error) if range.len() > 1 && depth < MAX_SPLIT_DEPTH && error.to_string().contains(TRUNCATED) => {
-                let middle = range.start + range.len() / 2;
-                queue.push((middle..range.end, depth + 1));
-                queue.push((range.start..middle, depth + 1));
+            Err(error) if ids.len() > 1 && depth < MAX_SPLIT_DEPTH && error.to_string().contains(TRUNCATED) => {
+                let (first, second) = ids.split_at(ids.len() / 2);
+                queue.push((second.to_vec(), depth + 1, again));
+                queue.push((first.to_vec(), depth + 1, again));
             }
             Err(_) => {}
         }
@@ -952,11 +1003,26 @@ fn assemble(locale: &ReportLocale, meta: Meta, a: Assembly) -> ConsistencyDoc {
             });
             continue;
         }
+        // A second result for the same values of a group repeats the first (the first wins).
+        let mut judged: Vec<Vec<usize>> = Vec::new();
         for (_, disposition, priority, confidence, result, replaced) in results {
+            let mut values = result.values.clone();
+            values.sort_unstable();
+            if judged.contains(&values) {
+                continue;
+            }
+            judged.push(values);
             let (title, explanation, check, benign) = if *replaced {
+                // The reason of a non-finding says what the review decided.
+                let explanation = match disposition {
+                    Disposition::Explainable => "prose_reason_explainable",
+                    Disposition::NotComparable => "prose_reason_not_comparable",
+                    Disposition::InsufficientContext => "prose_reason_insufficient",
+                    _ => "prose_explanation",
+                };
                 (
                     doc::text(locale, "prose_title").replace("{name}", &candidate.name),
-                    doc::text(locale, "prose_explanation").to_string(),
+                    doc::text(locale, explanation).to_string(),
                     doc::text(locale, "prose_check").to_string(),
                     Vec::new(),
                 )
@@ -1171,6 +1237,177 @@ mod tests {
             group_max_tokens: b.out_tokens().min(6_000),
             review_batch_bytes: b.scaled(40, 6),
             review_max_tokens: b.out_tokens(),
+        }
+    }
+
+    #[test]
+    fn fees_and_prices_share_a_bucket_and_a_key_keeps_its_own_attribute() {
+        use super::{bucket_items, key_attribute};
+        let fact = |id: usize, key: AttributeKey, subject: &str| Occurrence {
+            id,
+            source: id,
+            region: SourceKind::Page,
+            block_ref: "B1".to_string(),
+            attribute_key: key,
+            subject: subject.to_string(),
+            attribute: "cena".to_string(),
+            value: format!("{id}90 Kč"),
+            value_key: ValueKey::Exact(format!("num:{id}90:CZK:")),
+            qualifiers: String::new(),
+            evidence: format!("{id}90 Kč"),
+            value_span: (0, 6),
+            heading_path: Vec::new(),
+            pages: vec![id],
+        };
+        let occurrences = vec![
+            fact(0, AttributeKey::Price, "Instalace"),
+            fact(1, AttributeKey::Fee, "Instalace"),
+            fact(2, AttributeKey::Fee, "Výjezd"),
+            fact(3, AttributeKey::Phone, "Linka"),
+        ];
+        let buckets = bucket_items(&occurrences);
+        let keys: Vec<(AttributeKey, usize)> = buckets.iter().map(|(key, items)| (*key, items.len())).collect();
+        assert_eq!(keys, vec![(AttributeKey::Phone, 1), (AttributeKey::Price, 2)]);
+        assert_eq!(
+            key_attribute(AttributeKey::Price, &[2], &occurrences),
+            AttributeKey::Fee
+        );
+        assert_eq!(
+            key_attribute(AttributeKey::Price, &[1, 2], &occurrences),
+            AttributeKey::Fee
+        );
+        assert_eq!(
+            key_attribute(AttributeKey::Price, &[0, 1], &occurrences),
+            AttributeKey::Price,
+            "a tie goes to the bucket"
+        );
+    }
+
+    /// A review whose prose was replaced (a verdict word, a foreign number, a missing text) keeps
+    /// its disposition; the reason shown for an explained or not-judged group then says what the
+    /// review decided, not the finding text "the pages state different values".
+    #[test]
+    fn replaced_prose_of_a_non_finding_gets_a_reason_that_fits_its_disposition() {
+        use super::doc::Meta;
+        use super::judge::{Candidate, CandidateValue, Origin, ReviewResult};
+        use super::model::{Confidence, Disposition, Priority};
+        use super::{Assembly, assemble, doc, judge};
+        use crate::ai::report::locale::ReportLocale;
+        let pages: Vec<Page> = (0..2)
+            .map(|i| Page {
+                index: i,
+                url: format!("https://example.com/{i}"),
+                path: format!("/{i}"),
+                title: String::new(),
+            })
+            .collect();
+        let occurrences: Vec<Occurrence> = (0..2)
+            .map(|i| Occurrence {
+                id: i,
+                source: i,
+                region: SourceKind::Page,
+                block_ref: "B1".to_string(),
+                attribute_key: AttributeKey::Price,
+                subject: "Tarif".to_string(),
+                attribute: "cena".to_string(),
+                value: format!("{} Kč", 100 + i),
+                value_key: ValueKey::Exact(format!("num:{}:CZK:", 100 + i)),
+                qualifiers: String::new(),
+                evidence: format!("Tarif {} Kč", 100 + i),
+                value_span: (6, 12),
+                heading_path: Vec::new(),
+                pages: vec![i],
+            })
+            .collect();
+        let candidate = Candidate {
+            key_id: 0,
+            name: "Tarif – cena".to_string(),
+            attribute_key: AttributeKey::Price,
+            values: (0..2)
+                .map(|i| CandidateValue {
+                    id: i + 1,
+                    key: occurrences[i].value_key.clone(),
+                    text: occurrences[i].value.clone(),
+                    occurrence_ids: vec![i],
+                    source_ids: vec![i],
+                    origins: vec![Origin::Page(i)],
+                    pages: vec![i],
+                    qualified: false,
+                })
+                .collect(),
+            baseline: None,
+        };
+        let result = |disposition: Disposition, confidence: Option<Confidence>| {
+            let review = ReviewResult {
+                group: 1,
+                values: vec![1, 2],
+                confidence: String::new(),
+                priority: String::new(),
+                title: "Tarif – cena: values differ".to_string(),
+                explanation: "The pages state different values for the same property.".to_string(),
+                benign: Vec::new(),
+                check: String::new(),
+            };
+            (
+                0,
+                disposition,
+                confidence.map(|_| Priority::Medium),
+                confidence,
+                review,
+                true,
+            )
+        };
+        for (language, expect) in [("en", "plausible legitimate reason"), ("cs", "oprávněný důvod")] {
+            let locale = ReportLocale::new(language);
+            let doc = assemble(
+                &locale,
+                Meta::default(),
+                Assembly {
+                    reviewed: vec![
+                        (&candidate, vec![result(Disposition::Explainable, None)]),
+                        (&candidate, vec![result(Disposition::NotComparable, None)]),
+                        (&candidate, vec![result(Disposition::InsufficientContext, None)]),
+                        (
+                            &candidate,
+                            vec![
+                                result(Disposition::Finding, Some(Confidence::Possible)),
+                                result(Disposition::Finding, Some(Confidence::Possible)),
+                            ],
+                        ),
+                    ],
+                    not_reviewed_reason: "not_reviewed_call_failed",
+                    over_cap: &[],
+                    consistent: Vec::new(),
+                    occurrences: &occurrences,
+                    pages: &pages,
+                    sources: Vec::new(),
+                    failed_sources: Vec::new(),
+                },
+            );
+            // The finding's result came twice for the same values (live: a thinking model); the
+            // second copy is dropped.
+            assert_eq!(doc.findings.len(), 1, "one finding per group and value set");
+            assert_eq!(doc.counts.medium, 1);
+            assert_eq!(doc.explained.len(), 2);
+            assert_eq!(doc.explained[0].reason, doc::text(&locale, "prose_reason_explainable"));
+            assert!(doc.explained[0].reason.contains(expect), "{}", doc.explained[0].reason);
+            assert_eq!(
+                doc.explained[1].reason,
+                doc::text(&locale, "prose_reason_not_comparable")
+            );
+            assert_eq!(
+                doc.not_judged[0].reason,
+                doc::text(&locale, "prose_reason_insufficient")
+            );
+            // A finding keeps the deterministic finding text.
+            assert_eq!(doc.findings[0].explanation, doc::text(&locale, "prose_explanation"));
+            for reason in [
+                "prose_reason_explainable",
+                "prose_reason_not_comparable",
+                "prose_reason_insufficient",
+            ] {
+                assert!(!judge::has_forbidden_word(doc::text(&locale, reason)), "{reason}");
+            }
         }
     }
 

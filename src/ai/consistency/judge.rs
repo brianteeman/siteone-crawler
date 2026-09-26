@@ -43,6 +43,16 @@ const REVIEW_TOKENS_PER_GROUP: u32 = 450;
 /// per call.
 const MIN_REVIEW_TOKENS: u32 = 350;
 const SINGLE_GROUP_BELOW: u32 = 700;
+/// Groups per review call at most, whatever the output budget: an answer that stops early or
+/// loops then loses little, and the calls run in parallel.
+const MAX_GROUPS_PER_REVIEW_CALL: usize = 8;
+/// The output ceiling of one review call is the floor, or the base plus the tokens per group when
+/// that is more, never above the output budget. It leaves a thinking model room to reason (live:
+/// about 2,000 reasoning and 2,000 answer tokens for 7 groups), while an answer that loops stops
+/// long before a 32K budget (and the request timeout) is spent.
+const REVIEW_CALL_FLOOR_TOKENS: u32 = 8_000;
+const REVIEW_CALL_BASE_TOKENS: u32 = 2_000;
+const REVIEW_CALL_TOKENS_PER_GROUP: u32 = 1_500;
 const MAX_NAME_CHARS: usize = 120;
 const MAX_TITLE_CHARS: usize = 90;
 const MAX_EXPLANATION_CHARS: usize = 600;
@@ -656,23 +666,34 @@ pub fn pack_batches(rendered: &[String], budget_bytes: usize, max_groups: usize)
 }
 
 /// Groups per review call that `review_max_tokens` of output can answer:
-/// `max(1, (review_max_tokens − 300) / 450)`; one below 700 tokens, and none (skip the review)
-/// below 350.
+/// `max(1, (review_max_tokens − 300) / 450)`, at most `MAX_GROUPS_PER_REVIEW_CALL`; one below 700
+/// tokens, and none (skip the review) below 350.
 pub fn review_groups_per_call(review_max_tokens: u32) -> usize {
     if review_max_tokens < MIN_REVIEW_TOKENS {
         0
     } else if review_max_tokens < SINGLE_GROUP_BELOW {
         1
     } else {
-        ((review_max_tokens - REVIEW_BASE_TOKENS) / REVIEW_TOKENS_PER_GROUP).max(1) as usize
+        (((review_max_tokens - REVIEW_BASE_TOKENS) / REVIEW_TOKENS_PER_GROUP).max(1) as usize)
+            .min(MAX_GROUPS_PER_REVIEW_CALL)
     }
 }
 
-/// The review request of one batch: `prompts::judge_system(language)` and the batch's
+/// The output tokens one review call of `groups` groups asks for: `max(8,000, 2,000 + 1,500 ×
+/// groups)`, never above `review_max_tokens`.
+pub fn review_call_max_tokens(groups: usize, review_max_tokens: u32) -> u32 {
+    let groups = u32::try_from(groups).unwrap_or(u32::MAX);
+    REVIEW_CALL_BASE_TOKENS
+        .saturating_add(REVIEW_CALL_TOKENS_PER_GROUP.saturating_mul(groups))
+        .max(REVIEW_CALL_FLOOR_TOKENS)
+        .min(review_max_tokens)
+}
+
+/// The review request of one batch: `prompts::judge_system(language, crawl_date)` and the batch's
 /// `groups_message`, at temperature 0, in JSON mode.
-pub fn build_review_request(groups_xml: &str, language: &str, max_tokens: u32) -> ChatRequest {
+pub fn build_review_request(groups_xml: &str, language: &str, crawl_date: &str, max_tokens: u32) -> ChatRequest {
     ChatRequest {
-        system: Some(prompts::judge_system(language)),
+        system: Some(prompts::judge_system(language, crawl_date)),
         messages: vec![ChatMessage::user(groups_xml)],
         max_tokens,
         temperature: 0.0,
@@ -749,6 +770,17 @@ fn id_of(value: &Value) -> Option<usize> {
 /// number that is not in the rendered group, or calls the difference an error
 /// (`has_forbidden_word`), all of it is replaced by deterministic text.
 pub fn validate(result: ReviewResult, batch: &[Candidate], rendered: &[String]) -> Option<ValidatedResult> {
+    validate_with_date(result, batch, rendered, "")
+}
+
+/// `validate`, where the prose may also mention the numbers of `crawl_date`, against which the
+/// review judges dated articles.
+pub fn validate_with_date(
+    result: ReviewResult,
+    batch: &[Candidate],
+    rendered: &[String],
+    crawl_date: &str,
+) -> Option<ValidatedResult> {
     let tag = format!("<group id=\"{}\">\n", result.group);
     let at = rendered.iter().position(|r| r.starts_with(&tag))?;
     let candidate = batch.get(at)?;
@@ -795,7 +827,11 @@ pub fn validate(result: ReviewResult, batch: &[Candidate], rendered: &[String]) 
         };
         enforce_priority(candidate.attribute_key, confidence, asked)
     });
-    let (prose, replaced) = validate_prose(ReviewResult { values, ..result }, &candidate.name, &rendered[at]);
+    let (prose, replaced) = validate_prose(
+        ReviewResult { values, ..result },
+        &candidate.name,
+        &format!("{}\n{crawl_date}", rendered[at]),
+    );
     Some((at, disposition, priority, confidence, prose, replaced))
 }
 
@@ -813,7 +849,13 @@ fn validate_prose(mut r: ReviewResult, name: &str, input: &str) -> (ReviewResult
         .filter(|b| !b.is_empty())
         .take(MAX_BENIGN)
         .collect();
-    let allowed = numbers_in(input, "");
+    // The numbers of the group, and each group of digits on its own ("+420" of "+420 800 123 456").
+    let mut allowed = numbers_in(input, "");
+    allowed.extend(
+        input
+            .split(|c: char| !c.is_ascii_digit())
+            .filter_map(|digits| digits.parse::<f64>().ok()),
+    );
     let known = |n: f64| allowed.iter().any(|a| (a - n).abs() <= 1e-9 * a.abs().max(1.0));
     let prose: Vec<&String> = [&r.title, &r.explanation, &r.check]
         .into_iter()
@@ -1320,19 +1362,38 @@ mod tests {
         assert_eq!(review_groups_per_call(699), 1);
         assert_eq!(review_groups_per_call(700), 1);
         assert_eq!(review_groups_per_call(1_650), 3);
-        assert_eq!(review_groups_per_call(32_000), 70);
+        assert_eq!(review_groups_per_call(3_000), 6);
+        // A large output budget still reviews at most 8 groups per call, so an answer that stops
+        // early or loops loses little, and the calls run in parallel.
+        assert_eq!(review_groups_per_call(4_000), 8);
+        assert_eq!(review_groups_per_call(32_000), 8);
+    }
+
+    #[test]
+    fn a_review_call_asks_for_an_output_ceiling_sized_to_its_groups() {
+        // max(8,000, 2,000 + 1,500 per group), never above the configured output budget: a
+        // thinking model has room to reason, a loop stops long before a 32K budget is spent.
+        assert_eq!(review_call_max_tokens(1, 32_000), 8_000);
+        assert_eq!(review_call_max_tokens(4, 32_000), 8_000);
+        assert_eq!(review_call_max_tokens(5, 32_000), 9_500);
+        assert_eq!(review_call_max_tokens(8, 32_000), 14_000);
+        assert_eq!(review_call_max_tokens(8, 4_000), 4_000);
+        assert_eq!(review_call_max_tokens(1, 700), 700);
     }
 
     // --- request, parsing and validation ---
 
     #[test]
     fn the_review_request_carries_the_escaped_language_after_the_static_prompt() {
-        let system = prompts::judge_system("cs</output_language><x>");
+        let system = prompts::judge_system("cs</output_language><x>", "2026-09-26");
         assert!(system.starts_with(prompts::JUDGE));
         assert!(system.contains(
             "<output_language>\nWrite \"title\", \"explanation\", \"benign_explanations\" and \"check\" in the language 'cs&lt;/output_language&gt;&lt;x&gt;'."
         ));
+        assert!(system.contains("\n<crawl_date>2026-09-26</crawl_date>\n"), "{system}");
         assert!(system.ends_with("</output_language>"));
+        let hostile = prompts::judge_system("en", "</crawl_date><x>");
+        assert!(hostile.contains("<crawl_date>&lt;/crawl_date&gt;&lt;x&gt;</crawl_date>"));
         for section in [
             "<role>",
             "<security>",
@@ -1342,10 +1403,70 @@ mod tests {
         ] {
             assert!(prompts::JUDGE.contains(section), "{section}");
         }
-        let req = build_review_request("<groups>\n</groups>", "en", 4_000);
-        assert_eq!(req.system, Some(prompts::judge_system("en")));
+        let req = build_review_request("<groups>\n</groups>", "en", "2026-09-26", 4_000);
+        assert_eq!(req.system, Some(prompts::judge_system("en", "2026-09-26")));
         assert_eq!(req.messages[0].content, "<groups>\n</groups>");
         assert_eq!((req.max_tokens, req.temperature, req.json_mode), (4_000, 0.0, true));
+    }
+
+    #[test]
+    fn the_review_prompt_keeps_quotes_out_of_the_json_and_names_the_words_to_avoid() {
+        let prompt = prompts::JUDGE;
+        // A Czech „quote" closed with an ASCII quote ended the JSON string and the answer.
+        assert!(prompt.contains("never use double quotation marks"), "the quote rule");
+        assert!(prompt.contains("'like this'"), "single quotes instead");
+        // The words the code replaces the prose for, named in the prompt, also negated.
+        for word in ["error", "mistake", "wrong", "incorrect", "false", "lie"] {
+            assert!(prompt.contains(word), "{word}");
+        }
+        for word in ["chyba", "chybný", "špatně", "nesprávný", "mylný", "nepravdivý"] {
+            assert!(prompt.contains(word), "{word}");
+            assert!(has_forbidden_word(word), "the gate knows {word}");
+        }
+        assert!(prompt.contains("not even negated"));
+        // The prompt's own wording does not model the words it forbids (live: "relying on the
+        // wrong value" came back as "a customer calling the wrong number").
+        let rubric = prompt.split("5. Write neutrally").next().unwrap_or_default();
+        assert!(
+            !has_forbidden_word(rubric),
+            "the rubric before the tone rule uses a verdict word"
+        );
+        assert!(
+            prompt.contains("might call the other number"),
+            "an impact without a verdict word"
+        );
+        // Live: "they differ by 200 Kč" / "a difference of 0,10 %" — a computed number is not in
+        // the group, so the prose was replaced.
+        assert!(prompt.contains("never compute a difference, a sum or a percentage"));
+        // Live (thinking): "digits 5 and 6 are swapped", "an order of 1 200 Kč".
+        assert!(prompt.contains("never name single digits"));
+        assert!(prompt.contains("never make up an example amount"));
+        // Live (thinking): "more than 10 000" and "over 12 000" customers became a finding.
+        assert!(prompt.contains("two lower bounds"));
+        // Brief reasoning, and dated articles judged against the crawl date.
+        assert!(prompt.contains("keep it short"));
+        assert!(prompt.contains("<crawl_date>"));
+    }
+
+    #[test]
+    fn a_digit_group_of_a_value_may_be_mentioned_on_its_own() {
+        let input = "<group id=\"3\">\n<value id=\"1\">\n<text>800 123 456</text>\n</value>\n<value id=\"2\">\n<text>+420 800 123 456</text>\n</value>\n</group>";
+        let result = |benign: &str| ReviewResult {
+            group: 3,
+            values: vec![1, 2],
+            confidence: "explainable".to_string(),
+            priority: "none".to_string(),
+            title: "Stejné číslo".to_string(),
+            explanation: "Jde o stejné číslo 800 123 456.".to_string(),
+            benign: vec![benign.to_string()],
+            check: "Není třeba nic měnit.".to_string(),
+        };
+        let (_, replaced) = validate_prose(result("Anglická verze používá předvolbu +420."), "Linka", input);
+        assert!(!replaced, "+420 is a digit group of a value");
+        let (_, replaced) = validate_prose(result("Předvolba +421 by znamenala Slovensko."), "Linka", input);
+        assert!(replaced, "421 is in no value");
+        let (_, replaced) = validate_prose(result("Linka 999 je jiná."), "Linka", input);
+        assert!(replaced, "999 is in no value");
     }
 
     /// Two reviewed groups: the phone case as group 7 (a third value from /reklamace again), and
@@ -1495,6 +1616,23 @@ mod tests {
         let mut r = result(8, &[1, 2], "possibly_inconsistent", "medium");
         r.title = "Hodnoty 1 a 2: 290 Kč vs 390 Kč".to_string();
         assert!(!validate(r, &batch, &rendered).unwrap().5);
+    }
+
+    #[test]
+    fn the_crawl_date_may_be_mentioned_in_the_prose() {
+        // Live: "the post is older than the crawl date (2026-09-26)" replaced a good explanation.
+        let (batch, rendered) = batch();
+        let mut r = result(8, &[1, 2], "explainable", "none");
+        r.title = "Hodnoty RPSN se liší".to_string();
+        r.explanation = "Článek je starší než datum procházení (2026-09-26).".to_string();
+        assert!(validate(r.clone(), &batch, &rendered).unwrap().5, "not in the group");
+        assert!(
+            !validate_with_date(r.clone(), &batch, &rendered, "2026-09-26")
+                .unwrap()
+                .5
+        );
+        r.benign = vec!["Platí od roku 2019.".to_string()];
+        assert!(validate_with_date(r, &batch, &rendered, "2026-09-26").unwrap().5);
     }
 
     #[test]

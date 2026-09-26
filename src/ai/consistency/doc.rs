@@ -602,6 +602,21 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "Compare the values on the listed pages and decide which one is current.",
         "Porovnejte hodnoty na uvedených stránkách a rozhodněte, která z nich je aktuální.",
     ),
+    (
+        "prose_reason_explainable",
+        "The review saw a plausible legitimate reason for the difference, but its wording could not be used; please compare the values and the evidence.",
+        "Posouzení vidí pro rozdíl pravděpodobný oprávněný důvod, jeho znění ale nešlo použít; porovnejte prosím hodnoty a podklady.",
+    ),
+    (
+        "prose_reason_not_comparable",
+        "The review judged that the values describe different things, but its wording could not be used; please compare the values and the evidence.",
+        "Posouzení vyhodnotilo, že hodnoty popisují různé věci, jeho znění ale nešlo použít; porovnejte prosím hodnoty a podklady.",
+    ),
+    (
+        "prose_reason_insufficient",
+        "The evidence did not let the review tell whether the values conflict.",
+        "Z dostupných podkladů nešlo posoudit, zda si hodnoty odporují.",
+    ),
 ];
 
 /// The fixed text `key` in Czech for a Czech report, else in English; "" for an unknown key.

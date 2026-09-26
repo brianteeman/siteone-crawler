@@ -26,9 +26,16 @@ inside the step's XML envelope, escaped with `sanitize_for_prompt`.
 - `group.md` — groups the labels of one attribute key (`<labels>`) that name the same property of
   the same subject.
 - `judge.md` — reviews groups of differing values (`<groups>`) with a lenient rubric;
-  `prompts::judge_system` appends the `<output_language>` of the prose.
+  `prompts::judge_system` appends the `<crawl_date>` (dated articles are judged against it) and the
+  `<output_language>` of the prose.
 
 Each prompt has a `<security>` block that declares its envelope untrusted data, and the unit tests
 check that a forged closing tag or a natural-language instruction inside the data stays inert. The
 code never trusts the answers: facts are verified against the crawler's blocks, ids against the
 supplied lists, and the review's priority, numbers and wording are gated in `judge.rs`.
+
+After changing a prompt, run the live evaluation on the committed corpus
+(`tests/fixtures/consistency/`, expectations in `expected.json`):
+`SITEONE_LIVE_AI_ENDPOINT=… SITEONE_LIVE_AI_MODEL=… cargo test --test integration_crawl consistency_corpus_live -- --ignored --nocapture`
+(optional `SITEONE_LIVE_AI_EXTRA_BODY`, `SITEONE_LIVE_AI_CONTEXT_WINDOW`, `SITEONE_LIVE_AI_REPORT_DIR`). It
+prints recall, false positives and missed cases.

@@ -270,6 +270,12 @@ mod tests {
         for key in AttributeKey::ALL {
             assert!(prompts::EXTRACT.contains(key.as_str()), "{}", key.as_str());
         }
+        // A contact is named by its channel; its purpose is a qualifier (live: "telefonní číslo pro
+        // reklamace" read as a department line, while the page says "our customer line").
+        assert!(prompts::EXTRACT.contains("what the text says it is used for"));
+        // The subject is who the value belongs to, not the page topic (live: "our customer line"
+        // on the complaints page got the subject "Reklamace" and was kept apart).
+        assert!(prompts::EXTRACT.contains("not the topic of the page"));
         assert!(req.json_mode);
         assert_eq!(req.max_tokens, 2_000);
         assert_eq!(req.temperature, 0.2);

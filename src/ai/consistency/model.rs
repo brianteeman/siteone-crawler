@@ -242,6 +242,20 @@ impl AttributeKey {
             Price | Fee | InterestRate | Apr | CompanyId | VatId | BankAccount | RegistrationNumber
         )
     }
+
+    /// The grouping bucket of this key. The extractor picks either of two near-synonyms for the
+    /// same fact, which would then never be compared (live: an installation charge was a `price`
+    /// on one page and a `fee` on another; a score range a `spec` on some pages and an
+    /// `other_figure` on others), so fees are grouped with prices and other figures with product
+    /// parameters: keys read alike and weighing the same. Every other key is its own bucket
+    /// (`interest_rate` and `apr` never mix).
+    pub fn bucket(self) -> Self {
+        match self {
+            AttributeKey::Fee => AttributeKey::Price,
+            AttributeKey::OtherFigure => AttributeKey::Spec,
+            key => key,
+        }
+    }
 }
 
 /// Where a source comes from: one page's own content, or header/footer lines shared by pages.
@@ -432,6 +446,31 @@ mod tests {
         for unknown in ["", "price_per_month", "cena", "</attribute_key>", "other_figures"] {
             assert_eq!(AttributeKey::parse(unknown), AttributeKey::Other, "{unknown:?}");
         }
+    }
+
+    #[test]
+    fn near_synonym_keys_share_a_bucket_and_nothing_else_mixes() {
+        use AttributeKey::*;
+        // Live: an installation charge was a `price` on one page and a `fee` on another.
+        assert_eq!(Fee.bucket(), Price);
+        assert_eq!(Price.bucket(), Price);
+        // Live (crawler.siteone.io): the same score range was a `spec` on 4 pages and an
+        // `other_figure` on 2.
+        assert_eq!(OtherFigure.bucket(), Spec);
+        assert_eq!(Spec.bucket(), Spec);
+        for key in AttributeKey::ALL {
+            let bucket = key.bucket();
+            assert_eq!(bucket.bucket(), bucket, "{key:?}");
+            // A bucket mixes only keys whose values are read alike and weigh the same.
+            assert_eq!(key.value_hint(), bucket.value_hint(), "{key:?}");
+            assert_eq!(key.importance(), bucket.importance(), "{key:?}");
+            assert_eq!(key.critical_allowed(), bucket.critical_allowed(), "{key:?}");
+            if key != Fee && key != OtherFigure {
+                assert_eq!(bucket, key, "{key:?} is its own bucket");
+            }
+        }
+        // Interest rate and APR never mix.
+        assert_ne!(InterestRate.bucket(), Apr.bucket());
     }
 
     #[test]

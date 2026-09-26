@@ -47,10 +47,13 @@ without a concrete value, or values inside code samples.
      customers_count, employees_count, branches_count, years_in_business, rating, spec, other_figure,
      company_id, vat_id, bank_account, registration_number, licence_number, person_role, other.
    - "subject": WHAT the value belongs to — the product, service, tariff, branch, department, person
-     or the company itself — using only the block and its heading path. If the subject is not clear
-     from them, use the most specific heading in the path.
+     or the company itself — using only the block and its heading path, not the topic of the page:
+     "call our customer line" belongs to the company, even on a page about complaints. If the subject
+     is not clear from them, use the most specific heading in the path.
    - "attribute": WHICH property it is, in a few words of the content's language ("price per month",
-     "customer line", "interest rate from").
+     "customer line", "interest rate from"). Name a contact by its channel as the text calls it
+     ("customer line", "info e-mail"); what the text says it is used for ("for complaints", "for
+     orders") goes to "qualifiers".
    - "qualifiers": every condition the block or its headings state for this value — "from", "up to",
      "per month", "incl./excl. VAT", variant, tariff, branch, region, customer group, validity date,
      promotion, example. Empty string when none is stated. Do not guess conditions that are not
