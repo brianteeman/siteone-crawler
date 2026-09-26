@@ -157,6 +157,28 @@ struct Table {
     thead: usize,
     rows: usize,
     row: Option<Row>,
+    /// Per column, the cell of an earlier row that still covers it (`rowspan`).
+    spanning: Vec<Option<Spanning>>,
+}
+
+/// A cell that spans into later rows.
+#[derive(Clone)]
+struct Spanning {
+    text: String,
+    /// It is a cell of a header row (it names columns, it is no data of the rows it covers).
+    header_row: bool,
+    /// The first column of the cell (a cell spanning columns is read once).
+    first: bool,
+    /// The later rows it still covers.
+    rows_left: usize,
+}
+
+/// A column of a row: a cell of the row itself (its index; whether this is its first column),
+/// a cell of an earlier row spanning into it, or nothing.
+enum Slot {
+    Own(usize, bool),
+    Carried(Spanning),
+    Empty,
 }
 
 struct Row {
@@ -168,6 +190,7 @@ struct Cell {
     text: String,
     header: bool,
     colspan: usize,
+    rowspan: usize,
 }
 
 #[derive(Default)]
@@ -234,16 +257,18 @@ impl Walker {
                 }
                 "td" | "th" => {
                     if let Some(row) = table.row.as_mut() {
-                        let colspan = el
-                            .attr("colspan")
-                            .and_then(|span| span.trim().parse::<usize>().ok())
-                            .filter(|span| *span > 0)
-                            .unwrap_or(1)
-                            .min(1_000);
+                        let span = |name: &str| {
+                            el.attr(name)
+                                .and_then(|span| span.trim().parse::<usize>().ok())
+                                .filter(|span| *span > 0)
+                                .unwrap_or(1)
+                                .min(1_000)
+                        };
                         row.cells.push(Cell {
                             text: String::new(),
                             header: tag == "th",
-                            colspan,
+                            colspan: span("colspan"),
+                            rowspan: span("rowspan"),
                         });
                         self.cells += 1;
                         frame.cell = true;
@@ -307,6 +332,7 @@ impl Walker {
                     thead: 0,
                     rows: 0,
                     row: None,
+                    spanning: Vec::new(),
                 });
                 frame.table = true;
             }
@@ -426,46 +452,92 @@ impl Walker {
     fn finish_row(&mut self) {
         let Some(table) = self.tables.last_mut() else { return };
         let Some(row) = table.row.take() else { return };
-        let cells: Vec<(String, bool, usize)> = row
+        let cells: Vec<(String, bool, usize, usize)> = row
             .cells
             .into_iter()
-            .map(|cell| (clean_text(&cell.text), cell.header, cell.colspan))
+            .map(|cell| (clean_text(&cell.text), cell.header, cell.colspan, cell.rowspan))
             .collect();
-        if cells.iter().all(|(text, _, _)| text.is_empty()) {
-            return;
-        }
         let is_header = row.in_thead
             || (table.header.is_none()
                 && table.rows == 0
-                && cells.iter().all(|(text, header, _)| *header || text.is_empty()));
+                && cells.iter().all(|(text, header, _, _)| *header || text.is_empty()));
+
+        // The row on the table's grid: a column still covered by a cell of an earlier row
+        // (`rowspan`) is skipped by the row's own cells, which move to the right.
+        let carried = std::mem::take(&mut table.spanning);
+        let mut grid: Vec<Slot> = Vec::new();
+        let mut own = cells.iter().enumerate();
+        loop {
+            if let Some(Some(spanning)) = carried.get(grid.len()) {
+                grid.push(Slot::Carried(spanning.clone()));
+                continue;
+            }
+            let Some((i, (_, _, colspan, _))) = own.next() else {
+                break;
+            };
+            grid.extend((0..*colspan).map(|k| Slot::Own(i, k == 0)));
+        }
+        while grid.len() < carried.len() {
+            grid.push(match carried.get(grid.len()) {
+                Some(Some(spanning)) => Slot::Carried(spanning.clone()),
+                _ => Slot::Empty,
+            });
+        }
+        table.spanning = grid
+            .iter()
+            .map(|slot| match slot {
+                Slot::Carried(spanning) if spanning.rows_left > 1 => Some(Spanning {
+                    rows_left: spanning.rows_left - 1,
+                    ..spanning.clone()
+                }),
+                Slot::Own(i, first) => cells.get(*i).filter(|cell| cell.3 > 1).map(|cell| Spanning {
+                    text: cell.0.clone(),
+                    header_row: is_header,
+                    first: *first,
+                    rows_left: cell.3 - 1,
+                }),
+                _ => None,
+            })
+            .collect();
+
+        if cells.iter().all(|(text, _, _, _)| text.is_empty()) {
+            return;
+        }
         table.rows += 1;
         let text = if is_header {
             table.header = Some(
-                cells
-                    .iter()
-                    .flat_map(|(text, _, span)| std::iter::repeat_n(text.clone(), *span))
+                grid.iter()
+                    .map(|slot| match slot {
+                        Slot::Own(i, _) => cells.get(*i).map(|cell| cell.0.clone()).unwrap_or_default(),
+                        Slot::Carried(spanning) => spanning.text.clone(),
+                        Slot::Empty => String::new(),
+                    })
                     .collect(),
             );
             cells
                 .iter()
-                .filter(|(text, _, _)| !text.is_empty())
-                .map(|(text, _, _)| text.as_str())
+                .filter(|(text, _, _, _)| !text.is_empty())
+                .map(|(text, _, _, _)| text.as_str())
                 .collect::<Vec<_>>()
                 .join(" | ")
         } else {
-            let mut column = 0;
             let mut parts = Vec::new();
-            for (text, _, span) in &cells {
+            for (column, slot) in grid.iter().enumerate() {
+                let text = match slot {
+                    Slot::Own(i, true) => cells.get(*i).map_or("", |cell| cell.0.as_str()),
+                    // A data cell spanning into this row is data of this row too.
+                    Slot::Carried(spanning) if spanning.first && !spanning.header_row => spanning.text.as_str(),
+                    _ => continue,
+                };
                 let header = table
                     .header
                     .as_ref()
                     .and_then(|header| header.get(column))
                     .filter(|header| !header.is_empty());
-                column += span;
                 match (text.is_empty(), header) {
                     (true, _) => {}
                     (false, Some(header)) => parts.push(format!("{header}: {text}")),
-                    (false, None) => parts.push(text.clone()),
+                    (false, None) => parts.push(text.to_string()),
                 }
             }
             parts.join(" | ")
@@ -696,6 +768,37 @@ mod tests {
                 "IČO | 12345678",
                 "Otevírací doba",
                 "Po–Pá | 8–18",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cell_spanning_rows_belongs_to_each_of_its_rows() {
+        let blocks = blocks_from_html(
+            r#"<body>
+            <table><tr><th>Plan</th><th>Period</th><th>Price</th></tr>
+              <tr><th rowspan="2">Basic</th><td>Monthly</td><td>10 EUR</td></tr>
+              <tr><td>Yearly</td><td>100 EUR</td></tr>
+              <tr><th>Premium</th><td rowspan="2">Monthly</td><td>20 EUR</td></tr>
+              <tr><th>Premium Plus</th><td>30 EUR</td></tr>
+              <tr><td>Business</td><td>Yearly</td><td>500 EUR</td></tr></table>
+            <table><thead><tr><th rowspan="2">Tarif</th><th colspan="2">Cena</th></tr>
+              <tr><th>měsíčně</th><th>ročně</th></tr></thead>
+              <tr><td>Basic</td><td>290 Kč</td><td>2 900 Kč</td></tr></table>
+            </body>"#,
+        );
+        assert_eq!(
+            texts(&blocks),
+            [
+                "Plan | Period | Price",
+                "Plan: Basic | Period: Monthly | Price: 10 EUR",
+                "Plan: Basic | Period: Yearly | Price: 100 EUR",
+                "Plan: Premium | Period: Monthly | Price: 20 EUR",
+                "Plan: Premium Plus | Period: Monthly | Price: 30 EUR",
+                "Plan: Business | Period: Yearly | Price: 500 EUR",
+                "Tarif | Cena",
+                "měsíčně | ročně",
+                "Tarif: Basic | měsíčně: 290 Kč | ročně: 2 900 Kč",
             ]
         );
     }
