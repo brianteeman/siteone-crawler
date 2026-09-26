@@ -166,6 +166,26 @@ pub struct MockResponse {
     pub delay_ms: u64,
 }
 
+/// One answer of `MockLlm::start_routed`: a request whose user message contains `envelope` (e.g.
+/// `"<page_data>"`) and, when given, `marker` gets `response`, provided its path starts with
+/// `response.path_prefix`. A route answers every request it matches (it does not get used up).
+pub struct MockRoute {
+    pub envelope: &'static str,
+    pub marker: Option<&'static str>,
+    pub response: MockResponse,
+}
+
+/// How a `MockLlm` picks the answer to a request.
+enum Router {
+    /// Per path prefix, in the order given; the last one repeats.
+    Ordered(Vec<MockResponse>),
+    /// By the user-message envelope and marker; otherwise from the ordered `fallback`.
+    Routed {
+        routes: Vec<MockRoute>,
+        fallback: Vec<MockResponse>,
+    },
+}
+
 /// A minimal OpenAI-compatible LLM endpoint on 127.0.0.1 (base URL `url()`, e.g. for
 /// `--ai-endpoint`) that answers with canned bodies such as the captured provider responses in
 /// `tests/fixtures/ai-responses/`. The responses of one path prefix are served in order and the
@@ -183,12 +203,28 @@ pub struct MockLlm {
 
 impl MockLlm {
     pub fn start(responses: Vec<MockResponse>) -> Self {
+        Self::serve(Router::Ordered(responses))
+    }
+
+    /// Answers by what a request asks for rather than by arrival order, so parallel calls of a
+    /// pipeline get deterministic answers. The first route whose `envelope` (and `marker`, if
+    /// any) occur in the request's user message answers it; otherwise the ordered `fallback`
+    /// responses do, as in `start` (the last repeats), and without a matching fallback the answer
+    /// is a 404. The user message is the text of the `"user"` messages of a chat request body;
+    /// a body that is not one is matched as a whole. Matching the user message only matters:
+    /// a stage's system prompt names the envelopes of the other stages too. Every request is
+    /// recorded.
+    pub fn start_routed(routes: Vec<MockRoute>, fallback: Vec<MockResponse>) -> MockLlm {
+        Self::serve(Router::Routed { routes, fallback })
+    }
+
+    fn serve(router: Router) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a free port");
         let port = listener.local_addr().expect("a bound address").port();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
-        let responses = Arc::new(responses);
-        // How many requests each path prefix has answered so far.
+        let router = Arc::new(router);
+        // How many requests each path prefix of the ordered responses has answered so far.
         let served: Arc<Mutex<Vec<(&'static str, usize)>>> = Arc::new(Mutex::new(Vec::new()));
         let (recorded, stopped) = (requests.clone(), stop.clone());
         let thread = std::thread::spawn(move || {
@@ -197,31 +233,26 @@ impl MockLlm {
                     break;
                 }
                 let Ok(mut stream) = stream else { continue };
-                let (responses, served, recorded) = (responses.clone(), served.clone(), recorded.clone());
+                let (router, served, recorded) = (router.clone(), served.clone(), recorded.clone());
                 std::thread::spawn(move || {
                     let (head, body) = read_request(&mut stream);
                     let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let answer = match router.as_ref() {
+                        Router::Ordered(responses) => ordered_answer(responses, &path, &served),
+                        Router::Routed { routes, fallback } => {
+                            let user = user_message(&body);
+                            routes
+                                .iter()
+                                .find(|route| {
+                                    path.starts_with(route.response.path_prefix)
+                                        && user.contains(route.envelope)
+                                        && route.marker.is_none_or(|marker| user.contains(marker))
+                                })
+                                .map(|route| &route.response)
+                                .or_else(|| ordered_answer(fallback, &path, &served))
+                        }
+                    };
                     recorded.lock().unwrap().push((head, body));
-                    let answer = responses
-                        .iter()
-                        .find(|response| path.starts_with(response.path_prefix))
-                        .map(|first| {
-                            let prefix = first.path_prefix;
-                            let candidates: Vec<&MockResponse> =
-                                responses.iter().filter(|r| r.path_prefix == prefix).collect();
-                            let mut served = served.lock().unwrap();
-                            let index = match served.iter_mut().find(|(p, _)| *p == prefix) {
-                                Some((_, count)) => {
-                                    *count += 1;
-                                    *count - 1
-                                }
-                                None => {
-                                    served.push((prefix, 1));
-                                    0
-                                }
-                            };
-                            candidates[index.min(candidates.len() - 1)]
-                        });
                     let response = match answer {
                         Some(answer) => {
                             std::thread::sleep(Duration::from_millis(answer.delay_ms));
@@ -297,6 +328,60 @@ fn reason_phrase(status: u16) -> &'static str {
         500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "Mock",
+    }
+}
+
+/// The next of `responses` for `path`: the first prefix (in the order given) that matches the path
+/// serves its responses in order, and the last one repeats once they are used up.
+fn ordered_answer<'a>(
+    responses: &'a [MockResponse],
+    path: &str,
+    served: &Mutex<Vec<(&'static str, usize)>>,
+) -> Option<&'a MockResponse> {
+    let prefix = responses
+        .iter()
+        .find(|response| path.starts_with(response.path_prefix))?
+        .path_prefix;
+    let candidates: Vec<&MockResponse> = responses.iter().filter(|r| r.path_prefix == prefix).collect();
+    let mut served = served.lock().unwrap();
+    let index = match served.iter_mut().find(|(p, _)| *p == prefix) {
+        Some((_, count)) => {
+            *count += 1;
+            *count - 1
+        }
+        None => {
+            served.push((prefix, 1));
+            0
+        }
+    };
+    Some(candidates[index.min(candidates.len() - 1)])
+}
+
+/// The text of the `"user"` messages of a chat request body (a string `content`, or the `text`
+/// of its parts), joined by newlines; the whole body when it has none.
+fn user_message(body: &str) -> String {
+    let Ok(request) = serde_json::from_str::<serde_json::Value>(body) else {
+        return body.to_string();
+    };
+    let texts: Vec<String> = request["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|message| message["role"] == "user")
+        .map(|message| match &message["content"] {
+            serde_json::Value::String(text) => text.clone(),
+            serde_json::Value::Array(parts) => parts
+                .iter()
+                .filter_map(|part| part["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        })
+        .collect();
+    if texts.is_empty() {
+        body.to_string()
+    } else {
+        texts.join("\n")
     }
 }
 
