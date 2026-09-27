@@ -1303,6 +1303,16 @@ impl GeoDoc {
                         })
                         .collect(),
                 ));
+                if !page.coverage.is_complete() {
+                    nodes.push(Node::Note(line(fill(
+                        text(locale, "label.partial_advice"),
+                        &[
+                            page.coverage.included.len().to_string(),
+                            page.coverage.total.to_string(),
+                        ],
+                        0,
+                    ))));
+                }
             }
             if page.page_type == crate::ai::geo::analyze::PageType::Article {
                 let missing = text(locale, "label.byline_missing").to_string();
@@ -2452,6 +2462,10 @@ const EN: &[(&str, &str)] = &[
     ),
     ("label.priority", "Priority"),
     ("label.improvement", "Improvement"),
+    (
+        "label.partial_advice",
+        "This advice rests on {0} of the page's {1} blocks (the rest was left out or shortened to fit the input budget): it may call something missing that the page shows elsewhere, so its priority is capped at low. Check the page before acting on it.",
+    ),
     ("label.blocks", "Blocks"),
     ("priority.high", "high"),
     ("priority.medium", "medium"),
@@ -3308,6 +3322,10 @@ const CS: &[(&str, &str)] = &[
     ("label.vague", "Pasáže, které stojí na „to“, „my“ nebo „tento produkt“:"),
     ("label.priority", "Priorita"),
     ("label.improvement", "Zlepšení"),
+    (
+        "label.partial_advice",
+        "Tato doporučení vycházejí z {0} bloků stránky z celkových {1} (zbytek byl vynechán nebo zkrácen, aby se vešel do vstupního rozpočtu): mohou za chybějící označit něco, co stránka uvádí jinde, proto mají nejvýš nízkou prioritu. Před úpravou stránku zkontrolujte.",
+    ),
     ("label.blocks", "Bloky"),
     ("priority.high", "vysoká"),
     ("priority.medium", "střední"),
@@ -4007,6 +4025,38 @@ mod tests {
     const KIT_DIR: &str = "ai-geo-kit.example.com.20260926-1000";
 
     #[test]
+    fn advice_from_a_partly_shown_page_says_what_it_rests_on() {
+        for language in ["en", "cs"] {
+            let locale = ReportLocale::new(language);
+            let mut doc = sample(language, true);
+            let page = &mut doc.pages[0];
+            page.improvements = vec![crate::ai::geo::analyze::Improvement {
+                issue: "The Mailer options section documents only 5 options.".to_string(),
+                fix: "Add the remaining mailer parameters.".to_string(),
+                priority: Priority::Low,
+                excerpts: Vec::new(),
+            }];
+            page.coverage = crate::ai::geo::analyze::Coverage {
+                total: 33,
+                included: (0..8).collect(),
+                shortened: 0,
+                h1: None,
+            };
+            let note = fill(
+                text(&locale, "label.partial_advice"),
+                &["8".to_string(), "33".to_string()],
+                0,
+            );
+            assert!(doc.to_markdown(KIT_DIR).contains(&note), "{language}");
+            doc.pages[0].coverage.total = 8;
+            assert!(
+                !doc.to_markdown(KIT_DIR).contains(&note),
+                "{language}: the whole page was shown"
+            );
+        }
+    }
+
+    #[test]
     fn an_author_the_page_does_not_mark_is_shown_for_review_only() {
         for language in ["en", "cs"] {
             let mut doc = sample(language, true);
@@ -4267,6 +4317,7 @@ mod tests {
                 "label.consistency_link",
                 "label.consistency_partial",
                 "label.byline_unconfirmed",
+                "label.partial_advice",
             ]
             .map(str::to_string),
         );

@@ -333,6 +333,8 @@ pub struct Question {
 pub struct Improvement {
     pub issue: String,
     pub fix: String,
+    /// The model's priority; at most `Low` when the model saw only part of the page (see
+    /// `verify_analysis`).
     pub priority: Priority,
     pub excerpts: Vec<Excerpt>,
 }
@@ -1144,7 +1146,11 @@ impl<'a> Shown<'a> {
 
 /// Checks the model's answer against the blocks it was shown (`coverage`) and keeps only what the
 /// crawler's own blocks support (see the module comment). `page` gives the URL and the language
-/// numbers are read in.
+/// numbers are read in. When blocks were left out or shortened, every improvement keeps its text
+/// but at most `Low` priority: advice may claim that something is missing or rank itself against
+/// the whole page, and the crawler can tell neither which advice does so nor which part of the
+/// page it concerns, so no advice from a partly seen page is ranked above the lowest tier (the
+/// report says what the advice rests on).
 pub fn verify_analysis(raw: RawAnalysis, page: &AnalyzedPage, blocks: &[Block], coverage: &Coverage) -> PageAnalysis {
     let shown = Shown {
         blocks,
@@ -1206,7 +1212,11 @@ pub fn verify_analysis(raw: RawAnalysis, page: &AnalyzedPage, blocks: &[Block], 
         improvements.push(Improvement {
             issue,
             fix,
-            priority: Priority::parse(&improvement.priority),
+            priority: if coverage.is_complete() {
+                Priority::parse(&improvement.priority)
+            } else {
+                Priority::Low
+            },
             excerpts: found.into_iter().map(Excerpt::of).collect(),
         });
     }
@@ -2459,6 +2469,61 @@ mod tests {
         let analysis = analyze(&page, &blocks, "");
         assert_eq!(analysis.page_type, PageType::Service);
         assert_eq!(analysis.states_offer_early, OfferEarly::Yes);
+    }
+
+    #[test]
+    fn advice_from_a_partly_shown_page_is_never_more_than_low_priority() {
+        let mut html = String::from(
+            "<html lang=\"en\"><body><main><h1>Mail configuration</h1><h2>Mailer options</h2>\
+             <table><tr><th>Option</th><th>Meaning</th></tr>",
+        );
+        for i in 0..30 {
+            html.push_str(&format!(
+                "<tr><td>--mailer-option-{i}</td><td>{}</td></tr>",
+                "Select how the mail system delivers notifications to listed recipients. ".repeat(6)
+            ));
+        }
+        html.push_str("</table></main></body></html>");
+        let (page, blocks) = page_of(&html);
+        let advice = |coverage: &Coverage| -> Vec<Improvement> {
+            let row = coverage
+                .included
+                .iter()
+                .map(|id| &blocks[*id])
+                .find(|block| block.text.contains("--mailer-option-"))
+                .expect("a shown row");
+            let json = answer(&format!(
+                r#""improvements":[{{"issue":"The Mailer options section documents only 5 options.",
+                    "fix":"Add the remaining mailer parameters.","priority":"high","blocks":["{}"]}},
+                    {{"issue":"The title does not name the product.","fix":"Name it.","priority":"medium","blocks":[]}}]"#,
+                block_ref(row.id)
+            ));
+            verify_analysis(parse_analysis(&json).expect("an answer"), &page, &blocks, coverage).improvements
+        };
+        let (_, partial) = request(&page, &blocks, false, 6_000);
+        assert!(partial.omitted() > 0, "{partial:?}");
+        let partly = advice(&partial);
+        assert_eq!(
+            partly.iter().map(|advice| advice.priority).collect::<Vec<_>>(),
+            [Priority::Low, Priority::Low],
+            "the unseen blocks may hold what the advice misses"
+        );
+        assert_eq!(
+            partly[0].fix, "Add the remaining mailer parameters.",
+            "the advice stays for review"
+        );
+        let (_, full) = request(&page, &blocks, false, 1_000_000);
+        assert!(full.is_complete());
+        assert_eq!(
+            advice(&full).iter().map(|advice| advice.priority).collect::<Vec<_>>(),
+            [Priority::High, Priority::Medium]
+        );
+        let shortened = Coverage { shortened: 1, ..full };
+        assert_eq!(
+            advice(&shortened)[0].priority,
+            Priority::Low,
+            "a shortened block is partly shown"
+        );
     }
 
     #[test]
