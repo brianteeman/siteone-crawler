@@ -92,10 +92,11 @@ fn raw_fact(item: &Value) -> Option<RawFact> {
 /// Keep the facts grounded in `source` as occurrences with the ids `next_id…`: the `block` must be
 /// one of the source's ids (case and surrounding spaces aside), its text must contain the `quote`,
 /// and the `value` must be a whole token inside that quote (`grounding::locate_quoted_value`). The
-/// occurrence takes the page's own spelling of the value — for a number, with an operator written
-/// right before it (`od 18 let`, `18+`), a sign joined to it (`-5 %`) and the other end of a range
-/// it is one end of (`5–10 %`, `grounding::extend_number_span`), even when the model put them into
-/// the qualifiers or left them out — the crawler's text around it as evidence (with the value's
+/// occurrence takes the page's own spelling of the value — for a number, with its unit (`10 EUR`),
+/// an operator written right before it (`od 18 let`, `18+`), a sign joined to it (`-5 %`) and the
+/// other end of a range it is one end of, with that end's own sign (`5–10 %`, `-5–10 %`,
+/// `5 to 10 %`, `grounding::extend_number_span`), even when the model put them into the
+/// qualifiers or left them out — the crawler's text around it as evidence (with the value's
 /// place in it), the block's heading path (or header/footer label) and page set, and the value's
 /// comparison key read with `lang` and `site_country` (never from the model's `normalized` form).
 /// An unknown `attribute_key` becomes `Other`; `subject`, `attribute` and `qualifiers` get
@@ -173,7 +174,7 @@ fn clean_label(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::consistency::model::{AnalysisSource, AttributeKey, Page, SourceBlock, SourceKind};
+    use crate::ai::consistency::model::{AnalysisSource, AttributeKey, FactKey, Page, SourceBlock, SourceKind};
     use crate::ai::consistency::prompts;
     use crate::ai::grounding::{ValueHint, ValueKey, value_key};
 
@@ -594,6 +595,47 @@ mod tests {
             &kept[4].evidence[kept[4].value_span.0..kept[4].value_span.1],
             "10 EUR – 20 EUR"
         );
+    }
+
+    #[test]
+    fn a_negative_range_quoted_by_its_upper_end_is_a_difference_from_the_positive_one() {
+        // One page states -5–10 %, two pages 5–10 %; the model returns only the upper end `10 %`
+        // of the first (or of a negative upper end), the whole range of the others.
+        for (text, value) in [
+            ("Annual return -5–10 %", "10 %"),
+            ("Annual return −5–10 %", "10 %"),
+            ("Annual return -5 to 10 %", "10 %"),
+            ("Annual return -10–-5 %", "5 %"),
+        ] {
+            let mut occ = Vec::new();
+            let mut next_id = 0;
+            for (id, (text, value)) in [
+                (text, value),
+                ("Annual return 5–10 %", "5–10 %"),
+                ("Annual return 5–10 %", "5–10 %"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut source = page_source();
+                source.id = id;
+                source.blocks = vec![block("B1", text, &[], &[id])];
+                let raw = vec![fact("B1", "interest_rate", value, text)];
+                let (kept, ungrounded) = verify_facts(raw, &source, "en", None, &mut next_id);
+                assert_eq!((kept.len(), ungrounded), (1, 0), "{text}");
+                occ.extend(kept);
+            }
+            assert_ne!(occ[0].value_key, occ[1].value_key, "{text}: {:?}", occ[0].value);
+            let key = FactKey {
+                id: 0,
+                attribute_key: AttributeKey::InterestRate,
+                name: "Annual return".to_string(),
+                aliases: Vec::new(),
+                occurrence_ids: vec![0, 1, 2],
+            };
+            let (candidates, consistent) = crate::ai::consistency::judge::split_keys(&[key], &occ);
+            assert_eq!((candidates.len(), consistent.len()), (1, 0), "{text}");
+        }
     }
 
     #[test]

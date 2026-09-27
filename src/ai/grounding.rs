@@ -197,71 +197,211 @@ pub fn extend_over_operator(text: &str, span: (usize, usize)) -> (usize, usize) 
 }
 
 /// The span of a number value in `text`, widened so that the value keeps the meaning the page
-/// gives it: over a sign joined to it (`-5 %`, `−5 %`), over the other end of a range it is one
-/// end of (`10 %` or `5` of `5–10 %` → `5–10 %`, `20 EUR` of `10 EUR – 20 EUR`), and then over an
+/// gives it: over its unit (`10` of `10 EUR`, `€10`), over a sign joined to it (`-5 %`, `−5 %`,
+/// `-€5`), over the other end of a range it is one end of, with that end's own sign and currency
+/// (`10 %` or `5` of `5–10 %` → `5–10 %`, `10 %` of `-5–10 %` → `-5–10 %`, `5 %` of `-10–-5 %`
+/// → `-10–-5 %`, `20 EUR` of `10 EUR – 20 EUR`, `10 %` of `5 to 10 %`), and then over an
 /// operator before it (`extend_over_operator`). A dash is a sign only when it touches the number
-/// and follows no letter or digit (`COVID-19` has no `-19`, `Sleva – 5 %` no `-5 %`); a dash
-/// between two numbers is a range unless the two ends name different units (`290 Kč – 10 GB` is
-/// no range). A span that is not a range of `text` is returned as it is.
+/// and follows no letter or digit (`COVID-19` has no `-19`, `Sleva – 5 %` no `-5 %`); a dash,
+/// `to`, `až` or `do` between two numbers is a range unless the two ends name different units
+/// (`290 Kč – 10 GB` is no range), and a word is none before a date (`10 do 31. 12.`) or after a
+/// value that ends in another word (`5 osob do 31`). A span that is not a range of `text` is
+/// returned as it is.
 pub fn extend_number_span(text: &str, span: (usize, usize)) -> (usize, usize) {
-    let (Some(before), Some(value), Some(after)) = (text.get(..span.0), text.get(span.0..span.1), text.get(span.1..))
-    else {
+    if text.get(span.0..span.1).is_none() {
         return span;
-    };
-    let (mut start, mut end) = span;
+    }
+    let (start, end) = with_unit(text, span);
+    let value = text.get(start..end).unwrap_or_default();
     let value_unit = unit_suffix(value).map(|(_, unit)| unit);
+    let start = widen_left(text, start, value, value_unit);
+    let end = widen_right(text, (start, end), value, value_unit);
+    extend_over_operator(text, (start, end))
+}
 
-    // Left: the lower end of a range, or a sign.
-    let left = before.trim_end_matches(char::is_whitespace);
-    if let Some(dash) = left.chars().next_back().filter(|&c| is_dash(c)) {
-        let pre = left.get(..left.len() - dash.len_utf8()).unwrap_or_default();
+/// `span` (a range of `text`) widened over a currency symbol joined to the front of its number
+/// (`€10`) and over a currency or `%` (`UNITS`) after a number it ends with (`10 EUR`, `5 %`).
+fn with_unit(text: &str, span: (usize, usize)) -> (usize, usize) {
+    let (mut start, mut end) = span;
+    let value = text.get(start..end).unwrap_or_default();
+    if value.starts_with(|c: char| c.is_ascii_digit())
+        && let Some(symbol) = text
+            .get(..start)
+            .and_then(|head| head.chars().next_back())
+            .filter(|c| matches!(c, '€' | '$' | '£'))
+    {
+        start -= symbol.len_utf8();
+    }
+    if value.ends_with(|c: char| c.is_ascii_digit()) {
+        let after = text.get(end..).unwrap_or_default();
+        let spaced = after.trim_start_matches(char::is_whitespace);
+        if let Some((len, _)) = unit_prefix(spaced) {
+            end += after.len() - spaced.len() + len;
+        }
+    }
+    (start, end)
+}
+
+/// The words that join the two ends of a range (and that `parse_number` reads as such); `do`
+/// only after `od` (`od 5 do 10 %`), since `iPhone 15 do 20 000 Kč` means up to 20 000 Kč.
+const RANGE_WORDS: [&str; 3] = ["to", "až", "do"];
+
+/// Where a number value that starts at `start` of `text` starts with a sign joined to it and
+/// with the lower end of a range it is the upper end of (see `extend_number_span`). A range
+/// before the value wins over a sign (`5 –10 %` is a range), and a range may end before a sign
+/// (`-10–-5 %`).
+fn widen_left(text: &str, mut start: usize, value: &str, value_unit: Option<&str>) -> usize {
+    let mut signed = false;
+    loop {
+        let before = text.get(..start).unwrap_or_default();
+        let left = before.trim_end_matches(char::is_whitespace);
+        let spaced = left.len() < before.len();
+        let Some((pre, word)) = connector_before(left, spaced) else {
+            return start;
+        };
         let low = pre.trim_end_matches(char::is_whitespace);
         let (body, low_unit) = match unit_suffix(low) {
             Some((at, unit)) => (low.get(..at).unwrap_or_default().trim_end(), Some(unit)),
             None => (low, None),
         };
-        let low_start = numeral_spans(body).find(|r| r.end == body.len()).map(|r| r.start);
-        match low_start {
-            Some(at) if units_agree(value_unit, low_unit) => {
-                start = at
-                    - body
-                        .get(..at)
-                        .and_then(|head| head.chars().next_back())
-                        .filter(|c| matches!(c, '€' | '$' | '£'))
-                        .map_or(0, char::len_utf8);
+        match numeral_spans(body).find(|r| r.end == body.len()) {
+            Some(r) if units_agree(value_unit, low_unit) => {
+                let low_start = signed_start(body, r.start);
+                return if word == Some("do") && !after_od(text, low_start) {
+                    start
+                } else {
+                    low_start
+                };
             }
-            Some(_) => {}
-            None if left.len() == before.len()
-                && value.starts_with(|c: char| c.is_ascii_digit())
+            None if word.is_none()
+                && !signed
+                && !spaced
+                && starts_with_amount(value)
                 && !pre.chars().next_back().is_some_and(char::is_alphanumeric) =>
             {
                 start = pre.len();
+                signed = true;
             }
-            None => {}
+            _ => return start,
         }
     }
+}
 
-    // Right: the upper end of a range.
+/// Where a number value at `span` of `text` ends with the upper end of a range it is the lower
+/// end of, with that end's own currency, sign and unit (see `extend_number_span`).
+fn widen_right(text: &str, span: (usize, usize), value: &str, value_unit: Option<&str>) -> usize {
+    let (start, end) = span;
+    let after = text.get(end..).unwrap_or_default();
     let right = after.trim_start_matches(char::is_whitespace);
-    if let Some(dash) = right.chars().next().filter(|&c| is_dash(c)) {
-        let rest = right.get(dash.len_utf8()..).unwrap_or_default().trim_start();
-        let rest = rest.strip_prefix(['€', '$', '£']).unwrap_or(rest);
-        if rest.starts_with(|c: char| c.is_ascii_digit()) {
-            let high_end = text.len() - rest.len() + scan_numeral(rest, 0);
-            let tail = text.get(high_end..).unwrap_or_default();
-            let spaced = tail.trim_start_matches(char::is_whitespace);
-            let high_unit = unit_prefix(spaced);
-            let agree = match (value_unit, high_unit) {
-                (Some(a), Some((_, b))) => a == b,
-                (Some(_), None) => false,
-                (None, _) => true,
-            };
-            if agree {
-                end = high_end + high_unit.map_or(0, |(len, _)| tail.len() - spaced.len() + len);
-            }
-        }
+    let spaced = right.len() < after.len();
+    let (rest, dash) = if let Some(dash) = right.chars().next().filter(|&c| is_dash(c)) {
+        (right.get(dash.len_utf8()..).unwrap_or_default(), true)
+    } else if let Some((rest, word)) = spaced.then(|| word_connector_after(right)).flatten()
+        && (value.ends_with(|c: char| c.is_ascii_digit()) || value_unit.is_some())
+        && (word != "do" || after_od(text, start))
+    {
+        (rest, false)
+    } else {
+        return end;
+    };
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix(['€', '$', '£']).unwrap_or(rest);
+    let rest = rest
+        .strip_prefix(is_dash)
+        .filter(|signed| starts_with_amount(signed))
+        .unwrap_or(rest);
+    let rest = rest.strip_prefix(['€', '$', '£']).unwrap_or(rest);
+    if !rest.starts_with(|c: char| c.is_ascii_digit()) {
+        return end;
     }
-    extend_over_operator(text, (start, end))
+    let high_end = text.len() - rest.len() + scan_numeral(rest, 0);
+    let tail = text.get(high_end..).unwrap_or_default();
+    let date = tail
+        .strip_prefix('.')
+        .is_some_and(|day| day.trim_start().starts_with(|c: char| c.is_ascii_digit()));
+    if !dash && date {
+        return end;
+    }
+    let spaced_tail = tail.trim_start_matches(char::is_whitespace);
+    let high_unit = unit_prefix(spaced_tail);
+    let agree = match (value_unit, high_unit) {
+        (Some(a), Some((_, b))) => a == b,
+        (Some(_), None) => false,
+        (None, _) => true,
+    };
+    if !agree {
+        return end;
+    }
+    high_end + high_unit.map_or(0, |(len, _)| tail.len() - spaced_tail.len() + len)
+}
+
+/// The text before a range connector that `left` ends with, and the connector's word (`None`
+/// for a dash): a dash, or a `RANGE_WORDS` word apart from the word before it and from the
+/// value (`spaced`).
+fn connector_before(left: &str, spaced: bool) -> Option<(&str, Option<&'static str>)> {
+    if let Some(dash) = left.chars().next_back().filter(|&c| is_dash(c)) {
+        return Some((left.get(..left.len() - dash.len_utf8())?, None));
+    }
+    if !spaced {
+        return None;
+    }
+    RANGE_WORDS.iter().find_map(|word| {
+        let (at, _) = left.char_indices().rev().nth(word.chars().count() - 1)?;
+        let pre = left.get(..at)?;
+        (left.get(at..)?.to_lowercase() == *word && pre.ends_with(char::is_whitespace)).then_some((pre, Some(*word)))
+    })
+}
+
+/// What follows a `RANGE_WORDS` word that `right` starts with, and the word, when the word
+/// stands apart from what follows it.
+fn word_connector_after(right: &str) -> Option<(&str, &'static str)> {
+    RANGE_WORDS.iter().find_map(|word| {
+        let len = right.char_indices().nth(word.chars().count()).map(|(at, _)| at)?;
+        let rest = right.get(len..)?;
+        (right.get(..len)?.to_lowercase() == *word && rest.starts_with(char::is_whitespace)).then_some((rest, *word))
+    })
+}
+
+/// The word `od` stands right before the number at `at` of `text` (`od 5`).
+fn after_od(text: &str, at: usize) -> bool {
+    let head = text.get(..at).unwrap_or_default().trim_end_matches(char::is_whitespace);
+    head.len() >= 2
+        && head
+            .get(head.len() - 2..)
+            .is_some_and(|word| word.eq_ignore_ascii_case("od"))
+        && !head
+            .get(..head.len() - 2)
+            .unwrap_or_default()
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric)
+}
+
+/// Where the numeral that starts at `at` of `text` starts with a currency symbol and a sign
+/// joined to it (`€5`, `-5`, `€-5`, `-€5`). A dash after a letter or a digit is no sign
+/// (`A-5`).
+fn signed_start(text: &str, at: usize) -> usize {
+    let mut start = at;
+    let (mut currency, mut sign) = (false, false);
+    while let Some(c) = text.get(..start).and_then(|head| head.chars().next_back()) {
+        let head = text.get(..start - c.len_utf8()).unwrap_or_default();
+        if !currency && matches!(c, '€' | '$' | '£') {
+            currency = true;
+        } else if !sign && is_dash(c) && !head.chars().next_back().is_some_and(char::is_alphanumeric) {
+            sign = true;
+        } else {
+            break;
+        }
+        start -= c.len_utf8();
+    }
+    start
+}
+
+/// `s` starts with a digit, or with a currency symbol and a digit (`5`, `€5`).
+fn starts_with_amount(s: &str) -> bool {
+    s.strip_prefix(['€', '$', '£'])
+        .unwrap_or(s)
+        .starts_with(|c: char| c.is_ascii_digit())
 }
 
 fn is_dash(c: char) -> bool {
@@ -917,8 +1057,9 @@ const BASES: &[(&str, &str)] = &[
 
 /// Read `value` as a number without changing its meaning. `None` when the value does not start
 /// with a number (after an optional operator and currency); otherwise a key
-/// `num:{op}{value}:{unit}:{base}` (a range: `range:{op}{low}-{high}:{unit}:{base}`), followed by
-/// `:{rest}` when other words remain, so they never merge different claims:
+/// `num:{op}{value}:{unit}:{base}` (a range: `range:{op}{low}-{high}:{unit}:{base}`, each end with
+/// its sign: `-10–-5 %` → `range:-10--5:%:`), followed by `:{rest}` when other words remain, so
+/// they never merge different claims:
 /// - thousands separators: spaces, NBSP, U+202F and `'`; when both `,` and `.` occur, the last one
 ///   is the decimal point; a single `,`/`.` followed by exactly 3 digits is read by `lang`
 ///   (decimal comma for cs/sk/de/pl/fr/…, decimal point for en/…) and is ambiguous without it;
@@ -953,6 +1094,10 @@ pub fn parse_number(value: &str, lang: &str) -> Option<ValueKey> {
         };
         let mut after = after.trim_start();
         let currency = take_word(&mut after, PREFIX_CURRENCIES);
+        let high_negative = after.starts_with('-') && after.get(1..).is_some_and(starts_with_digit);
+        if high_negative {
+            after = after.get(1..).unwrap_or_default();
+        }
         if !starts_with_digit(after) || (currency.is_some() && unit.is_some() && currency != unit) {
             continue;
         }
@@ -960,7 +1105,7 @@ pub fn parse_number(value: &str, lang: &str) -> Option<ValueKey> {
             unit = currency;
         }
         let (numeral, tail) = split_numeral(after);
-        high = Some(numeral);
+        high = Some((high_negative, numeral));
         rest = tail.trim_start();
         // "od 290 do 390" says the same as "290–390".
         if connector != "-" && op == Some("from ") {
@@ -1012,9 +1157,12 @@ pub fn parse_number(value: &str, lang: &str) -> Option<ValueKey> {
     let low = if negative { format!("-{low}") } else { low };
     let op = op.unwrap_or_default();
     let base = base.unwrap_or_default();
-    let mut key = match high.map(|high| parse_numeral(high, decimal)) {
+    let mut key = match high.map(|(negative, high)| (negative, parse_numeral(high, decimal))) {
         None => format!("num:{op}{low}:{unit}:{base}"),
-        Some(Numeral::Value(high)) => format!("range:{op}{low}-{high}:{unit}:{base}"),
+        Some((negative, Numeral::Value(high))) => {
+            let sign = if negative { "-" } else { "" };
+            format!("range:{op}{low}-{sign}{high}:{unit}:{base}")
+        }
         Some(_) => return uncertain(),
     };
     if !rest.is_empty() {
@@ -1618,6 +1766,114 @@ mod tests {
         );
         // An out-of-range span is returned as it is.
         assert_eq!(extend_number_span("abc", (2, 9)), (2, 9));
+    }
+
+    #[test]
+    fn each_end_of_a_widened_range_keeps_its_sign() {
+        let extended = |text: &str, value: &str| {
+            let start = text.rfind(value).expect("value");
+            let (a, b) = extend_number_span(text, (start, start + value.len()));
+            text[a..b].to_string()
+        };
+        // The lower end found from the upper one keeps its sign: ASCII or Unicode minus, with
+        // spaces around the dash, before or after a currency.
+        assert_eq!(extended("Annual return -5–10 %", "10 %"), "-5–10 %");
+        assert_eq!(extended("Annual return −5–10 %", "10 %"), "−5–10 %");
+        assert_eq!(extended("Annual return -5 – 10 %", "10 %"), "-5 – 10 %");
+        assert_eq!(extended("(-5–10 %)", "10 %"), "-5–10 %");
+        assert_eq!(extended("Fee €-5 – €10", "€10"), "€-5 – €10");
+        assert_eq!(extended("Fee -€5 – €10", "€10"), "-€5 – €10");
+        // A negative upper end, whichever end the model returned, with or without its sign.
+        assert_eq!(extended("Return -10–-5 %", "5 %"), "-10–-5 %");
+        assert_eq!(extended("Return -10–-5 %", "-5 %"), "-10–-5 %");
+        assert_eq!(extended("Return -10–-5 %", "-10"), "-10–-5 %");
+        assert_eq!(extended("Return -10 – −5 %", "10"), "-10 – −5 %");
+        // A sign before a value that starts with its currency.
+        assert_eq!(extended("Fee -€5", "€5"), "-€5");
+        // Asymmetric spacing still reads as a range, not as a sign of the upper end.
+        assert_eq!(extended("Interest 5 –10 %", "10 %"), "5 –10 %");
+        assert_eq!(extended("Interest -5 –10 %", "10 %"), "-5 –10 %");
+        // A dash after a letter or a digit is no sign of the lower end.
+        assert_eq!(extended("Model A-5–10 %", "10 %"), "5–10 %");
+        // The keys keep both signs: a negative range is never the positive one.
+        let key = |value: &str| parse_number(value, "en");
+        assert_eq!(key("-5–10 %"), Some(ValueKey::Exact("range:-5-10:%:".to_string())));
+        assert_eq!(key("−5–10 %"), key("-5–10 %"));
+        assert_eq!(key("-5 – 10 %"), key("-5–10 %"));
+        assert_ne!(key("-5–10 %"), key("5–10 %"));
+        assert_eq!(key("-10–-5 %"), Some(ValueKey::Exact("range:-10--5:%:".to_string())));
+        assert_eq!(key("-10 – −5 %"), key("-10–-5 %"));
+        assert_ne!(key("-10–-5 %"), key("-10–5 %"));
+        assert_eq!(key("€-5 – €10"), Some(ValueKey::Exact("range:-5-10:EUR:".to_string())));
+        assert!(matches!(
+            value_key(ValueHint::Number, "-€5 – €10", "", "en", None),
+            ValueKey::Uncertain(_)
+        ));
+        assert!(matches!(
+            value_key(ValueHint::Number, "-€5", "", "en", None),
+            ValueKey::Uncertain(_)
+        ));
+    }
+
+    #[test]
+    fn a_range_written_with_a_word_is_one_value() {
+        let extended = |text: &str, value: &str| {
+            let start = text.rfind(value).expect("value");
+            let (a, b) = extend_number_span(text, (start, start + value.len()));
+            text[a..b].to_string()
+        };
+        // `to`, `až` and `do` between two numbers, from either end, with signs.
+        assert_eq!(extended("Annual return 5 to 10 %", "10 %"), "5 to 10 %");
+        assert_eq!(extended("Annual return 5 to 10 %", "5"), "5 to 10 %");
+        assert_eq!(extended("Úrok 5 až 10 %", "10 %"), "5 až 10 %");
+        assert_eq!(extended("Úrok od 5 do 10 %", "10 %"), "od 5 do 10 %");
+        assert_eq!(extended("Úrok od 5 do 10 %", "5"), "od 5 do 10 %");
+        assert_eq!(extended("Annual return -5 to 10 %", "10 %"), "-5 to 10 %");
+        assert_eq!(extended("Return -10 to -5 %", "5 %"), "-10 to -5 %");
+        // Not a range: a word after no number is an operator; a date or another unit after it.
+        assert_eq!(extended("Save up to 10 %", "10 %"), "up to 10 %");
+        assert_eq!(extended("Sleva až 10 %", "10 %"), "až 10 %");
+        assert_eq!(extended("Sleva 10 % do 31. 12.", "10 %"), "10 %");
+        assert_eq!(extended("Sleva 10 do 31. 12.", "10"), "10");
+        assert_eq!(extended("Cena 290 Kč do 10 GB", "290 Kč"), "290 Kč");
+        assert_eq!(extended("Kapacita 5 osob do 31", "5 osob"), "5 osob");
+        assert_eq!(extended("Go to 10 %", "10 %"), "10 %");
+        // `do` joins a range only after `od` (`iPhone 15 do 20 000 Kč` is up to 20 000 Kč).
+        assert_eq!(extended("iPhone 15 do 20 000 Kč", "20 000 Kč"), "do 20 000 Kč");
+        assert_eq!(extended("Tarif 2 do 10 GB", "2"), "2");
+        // The keys are those of the same range written with a dash.
+        let key = |value: &str| parse_number(value, "en");
+        assert_eq!(key("5 to 10 %"), key("5–10 %"));
+        assert_eq!(key("5 až 10 %"), key("5–10 %"));
+        assert_eq!(key("od 5 do 10 %"), key("5–10 %"));
+        assert_eq!(key("-5 to 10 %"), key("-5–10 %"));
+        assert_eq!(key("-10 to -5 %"), key("-10–-5 %"));
+    }
+
+    #[test]
+    fn a_bare_number_keeps_its_unit_and_the_positive_part_of_a_signed_range_its_sign() {
+        let extended = |text: &str, value: &str| {
+            let start = text.rfind(value).expect("value");
+            let (a, b) = extend_number_span(text, (start, start + value.len()));
+            text[a..b].to_string()
+        };
+        // A unit after the number, a currency symbol before it: `10` of `10 EUR` is no `10 USD`.
+        assert_eq!(extended("Fee 10 EUR", "10"), "10 EUR");
+        assert_eq!(extended("Fee 10 USD", "10"), "10 USD");
+        assert_eq!(extended("Poplatek 290 Kč měsíčně", "290"), "290 Kč");
+        assert_eq!(extended("Fee €10", "10"), "€10");
+        assert_eq!(extended("Fee -€10", "10"), "-€10");
+        assert_eq!(extended("Interest 5 % – 10 %", "5"), "5 % – 10 %");
+        assert_eq!(extended("Cena 290 Kč – 10 GB", "290"), "290 Kč");
+        // No unit: another word after the number.
+        assert_eq!(extended("Kapacita 5 osob", "5"), "5");
+        // Any part of a signed range the model returns gets the whole range.
+        assert_eq!(extended("Annual return -5–10 %", "5–10 %"), "-5–10 %");
+        assert_eq!(extended("Annual return -5–10 %", "5"), "-5–10 %");
+        assert_eq!(extended("Annual return -5–10 %", "10"), "-5–10 %");
+        let key = |value: &str| parse_number(value, "en");
+        assert_ne!(key("10 EUR"), key("10 USD"));
+        assert_eq!(key("€10"), key("10 EUR"));
     }
 
     #[test]
