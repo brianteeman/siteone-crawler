@@ -1326,7 +1326,8 @@ fn verify_faq_pairs(raw: &[RawFaqPair], shown: &Shown, rejected: &mut Rejected) 
 /// next block of the page's own content that starts another question, whatever element holds
 /// either — a text that is a question (`is_question`: a heading, a paragraph, a list item, a `dt`
 /// or a `summary`), or a heading, `summary` or `dt` outside the question's own section (the
-/// subsections of a heading belong to its answer unless they ask a question themselves).
+/// subsections of a heading belong to its answer unless they ask a question themselves). Text no
+/// visitor sees (`Block::hidden`) starts nothing; a question a visitor can open does.
 /// `usize::MAX` when none follows.
 fn next_question_on_page(question: &Block, blocks: &[Block]) -> usize {
     let own = section_path(question, blocks);
@@ -1337,7 +1338,7 @@ fn next_question_on_page(question: &Block, blocks: &[Block]) -> usize {
     };
     blocks
         .iter()
-        .filter(|block| block.id > question.id && block.region == Region::Main)
+        .filter(|block| block.id > question.id && block.region == Region::Main && !block.hidden)
         .find(|block| is_question(&block.text) || (block.kind == BlockKind::Heading && !in_section(block)))
         .map_or(usize::MAX, |block| block.id)
 }
@@ -2264,6 +2265,9 @@ mod tests {
             "<dl><dt>Are returns free?</dt><dd>Return labels cost EUR 15.</dd><dt>Is delivery free?</dt><dd>Delivery is free on all orders.</dd></dl>",
             "<details><summary>Are returns free?</summary><p>Return labels cost EUR 15.</p></details>\
              <details><summary>Is delivery free?</summary><p>Delivery is free on all orders.</p></details>",
+            // A question a visitor can open still starts another answer.
+            "<h2>Are returns free?</h2><p>Return labels cost EUR 15.</p>\
+             <div class=\"collapse\"><p>Is delivery free?</p><p>Delivery is free on all orders.</p></div>",
         ] {
             assert!(
                 !kept(crossing, q1, wrong),
@@ -2283,6 +2287,16 @@ mod tests {
             "How do I pay?",
             "In cash."
         ));
+        // A question no visitor sees ends no answer.
+        for hidden in [
+            "<p hidden>Is express shipping free?</p>",
+            "<h3 hidden>Is express shipping free?</h3>",
+            "<div style=\"display: none\"><p>Is express shipping free?</p></div>",
+            "<ul><li style=\"visibility:hidden\">Is express shipping free?</li></ul>",
+        ] {
+            let content = format!("<h2>Are returns free?</h2>{hidden}<p>Return labels cost EUR 15.</p>");
+            assert!(kept(&content, q1, "Return labels cost EUR 15."), "{content}");
+        }
         for (content, question, answer) in [
             (
                 "<dl><dt>Are returns free?</dt><dd>Return labels cost EUR 15.</dd></dl>",
