@@ -1163,12 +1163,17 @@ pub fn parse_number(value: &str, lang: &str) -> Option<ValueKey> {
     let mut rest = text.as_str();
 
     let mut op = take_word(&mut rest, OPERATORS);
+    let plain = rest;
     let (mut unit, negative) = take_signed_currency(&mut rest);
     if !starts_with_digit(rest) {
         return None;
     }
-    // A day and month (`1.10.`, `31. 12.`, `31.12.2026`) is a date, not a number.
-    if matches!(day_month(rest), Some((DayMonth::Sure | DayMonth::Dotted, _))) {
+    // A day and month (`1.10.`, `31. 12.`, `31.12.2026`) is a date, not a number, unless a
+    // currency, a sign or a unit makes it an amount (`€1.10.` is a price and a full stop).
+    if rest.len() == plain.len()
+        && let Some((DayMonth::Sure | DayMonth::Dotted, len)) = day_month(rest)
+        && !unit_after(rest.get(len..).unwrap_or_default())
+    {
         return uncertain();
     }
     let (low, after) = split_numeral(rest);
@@ -2070,6 +2075,38 @@ mod tests {
             );
         }
         assert_ne!(key("od 1.10. do 31.12."), key("od 1.1. do 31.12."));
+    }
+
+    #[test]
+    fn a_currency_a_sign_or_a_unit_makes_a_day_and_month_an_amount() {
+        let key = |value: &str| parse_number(value, "en");
+        // A price and a sentence-final full stop is the price.
+        for (dotted, plain) in [
+            ("€1.10.", "€1.10"),
+            ("$10.05.", "$10.05"),
+            ("£1.01.", "£1.01"),
+            ("€ 1.10.", "€1.10"),
+            ("1.10 EUR.", "1.10 EUR"),
+            ("-1.10.", "-1.10"),
+            ("od €1.10.", "od €1.10"),
+        ] {
+            assert!(
+                matches!(key(dotted), Some(ValueKey::Exact(_))),
+                "{dotted}: {:?}",
+                key(dotted)
+            );
+            assert_eq!(key(dotted), key(plain), "{dotted}");
+        }
+        // Without one, a day and month is a date: never the decimal it looks like.
+        for date in ["1.10.", "1.1.", "31. 12.", "od 1.10."] {
+            assert!(
+                matches!(key(date), Some(ValueKey::Uncertain(_))),
+                "{date}: {:?}",
+                key(date)
+            );
+        }
+        assert_ne!(key("1.10."), key("1.1."));
+        assert!(matches!(key("1.10. EUR"), Some(ValueKey::Exact(_))), "a unit after it");
     }
 
     #[test]

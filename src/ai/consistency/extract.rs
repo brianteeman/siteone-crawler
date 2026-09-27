@@ -686,6 +686,25 @@ mod tests {
     }
 
     #[test]
+    fn a_price_with_a_full_stop_is_the_same_price() {
+        for (text, value, plain) in [
+            ("Price €1.10.", "€1.10.", "€1.10"),
+            ("Price $10.05.", "$10.05.", "$10.05"),
+            ("Price £1.01.", "£1.01.", "£1.01"),
+        ] {
+            let other_text = format!("Price {plain}");
+            let other = (other_text.as_str(), plain);
+            let (occ, candidates, consistent) = one_key("en", "price", &[(text, value), other, other]);
+            assert!(
+                matches!(occ[0].value_key, ValueKey::Exact(_)),
+                "{text}: {:?}",
+                occ[0].value_key
+            );
+            assert_eq!((candidates, consistent), (0, 1), "{text}");
+        }
+    }
+
+    #[test]
     fn the_same_value_for_two_subjects_is_kept_twice() {
         let mut source = page_source();
         source.blocks = vec![block("B1", "Zákaznická linka a reklamace: 800 123 456", &[], &[2])];
