@@ -1000,7 +1000,9 @@ fn rendering(checks: &Checks, found: &mut Found) -> Counts {
     Counts::of_key_pages(checks.key_pages.len(), checks.render.checked, reason)
 }
 
-fn llm_counts(run: &AnalysisRun) -> Counts {
+/// The counts of a per-page category: a page succeeded when its answer was parsed and `assessed`
+/// holds for its verified analysis; any other attempted page failed.
+fn llm_counts(run: &AnalysisRun, assessed: impl Fn(&PageAnalysis) -> bool) -> Counts {
     if run.unavailable.is_some() {
         return Counts {
             skipped: run.selected + run.without_text.len(),
@@ -1009,15 +1011,18 @@ fn llm_counts(run: &AnalysisRun) -> Counts {
         };
     }
     let attempted = run.pages.len() + run.failed.len();
+    let succeeded = run.pages.iter().filter(|page| assessed(page)).count();
     Counts {
         attempted,
-        succeeded: run.pages.len(),
-        failed: run.failed.len(),
+        succeeded,
+        failed: attempted - succeeded,
         skipped: run.without_text.len(),
         reason: if attempted == 0 {
             "no_pages_analyzed"
-        } else {
+        } else if run.pages.is_empty() {
             "analysis_failed"
+        } else {
+            "no_verified_answers"
         },
     }
 }
@@ -1116,7 +1121,8 @@ fn answer_extractability(checks: &Checks, found: &mut Found) -> Counts {
     grouped.set_args("unanswered_questions", vec![unanswered.to_string()]);
     grouped.set_args("images_without_alt", vec![images.to_string()]);
     grouped.emit(found, Evidence::Moderate);
-    llm_counts(run)
+    // A page whose questions the crawler could not verify tells nothing about extractability.
+    llm_counts(run, PageAnalysis::has_verified_questions)
 }
 
 fn entity_clarity(checks: &Checks, found: &mut Found) -> Counts {
@@ -1151,7 +1157,7 @@ fn entity_clarity(checks: &Checks, found: &mut Found) -> Counts {
         }
     }
     grouped.emit(found, Evidence::Moderate);
-    llm_counts(run)
+    llm_counts(run, |_| true)
 }
 
 fn structured_data(checks: &Checks, found: &mut Found) -> Counts {
@@ -1512,7 +1518,14 @@ mod tests {
             page_type,
             main_topic: "Služby".to_string(),
             states_offer_early: OfferEarly::Yes,
-            questions: Vec::new(),
+            questions: vec![Question {
+                question: "Co nabízíte?".to_string(),
+                answered: Answered::Yes,
+                excerpts: vec![Excerpt {
+                    block: "B2".to_string(),
+                    text: "Nabízíme služby.".to_string(),
+                }],
+            }],
             vague_references: Vec::new(),
             improvements: Vec::new(),
             lead: None,
@@ -2140,6 +2153,54 @@ mod tests {
             (partly.status, partly.succeeded, partly.failed),
             (CheckStatus::Ok, 1, 1)
         );
+    }
+
+    #[test]
+    fn answers_the_crawler_cannot_verify_leave_extractability_not_assessed() {
+        let unverified = Question {
+            question: "Kolik to stojí?".to_string(),
+            answered: Answered::Partly,
+            excerpts: Vec::new(),
+        };
+        let mut checks = clean();
+        for page in &mut checks.analysis.pages {
+            page.questions = vec![unverified.clone()];
+        }
+        let state_of = |checks: &Checks| state(checks, CategoryId::AnswerExtractability);
+        let unassessed = state_of(&checks);
+        assert_eq!(
+            (
+                unassessed.status,
+                unassessed.attempted,
+                unassessed.succeeded,
+                unassessed.failed
+            ),
+            (CheckStatus::NotAssessed, 2, 0, 2)
+        );
+        assert_eq!(unassessed.reason, "no_verified_answers");
+        assert_eq!(
+            state(&checks, CategoryId::EntityClarity).status,
+            CheckStatus::Ok,
+            "the rest of the answer was checked"
+        );
+        for page in &mut checks.analysis.pages {
+            page.questions.clear();
+        }
+        assert_eq!(
+            state_of(&checks).status,
+            CheckStatus::NotAssessed,
+            "no questions at all"
+        );
+
+        // One page with a verified answer (or a "no") is enough for a partial assessment.
+        checks.analysis.pages[0].questions = vec![Question {
+            question: "Jak dlouho to trvá?".to_string(),
+            answered: Answered::No,
+            excerpts: Vec::new(),
+        }];
+        let partial = state_of(&checks);
+        assert_eq!((partial.succeeded, partial.failed), (1, 1));
+        assert_ne!(partial.status, CheckStatus::NotAssessed);
     }
 
     #[test]

@@ -438,6 +438,16 @@ pub struct PageAnalysis {
     pub rejected: Rejected,
 }
 
+impl PageAnalysis {
+    /// At least one question the crawler could check: a "no", or an answer with an excerpt of a
+    /// block the model was shown. Without one, the page tells nothing about answer extractability.
+    pub fn has_verified_questions(&self) -> bool {
+        self.questions
+            .iter()
+            .any(|question| question.answered == Answered::No || !question.excerpts.is_empty())
+    }
+}
+
 /// The prompt id of a block: `B` and its 1-based position on the page.
 pub fn block_ref(id: usize) -> String {
     format!("B{}", id + 1)
@@ -813,9 +823,10 @@ fn choose_blocks(
     )
 }
 
-/// Parses the model's answer. `page_type`, a non-empty `main_topic`, `states_offer_early` and a
-/// `questions` array are required; an answer that repeats the schema's placeholders is rejected,
-/// so the call is retried. Other members default to empty; block ids are kept as written.
+/// Parses the model's answer. A non-empty `page_type` and `main_topic`, `states_offer_early` (a
+/// boolean or a string) and a `questions` array of objects are required; an answer that repeats
+/// the schema's placeholders is rejected, so the call is retried. Other members default to empty;
+/// block ids are kept as written.
 pub fn parse_analysis(raw: &str) -> Result<RawAnalysis, String> {
     let value = parse_json(raw)?;
     let object = value.as_object().ok_or("the answer is not a JSON object")?;
@@ -825,6 +836,9 @@ pub fn parse_analysis(raw: &str) -> Result<RawAnalysis, String> {
         .ok_or("missing \"page_type\"")?
         .trim()
         .to_string();
+    if page_type.is_empty() {
+        return Err("\"page_type\" is empty".to_string());
+    }
     let main_topic = object
         .get("main_topic")
         .and_then(Value::as_str)
@@ -834,15 +848,19 @@ pub fn parse_analysis(raw: &str) -> Result<RawAnalysis, String> {
     if main_topic.is_empty() {
         return Err("\"main_topic\" is empty".to_string());
     }
-    let states_offer_early = object
-        .get("states_offer_early")
-        .filter(|value| !value.is_null())
-        .map(OfferEarly::parse)
-        .ok_or("missing \"states_offer_early\"")?;
-    let questions: Vec<RawQuestion> = object
+    let states_offer_early = match object.get("states_offer_early") {
+        Some(value @ (Value::Bool(_) | Value::String(_))) => OfferEarly::parse(value),
+        None | Some(Value::Null) => return Err("missing \"states_offer_early\"".to_string()),
+        Some(_) => return Err("\"states_offer_early\" is no boolean or string".to_string()),
+    };
+    let questions = object
         .get("questions")
         .and_then(Value::as_array)
-        .ok_or("missing \"questions\" array")?
+        .ok_or("missing \"questions\" array")?;
+    if !questions.iter().all(Value::is_object) {
+        return Err("a question is not a JSON object".to_string());
+    }
+    let questions: Vec<RawQuestion> = questions
         .iter()
         .map(|question| RawQuestion {
             question: text_of(question.get("question")),
@@ -1540,6 +1558,17 @@ mod tests {
             parse_analysis(r#"{"page_type":"service","main_topic":"X","states_offer_early":true,"questions":{}}"#)
                 .is_err()
         );
+        // Wrong types are no answer either.
+        for malformed in [
+            r#"{"page_type":"","main_topic":"Cannot assess this page","states_offer_early":{},"questions":[null]}"#,
+            r#"{"page_type":"","main_topic":"X","states_offer_early":true,"questions":[]}"#,
+            r#"{"page_type":"service","main_topic":"X","states_offer_early":{},"questions":[]}"#,
+            r#"{"page_type":"service","main_topic":"X","states_offer_early":[true],"questions":[]}"#,
+            r#"{"page_type":"service","main_topic":"X","states_offer_early":true,"questions":[null]}"#,
+            r#"{"page_type":"service","main_topic":"X","states_offer_early":true,"questions":["Kolik?"]}"#,
+        ] {
+            assert!(parse_analysis(malformed).is_err(), "{malformed}");
+        }
         let echo = r#"{"page_type":"homepage|product|service|category|article|faq|contact|about|pricing|legal|career|directory|other",
             "main_topic":"","states_offer_early":true,"questions":[{"question":"","answered":"yes|partly|no","blocks":["B3"]}]}"#;
         assert!(parse_analysis(echo).is_err());
