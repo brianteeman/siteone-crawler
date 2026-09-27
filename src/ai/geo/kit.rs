@@ -537,32 +537,13 @@ fn section_name(page_type: PageType) -> &'static str {
     }
 }
 
-/// An llms.txt (llmstxt.org) of the analyzed pages: the site name, the homepage's main topic, and
-/// one section per page type in the order the types first occur, each listing its pages in rank
-/// order as `- [title](url): main topic`.
-pub fn llms_txt(
-    site_name: &str,
-    analyses: &[PageAnalysis],
-    titles: &HashMap<String, String>,
-    report_language: &str,
-) -> String {
-    // The main topics are written in the report language; on a site in another language they
-    // are left out, since llms.txt goes onto the site.
-    let primary = |code: &str| {
-        code.split(['-', '_'])
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-    };
-    let topic_of = |analysis: &PageAnalysis| {
-        let lang = primary(&analysis.lang);
-        if lang.is_empty() || lang == primary(report_language) {
-            analysis.main_topic.trim().to_string()
-        } else {
-            String::new()
-        }
-    };
+/// An llms.txt (llmstxt.org) of the analyzed pages: the site name, the homepage's own meta
+/// description, and one section per page type in the order the types first occur, each listing
+/// its pages in rank order as `- [title](url): meta description`. The file goes onto the site, so
+/// it holds only the site's own text: never a model-written summary, which the crawler cannot
+/// verify.
+pub fn llms_txt(site_name: &str, analyses: &[PageAnalysis], titles: &HashMap<String, String>) -> String {
+    let topic_of = |analysis: &PageAnalysis| analysis.description.trim().to_string();
     let mut out = format!("# {}\n\n", md_escape(site_name));
     let homepage = analyses
         .iter()
@@ -862,11 +843,13 @@ pub fn readme(locale: &ReportLocale, files: &[String], withheld: Option<&str>, t
     if has(LLMS_TXT_PATH) {
         out.push_str(&format!("### {LLMS_TXT_PATH}\n\n"));
         out.push_str(if cs {
-            "Přehled analyzovaných stránek ve formátu llmstxt.org. Volitelný; umístěte ho do kořene webu \
+            "Přehled analyzovaných stránek ve formátu llmstxt.org s vlastními meta popisy stránek (žádný text \
+             napsaný AI). Volitelný; umístěte ho do kořene webu \
              (/llms.txt) (evidence: weak — žádá se o něj zřídka a žádný velký poskytovatel AI se nezavázal ho \
              používat).\n\n"
         } else {
-            "An index of the analyzed pages in the llmstxt.org format. Optional; place it at the root of your \
+            "An index of the analyzed pages in the llmstxt.org format, with the pages' own meta descriptions (no \
+             AI-written text). Optional; place it at the root of your \
              site (/llms.txt) (evidence: weak — it is rarely requested and no major AI provider has committed \
              to using it).\n\n"
         });
@@ -1042,7 +1025,7 @@ pub fn build(
     if !input.analyses.is_empty() {
         files.push(KitFile::text(
             LLMS_TXT_PATH,
-            &llms_txt(input.site_name, input.analyses, input.titles, input.locale.code()),
+            &llms_txt(input.site_name, input.analyses, input.titles),
         ));
     }
     if let Some(sitemap) = input.sitemap {
@@ -1649,13 +1632,14 @@ mod tests {
             |_| String::new(),
         );
         home.page_type = PageType::Homepage;
-        home.main_topic = "Hypotéky a úvěry pro domácnosti".to_string();
+        home.description = "Hypotéky a úvěry pro domácnosti".to_string();
         let faq = faq_analysis();
         let article = article_analysis();
         let mut second_faq = analysis_of("https://example.com/faq-2", FAQ_PAGE, |_| String::new());
         second_faq.page_type = PageType::Faq;
         let mut faq = faq;
         faq.page_type = PageType::Faq;
+        faq.description = "Odpovědi na časté dotazy k hypotékám".to_string();
         let titles: HashMap<String, String> = [
             ("https://example.com/", "Example"),
             ("https://example.com/faq", "Časté [dotazy]"),
@@ -1664,14 +1648,14 @@ mod tests {
         .into_iter()
         .map(|(url, title)| (url.to_string(), title.to_string()))
         .collect();
-        let text = llms_txt("Example", &[home, faq, article, second_faq], &titles, "cs");
+        let text = llms_txt("Example", &[home, faq, article, second_faq], &titles);
         assert_eq!(
             text,
             "# Example\n\n> Hypotéky a úvěry pro domácnosti\n\n\
              ## Home\n\n- [Example](https://example.com/): Hypotéky a úvěry pro domácnosti\n\n\
-             ## FAQ\n\n- [Časté (dotazy)](https://example.com/faq): Hypotéky\n\
-             - [Časté dotazy | Example](https://example.com/faq-2): Hypotéky\n\n\
-             ## Articles\n\n- [Jak vybrat hypotéku](https://example.com/blog/hypoteka): Hypotéky\n"
+             ## FAQ\n\n- [Časté (dotazy)](https://example.com/faq): Odpovědi na časté dotazy k hypotékám\n\
+             - [Časté dotazy | Example](https://example.com/faq-2)\n\n\
+             ## Articles\n\n- [Jak vybrat hypotéku](https://example.com/blog/hypoteka)\n"
         );
     }
 
@@ -1687,12 +1671,11 @@ mod tests {
                 id(blocks, "Tarif [Mini] stojí málo.")
             )
         });
-        analysis.main_topic = "Ceník [klikni](https://evil.example)".to_string();
+        analysis.description = "Ceník [klikni](https://evil.example)".to_string();
         let llms = llms_txt(
             "Example [s.r.o.](https://evil.example)",
             std::slice::from_ref(&analysis),
             &HashMap::new(),
-            "cs",
         );
         let live_link = |text: &str| text.replace("\\]", "").contains("](https://evil.example)");
         assert!(!live_link(&llms), "{llms}");
@@ -2161,26 +2144,45 @@ mod tests {
     }
 
     #[test]
-    fn llms_txt_leaves_out_topics_written_in_another_language_than_the_page() {
+    fn llms_txt_carries_the_pages_own_descriptions_and_no_model_text() {
+        let page = "<html lang=\"en\"><head><title>Acme Tools</title>\
+            <meta name=\"description\" content=\" Garden spades with steel blades and wooden handles. \"></head>\
+            <body><main><h1>Acme Tools</h1><p>Acme Tools sells garden spades.</p></main></body></html>";
+        let mut home = analysis_of("https://example.com/", page, |_| String::new());
+        home.page_type = PageType::Homepage;
+        home.main_topic =
+            "Acme gives every customer free lifetime replacements and a 100% satisfaction guarantee.".to_string();
+        let mut bare = analysis_of(
+            "https://example.com/about",
+            "<html lang=\"en\"><head><title>About</title></head><body><main><h1>About</h1></main></body></html>",
+            |_| String::new(),
+        );
+        bare.page_type = PageType::About;
+        bare.main_topic = "The best garden tools in the world".to_string();
+        let text = llms_txt("Acme Tools", &[home, bare], &HashMap::new());
+        assert_eq!(
+            text,
+            "# Acme Tools\n\n> Garden spades with steel blades and wooden handles.\n\n\
+             ## Home\n\n- [Acme Tools](https://example.com/): Garden spades with steel blades and wooden handles.\n\n\
+             ## About\n\n- [About](https://example.com/about)\n"
+        );
+    }
+
+    #[test]
+    fn llms_txt_leaves_out_topics_written_in_any_language() {
         let english =
             "<html lang=\"en-GB\"><head><title>Pricing</title></head><body><main><h1>Pricing</h1></main></body></html>";
         let mut home = analysis_of("https://example.com/", english, |_| String::new());
         home.page_type = PageType::Homepage;
         home.main_topic = "Nástroje pro zahradu".to_string();
         let mut pricing = analysis_of("https://example.com/pricing", english, |_| String::new());
-        pricing.main_topic = "Ceník nástrojů".to_string();
-        let pages = [home, pricing];
-        // A Czech report of an English site: the Czech topics do not belong on the site.
-        let text = llms_txt("Example", &pages, &HashMap::new(), "cs");
+        pricing.main_topic = "Garden tool prices".to_string();
+        // Neither a Czech topic on an English site nor an English one belongs on the site.
         assert_eq!(
-            text,
+            llms_txt("Example", &[home, pricing], &HashMap::new()),
             "# Example\n\n## Home\n\n- [Pricing](https://example.com/)\n\n\
              ## Services\n\n- [Pricing](https://example.com/pricing)\n"
         );
-        // The same language (`en-GB` and `en`) keeps them.
-        let text = llms_txt("Example", &pages, &HashMap::new(), "en");
-        assert!(text.contains("> Nástroje pro zahradu\n"), "{text}");
-        assert!(text.contains("(https://example.com/pricing): Ceník nástrojů"), "{text}");
     }
 
     #[test]

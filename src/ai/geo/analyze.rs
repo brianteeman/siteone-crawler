@@ -44,6 +44,8 @@ const MAX_TEXT_CHARS: usize = 300;
 /// Excerpts of the crawler's block texts are cut to this many characters.
 const EXCERPT_CHARS: usize = 400;
 const MAX_TITLE_CHARS: usize = 300;
+/// The page's own meta description is cut to this many characters.
+const MAX_DESCRIPTION_CHARS: usize = 300;
 const MAX_URL_CHARS: usize = 2_000;
 /// The entity types of review drafts; any other type is dropped.
 const ENTITY_TYPES: &[&str] = &["Product", "Service", "Event", "LocalBusiness", "Person"];
@@ -53,6 +55,7 @@ const CHROME_MARK: &str = " (site header/footer)";
 static TITLE_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse("title").unwrap());
 static HTML_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse("html[lang]").unwrap());
 static H1_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse("h1").unwrap());
+static META_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse("meta[name][content]").unwrap());
 
 /// A page chosen for analysis, as the prompt and the verification need it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -65,6 +68,9 @@ pub struct AnalyzedPage {
     pub lang: String,
     /// The text of the first H1 outside the site chrome.
     pub h1: Option<String>,
+    /// The page's own `<meta name="description">`, whitespace collapsed (at most
+    /// `MAX_DESCRIPTION_CHARS` characters); empty without one.
+    pub description: String,
 }
 
 /// What the model was shown of a page.
@@ -422,6 +428,8 @@ pub struct PageAnalysis {
     pub url: String,
     pub title: String,
     pub lang: String,
+    /// The page's own meta description (`AnalyzedPage::description`), never model text.
+    pub description: String,
     pub page_type: PageType,
     pub main_topic: String,
     pub states_offer_early: OfferEarly,
@@ -486,6 +494,16 @@ pub fn analyzed_page(url: &str, html: &str) -> AnalyzedPage {
             .filter(|h1| !in_site_chrome(*h1))
             .map(|h1| collapse(shown_text(h1)))
             .find(|text| !text.is_empty()),
+        description: document
+            .select(&META_SELECTOR)
+            .find(|meta| {
+                meta.value()
+                    .attr("name")
+                    .is_some_and(|name| name.trim().eq_ignore_ascii_case("description"))
+            })
+            .and_then(|meta| meta.value().attr("content"))
+            .map(|content| clip(&collapse(content.to_string()), MAX_DESCRIPTION_CHARS))
+            .unwrap_or_default(),
     }
 }
 
@@ -1091,6 +1109,7 @@ pub fn verify_analysis(raw: RawAnalysis, page: &AnalyzedPage, blocks: &[Block], 
         url: page.url.clone(),
         title: page.title.clone(),
         lang: page.lang.clone(),
+        description: page.description.clone(),
         page_type: PageType::parse(&raw.page_type),
         main_topic: clip(&raw.main_topic, MAX_TOPIC_CHARS),
         states_offer_early: raw.states_offer_early,
@@ -2000,9 +2019,11 @@ mod tests {
     fn the_page_facts_come_from_the_html() {
         let page = analyzed_page(
             URL,
-            "<html lang=\"cs-CZ\"><head><title> Hypotéky  | Example </title></head><body>\
+            "<html lang=\"cs-CZ\"><head><title> Hypotéky  | Example </title>\
+             <meta name=\"Description\" content=\" Hypotéky pro   domácnosti. \"></head><body>\
              <header><h1>Logo</h1></header><main><h1>Hypotéky\u{a0}2026</h1></main></body></html>",
         );
+        assert_eq!(page.description, "Hypotéky pro domácnosti.");
         assert_eq!(page.url, URL);
         assert_eq!(page.lang, "cs-CZ");
         assert_eq!(page.title, "Hypotéky | Example");

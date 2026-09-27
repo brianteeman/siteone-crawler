@@ -1515,6 +1515,7 @@ mod tests {
             url: url.to_string(),
             title: String::new(),
             lang: "cs".to_string(),
+            description: String::new(),
             page_type,
             main_topic: "Služby".to_string(),
             states_offer_early: OfferEarly::Yes,
