@@ -1155,7 +1155,8 @@ fn verify_lead(raw: &RawAnalysis, shown: &Shown, lang: &str, rejected: &mut Reje
 /// A pair is kept when its blocks are the page's own content (not the site chrome the homepage
 /// shows) that the page shows (not hidden for good, see `Block::hidden`), its question block is a
 /// heading, a `summary` or a `dt`, or ends with a question mark, and every answer block comes after
-/// it and before the next pair's question.
+/// it and before the next pair's question and the next question on the page
+/// (`next_question_on_page`), so an answer is never taken from a question the model left out.
 fn verify_faq_pairs(raw: &[RawFaqPair], shown: &Shown, rejected: &mut Rejected) -> Vec<FaqPair> {
     let mut pairs: Vec<(&Block, &RawFaqPair)> = Vec::new();
     for pair in raw {
@@ -1171,7 +1172,10 @@ fn verify_faq_pairs(raw: &[RawFaqPair], shown: &Shown, rejected: &mut Rejected) 
     pairs.sort_by_key(|(question, _)| question.id);
     let mut kept: Vec<FaqPair> = Vec::new();
     for (at, (question, pair)) in pairs.iter().enumerate() {
-        let next_question = pairs.get(at + 1).map_or(usize::MAX, |(next, _)| next.id);
+        let next_question = pairs
+            .get(at + 1)
+            .map_or(usize::MAX, |(next, _)| next.id)
+            .min(next_question_on_page(question, shown.blocks));
         let (mut answers, all_valid) = shown.resolve(&pair.answer, &mut rejected.block_ids);
         answers.sort_by_key(|answer| answer.id);
         let is_question = question.kind == BlockKind::Heading || question.text.trim_end().ends_with(['?', '？']);
@@ -1190,6 +1194,47 @@ fn verify_faq_pairs(raw: &[RawFaqPair], shown: &Shown, rejected: &mut Rejected) 
         }
     }
     kept
+}
+
+/// Where the answer of `question` ends on the page, whatever pairs the model returned: at the
+/// next block of the page's own content that starts another question — for a heading, the next
+/// heading, `summary` or `dt` outside its own section (its subsections belong to its answer); for
+/// a question in a paragraph, also the next text ending with a question mark. `usize::MAX` when
+/// none follows.
+fn next_question_on_page(question: &Block, blocks: &[Block]) -> usize {
+    let own = section_path(question, blocks);
+    let in_section = |heading: &Block| {
+        own.as_ref()
+            .zip(section_path(heading, blocks))
+            .is_some_and(|(own, other)| other.len() > own.len() && other[..own.len()] == own[..])
+    };
+    blocks
+        .iter()
+        .filter(|block| block.id > question.id && block.region == Region::Main)
+        .find(|block| {
+            if block.kind == BlockKind::Heading {
+                !in_section(block)
+            } else {
+                question.kind != BlockKind::Heading && block.text.trim_end().ends_with(['?', '？'])
+            }
+        })
+        .map_or(usize::MAX, |block| block.id)
+}
+
+/// The heading path of the content a heading heads (its parents and itself), read from the first
+/// text block after it whose path names it; `None` for a `summary` or `dt`, which head no section,
+/// and for a heading without text of its own section.
+fn section_path(heading: &Block, blocks: &[Block]) -> Option<Vec<String>> {
+    if heading.kind != BlockKind::Heading {
+        return None;
+    }
+    blocks
+        .iter()
+        .filter(|block| block.id > heading.id && block.region == heading.region && block.kind != BlockKind::Heading)
+        .find_map(|block| {
+            let at = block.heading_path.iter().rposition(|text| *text == heading.text)?;
+            Some(block.heading_path[..=at].to_vec())
+        })
 }
 
 /// The author block (at most `MAX_AUTHOR_CHARS` characters, 2–6 words) and the date block (exactly
@@ -1775,6 +1820,55 @@ mod tests {
             ),
         );
         assert!(before.faq_pairs.is_empty(), "an answer before its question");
+    }
+
+    #[test]
+    fn a_faq_answer_must_belong_to_its_own_question_on_the_page() {
+        let html = "<html lang=\"en\"><body><main><h1>Delivery and returns</h1>\
+            <h2>Are returns free?</h2><p>Return labels cost EUR 15.</p>\
+            <h2>Is delivery free?</h2><p>Delivery is free on all orders.</p>\
+            <h2>How do I pay?</h2><h3>Online</h3><p>By card.</p><h3>In a shop</h3><p>In cash.</p>\
+            <p>Do you ship abroad?</p><p>Only within the EU.</p><p>Can I collect?</p><p>Yes.</p>\
+            </main></body></html>";
+        let (page, blocks) = page_of(html);
+        let id = |text: &str| r(&blocks, text);
+        let pairs = |json: String| -> Vec<(String, Vec<String>)> {
+            analyze(&page, &blocks, &json)
+                .faq_pairs
+                .iter()
+                .map(|pair| {
+                    (
+                        pair.question.text.clone(),
+                        pair.answers.iter().map(|answer| answer.text.clone()).collect(),
+                    )
+                })
+                .collect()
+        };
+        // The model left out "Is delivery free?" and gave its answer to the question before.
+        let skipped = pairs(format!(
+            r#""faq_pairs":[{{"question":"{}","answer":["{}"]}},{{"question":"{}","answer":["{}","{}"]}}]"#,
+            id("Are returns free?"),
+            id("Delivery is free on all orders."),
+            id("How do I pay?"),
+            id("By card."),
+            id("In cash.")
+        ));
+        assert_eq!(
+            skipped,
+            [(
+                "How do I pay?".to_string(),
+                vec!["By card.".to_string(), "In cash.".to_string()]
+            )],
+            "the answers of a question's own subsections are its answer"
+        );
+        // A question in a paragraph ends where the next question starts.
+        let paragraph = pairs(format!(
+            r#""faq_pairs":[{{"question":"{}","answer":["{}","{}"]}}]"#,
+            id("Do you ship abroad?"),
+            id("Only within the EU."),
+            id("Yes.")
+        ));
+        assert!(paragraph.is_empty(), "{paragraph:?}");
     }
 
     #[test]
