@@ -635,10 +635,12 @@ pub struct AuthorMark {
 /// markup — `<meta name="author">`, and in the page's own shown content (not the site chrome,
 /// nothing hidden for good) a `rel=author` link, a link to an author page (`/author/`, `/autor/`,
 /// …), an `itemprop=author` node (its visible `itemprop=name` nodes when it has any) — or by a
-/// class that marks a name or an author (`class_mark`). A node names someone only when one text
-/// node holds all its text (`single_run`) and no text of it is marked as something else
-/// (`marks_other`: a role, a title, a date), so a box with a name and a role names no one; a node
-/// that starts with a byline label names the person after it.
+/// class that marks a name or an author (`class_mark`). A node made for the name (the markup, a
+/// name class) names the text of its inline parts joined (`Jane <strong>Smith</strong>`), unless a
+/// nested block splits it (`one_run`); an author node (`post-author`) holds a name and nothing else
+/// only when one text node holds all its text (`single_run`). No text of either may be marked as
+/// something else (`marks_other`: a role, a title, a date), so a box with a name and a role names
+/// no one; a node that starts with a byline label names the person after it.
 fn author_names(document: &Html) -> Vec<AuthorMark> {
     let meta = document
         .select(&META_SELECTOR)
@@ -665,7 +667,8 @@ fn author_names(document: &Html) -> Vec<AuthorMark> {
                             .iter()
                             .any(|path| href.contains(path))
                     }));
-            let mut nodes: Vec<(ElementRef, bool)> = Vec::new();
+            // (the node, marked by markup, its inline parts join into the name)
+            let mut nodes: Vec<(ElementRef, bool, bool)> = Vec::new();
             if el.attr("itemprop").is_some_and(names_author) {
                 // Its name nodes, when it has any: only the ones a visitor sees name someone.
                 let names: Vec<ElementRef> = element
@@ -679,25 +682,26 @@ fn author_names(document: &Html) -> Vec<AuthorMark> {
                     })
                     .collect();
                 if names.is_empty() {
-                    nodes.push((element, true));
+                    nodes.push((element, true, true));
                 } else {
                     nodes.extend(
                         names
                             .into_iter()
                             .filter(|name| !hidden_for_good(*name))
-                            .map(|name| (name, true)),
+                            .map(|name| (name, true, true)),
                     );
                 }
             } else if author_link {
-                nodes.push((element, true));
+                nodes.push((element, true, true));
             }
             let tokens: Vec<&str> = el.attr("class").unwrap_or_default().split_whitespace().collect();
             // The hCard `fn org` names an organization.
             let organization = tokens.iter().any(|token| token.eq_ignore_ascii_case("org"));
-            if !organization && tokens.iter().any(|token| class_mark(token).is_some()) {
-                nodes.push((element, false));
+            let marks: Vec<ClassMark> = tokens.iter().filter_map(|token| class_mark(token)).collect();
+            if !organization && !marks.is_empty() {
+                nodes.push((element, false, marks.contains(&ClassMark::Name)));
             }
-            nodes.into_iter().filter_map(|(node, by_markup)| {
+            nodes.into_iter().filter_map(|(node, by_markup, joins)| {
                 let marked_other = node
                     .descendants()
                     .skip(1)
@@ -706,7 +710,8 @@ fn author_names(document: &Html) -> Vec<AuthorMark> {
                 if marked_other {
                     return None;
                 }
-                single_run(node).map(|text| (text, by_markup))
+                let text = if joins { one_run(node) } else { single_run(node) };
+                text.map(|text| (text, by_markup))
             })
         });
     // A marked byline may start with its label: the name is what follows it.
@@ -788,6 +793,23 @@ fn single_run(element: ElementRef) -> Option<String> {
         }
     });
     (runs.len() == 1).then(|| runs.remove(0))
+}
+
+/// The shown text of an element whose inline parts form one run (`Jane <strong>Smith</strong>`),
+/// whitespace collapsed; `None` when a nested block element splits it (`<p>Jane Smith</p><p>Editor
+/// </p>`) or it has no text.
+fn one_run(element: ElementRef) -> Option<String> {
+    let mut parts: Vec<String> = vec![String::new()];
+    walk_shown(element, |part| match part {
+        Some(text) => parts.last_mut().map_or((), |last| last.push_str(text)),
+        None => parts.push(String::new()),
+    });
+    let mut runs = parts
+        .iter()
+        .map(|part| part.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|run| !run.is_empty());
+    let run = runs.next()?;
+    runs.next().is_none().then_some(run)
 }
 
 /// Whether a text is a question: it ends with a question mark, before any closing quotes or
@@ -2408,6 +2430,73 @@ mod tests {
             ),
         ] {
             assert_eq!(name(byline_html, cited).as_deref(), expected, "{byline_html}");
+        }
+    }
+
+    #[test]
+    fn a_marked_name_split_by_inline_formatting_is_one_name() {
+        let name = |byline_html: &str, cited: &str| -> Option<String> {
+            let html = format!(
+                "<html lang=\"en\"><body><main><article><h1>How to sharpen a spade</h1>{byline_html}\
+                 <p>Wear gloves and file the edge at a shallow angle.</p></article></main></body></html>"
+            );
+            let (page, blocks) = page_of(&html);
+            let id = blocks
+                .iter()
+                .find(|block| block.region == Region::Main && block.text == cited)
+                .map(|block| block_ref(block.id))
+                .unwrap_or_else(|| panic!("no block {cited:?} in {:?}", texts_of(&blocks)));
+            analyze(&page, &blocks, &format!(r#""byline":{{"author":"{id}","date":""}}"#))
+                .byline
+                .author_name
+        };
+        for (byline_html, cited, expected) in [
+            (
+                "<p><a rel=\"author\" href=\"/author/jane/\">Jane <strong>Smith</strong></a></p>",
+                "Jane Smith",
+                "Jane Smith",
+            ),
+            (
+                "<div itemprop=\"author\" itemscope itemtype=\"https://schema.org/Person\">\
+                 <span itemprop=\"name\">Jane <strong>Smith</strong></span></div>",
+                "Jane Smith",
+                "Jane Smith",
+            ),
+            (
+                "<p class=\"author-name\"><span>Jane</span> Smith</p>",
+                "Jane Smith",
+                "Jane Smith",
+            ),
+            (
+                "<p><span class=\"author__name\">Jane <em>Smith</em></span>, Editor</p>",
+                "Jane Smith, Editor",
+                "Jane Smith",
+            ),
+            (
+                "<p>Text: <a href=\"/autor/jan/\" class=\"fn\"><b>Jan</b> <i>Novák</i></a></p>",
+                "Text: Jan Novák",
+                "Jan Novák",
+            ),
+        ] {
+            assert_eq!(name(byline_html, cited).as_deref(), Some(expected), "{byline_html}");
+        }
+        // Inline formatting joins a name only in a node made for the name: an author node that
+        // holds a name and more stays unconfirmed, and so does a name node split by a block.
+        for (byline_html, cited) in [
+            (
+                "<p class=\"author\">Jane Smith <span>Editorial Director</span></p>",
+                "Jane Smith Editorial Director",
+            ),
+            (
+                "<p class=\"post-author\"><b>Jane Smith</b> <i>Garden Writer</i></p>",
+                "Jane Smith Garden Writer",
+            ),
+            (
+                "<div class=\"author-name\"><p>Jane Smith</p><p>Editorial Director</p></div>",
+                "Editorial Director",
+            ),
+        ] {
+            assert_eq!(name(byline_html, cited), None, "{byline_html}");
         }
     }
 
