@@ -659,6 +659,11 @@ impl Walker {
     }
 }
 
+/// True for an element whose text flows into the surrounding block (`a`, `span`, `strong`, …).
+pub(crate) fn is_inline(tag: &str) -> bool {
+    INLINE.contains(&tag)
+}
+
 /// True when the element hides its content until the visitor opens it (or for good).
 fn hides(element: ElementRef) -> bool {
     let el = element.value();

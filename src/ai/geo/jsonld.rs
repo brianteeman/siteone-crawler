@@ -5,7 +5,8 @@
 // errors and the key values that are not visible on the page; Microdata and RDFa presence), and
 // builds the kit's JSON-LD with typed templates from the crawler's own copies of verified page
 // blocks — never from values written by a model: WebSite, Organization (a logo, contacts and
-// social profiles only from the site chrome, `sameAs` only for profiles named after the brand),
+// social profiles only from the site chrome, `sameAs` only for profiles named after the brand and
+// not credited to someone else),
 // BreadcrumbList from crawled ancestors, FAQPage from visible questions with their answers, and
 // Article / BlogPosting from the H1 and a verified byline. Install snippets escape `<`, `>` and
 // `&`, so no value can close the script element.
@@ -13,13 +14,14 @@
 use std::collections::HashMap;
 
 use chrono::NaiveDate;
+use ego_tree::iter::Edge;
 use once_cell::sync::Lazy;
-use scraper::{ElementRef, Html, Selector};
+use scraper::{ElementRef, Html, Node, Selector};
 use serde_json::{Map, Value, json};
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;
 
-use crate::ai::blocks::{Block, Region, hidden_for_good};
+use crate::ai::blocks::{Block, Region, hidden_for_good, is_inline};
 use crate::ai::geo::analyze::{DateRole, shown_text};
 use crate::ai::geo::controls::in_site_chrome;
 use crate::ai::geo::keys::normalized_url;
@@ -55,6 +57,53 @@ const AUTHOR_LABELS: &[&str] = &[
     "autorka",
     "napsal",
     "napsala",
+];
+
+/// Words that credit someone else in the text around a link (EN, CS, without diacritics): a web
+/// agency, a designer, a platform, a partner or a sponsor. A profile named there is theirs, even
+/// when its handle holds the brand's name.
+const CREDIT_MARKERS: &[&[&str]] = &[
+    &["built", "by"],
+    &["made", "by"],
+    &["designed", "by"],
+    &["developed", "by"],
+    &["created", "by"],
+    &["website", "by"],
+    &["web", "by"],
+    &["site", "by"],
+    &["powered", "by"],
+    &["hosted", "by"],
+    &["coded", "by"],
+    &["crafted", "by"],
+    &["produced", "by"],
+    &["maintained", "by"],
+    &["supported", "by"],
+    &["sponsored", "by"],
+    &["design"],
+    &["webdesign"],
+    &["agency"],
+    &["partner"],
+    &["partners"],
+    &["sponsor"],
+    &["sponsors"],
+    &["realizace"],
+    &["realizoval"],
+    &["realizovala"],
+    &["tvorba", "webu"],
+    &["tvorba", "stranek"],
+    &["tvorba", "webovych", "stranek"],
+    &["vytvoril"],
+    &["vytvorila"],
+    &["vytvorilo"],
+    &["naprogramoval"],
+    &["naprogramovala"],
+    &["agentura"],
+    &["agentury"],
+    &["partneri"],
+    &["sponzor"],
+    &["sponzori"],
+    &["grafika"],
+    &["dodavatel"],
 ];
 
 /// Separators after which a byline continues with a date or a reading time.
@@ -383,9 +432,10 @@ pub fn website(site_name: &str, origin: &str) -> Value {
 /// the site header, or linking to the homepage, whose `src`, `alt` or `class` says "logo" — not a
 /// partner's or a payment logo in the footer), a `contactPoint` from the first `tel:` and
 /// `mailto:` links whose values the chrome blocks show, and `sameAs` with the social profiles
-/// named after the brand (the site name or the domain's second-level label). The other social
-/// profiles of the chrome — a founder's LinkedIn, a profile under another name — are returned as
-/// possible profiles for the owner to add by hand.
+/// named after the brand (the site name or the domain's second-level label) that the text around
+/// them does not credit to someone else (`credits_someone_else`). The other social profiles of the
+/// chrome — a founder's LinkedIn, a profile under another name, the web agency's account — are
+/// returned as possible profiles for the owner to add by hand.
 pub fn organization(
     site_name: &str,
     origin: &str,
@@ -468,7 +518,10 @@ pub fn organization(
         url.set_query(None);
         url.set_fragment(None);
         let url = url.to_string();
-        if profile.organization && tokens.iter().any(|token| names_brand(&profile.handle, token)) {
+        if profile.organization
+            && tokens.iter().any(|token| names_brand(&profile.handle, token))
+            && !credits_someone_else(&link_context(*link), site_name)
+        {
             push_unique(&mut same_as, &url);
             possible.retain(|known| *known != url);
         } else if !same_as.contains(&url) {
@@ -479,6 +532,73 @@ pub fn organization(
         entity.insert("sameAs".to_string(), json!(same_as));
     }
     (Value::Object(entity), possible)
+}
+
+/// The text around a link as its block reads it: the link's `title` and `aria-label`, and the text
+/// of its nearest ancestor that is no inline element (the link's own text included), without the
+/// text of the blocks nested in that ancestor. The walk is iterative.
+fn link_context(link: ElementRef) -> String {
+    let mut text: String = ["title", "aria-label"]
+        .iter()
+        .filter_map(|attr| link.value().attr(attr))
+        .map(|value| format!("{value} "))
+        .collect();
+    let root = link
+        .ancestors()
+        .filter_map(ElementRef::wrap)
+        .find(|element| !is_inline(element.value().name()))
+        .unwrap_or(link);
+    let mut nested = 0usize;
+    for edge in root.traverse() {
+        match edge {
+            Edge::Open(node) if node.id() != root.id() => {
+                if nested > 0 {
+                    nested += usize::from(node.value().is_element());
+                    continue;
+                }
+                match node.value() {
+                    Node::Text(part) => text.push_str(part),
+                    Node::Element(element) if !is_inline(element.name()) => {
+                        nested = 1;
+                        text.push(' ');
+                    }
+                    _ => {}
+                }
+            }
+            Edge::Close(node) if nested > 0 && node.value().is_element() => nested -= 1,
+            _ => {}
+        }
+    }
+    text
+}
+
+/// Whether the text around a link credits someone else (`CREDIT_MARKERS`, compared as words
+/// without diacritics), once the site's own name is taken out of it ("Aster Design on Instagram"
+/// names the brand, not a designer).
+fn credits_someone_else(context: &str, site_name: &str) -> bool {
+    let words = |text: &str| -> Vec<String> {
+        text.split(|c: char| !c.is_alphanumeric())
+            .map(compact)
+            .filter(|word| !word.is_empty())
+            .collect()
+    };
+    let mut context = words(context);
+    let brand = words(site_name);
+    if !brand.is_empty() {
+        let mut at = 0;
+        while at + brand.len() <= context.len() {
+            if context[at..at + brand.len()] == brand[..] {
+                context.drain(at..at + brand.len());
+            } else {
+                at += 1;
+            }
+        }
+    }
+    CREDIT_MARKERS.iter().any(|marker| {
+        context
+            .windows(marker.len())
+            .any(|window| window.iter().zip(marker.iter()).all(|(word, known)| word == known))
+    })
 }
 
 /// Inside the site header: a `header` outside `article` and `main`, or `[role=banner]`.
@@ -1166,6 +1286,60 @@ mod tests {
                 "https://www.facebook.com/astercz"
             ]
         );
+    }
+
+    #[test]
+    fn a_profile_credited_to_someone_else_is_never_the_brand() {
+        let base = url::Url::parse("https://aster.example/").unwrap();
+        let profiles = |site_name: &str, footer: &str| -> (Value, Vec<String>) {
+            let html = format!("<body><main><h1>Aster tools</h1></main><footer>{footer}</footer></body>");
+            let (organization, possible) = organization(
+                site_name,
+                "https://aster.example",
+                &Html::parse_document(&html),
+                &[],
+                &base,
+            );
+            (organization.get("sameAs").cloned().unwrap_or(Value::Null), possible)
+        };
+        for credit in [
+            r#"<p>Website built by <a href="https://github.com/aster-web-agency">Blaster, an independent web agency</a>.</p>"#,
+            r#"<p>Built by <a href="https://github.com/aster-web-agency">our partners</a></p>"#,
+            r#"<p>Design: <a href="https://www.instagram.com/aster.studio/">Aster Studio</a></p>"#,
+            r#"<ul><li>Realizace: <a href="https://www.facebook.com/aster.web">Aster Web s.r.o.</a></li></ul>"#,
+            r#"<div>Tvorba webu <a href="https://www.linkedin.com/company/aster-digital/">Aster Digital</a></div>"#,
+            r#"<p><small>Powered by <a href="https://github.com/aster-cms">Aster CMS</a></small></p>"#,
+            r#"<p><a href="https://x.com/aster_design">Webdesign: Aster Design</a></p>"#,
+            r#"<p><a href="https://github.com/aster-web-agency" title="Web design by Aster Web Agency"><svg></svg></a></p>"#,
+            r#"<p><a href="https://github.com/aster-web-agency" aria-label="Made by Aster Web Agency"><svg></svg></a></p>"#,
+        ] {
+            let footer = format!(r#"{credit}<a href="https://github.com/aster">Aster on GitHub</a>"#);
+            let (same_as, possible) = profiles("Aster", &footer);
+            assert_eq!(same_as, json!(["https://github.com/aster"]), "{credit}");
+            assert_eq!(
+                possible.len(),
+                1,
+                "the credited profile is left for review: {credit} {possible:?}"
+            );
+        }
+        // The site's own profiles: icon links in a list, a follow link, and a brand whose name
+        // holds a word of a credit ("Aster Design").
+        let (same_as, possible) = profiles(
+            "Aster",
+            r#"<ul class="social"><li><a href="https://www.facebook.com/aster"><svg></svg></a></li>
+               <li><a href="https://www.instagram.com/aster/">Follow us on Instagram</a></li></ul>
+               <p>© 2026 Aster. Website by <a href="https://studio.example/">Studio</a>.</p>"#,
+        );
+        assert_eq!(
+            same_as,
+            json!(["https://www.facebook.com/aster", "https://www.instagram.com/aster/"])
+        );
+        assert!(possible.is_empty(), "{possible:?}");
+        let (same_as, _) = profiles(
+            "Aster Design",
+            r#"<a href="https://www.instagram.com/asterdesign/">Aster Design on Instagram</a>"#,
+        );
+        assert_eq!(same_as, json!(["https://www.instagram.com/asterdesign/"]));
     }
 
     #[test]

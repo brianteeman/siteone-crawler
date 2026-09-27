@@ -109,7 +109,8 @@ pub struct KitInput<'a> {
     pub locale: &'a ReportLocale,
     pub site_name: &'a str,
     pub markup: &'a [KitEntry],
-    /// Social profiles of the site chrome not named after the brand (for the manifest).
+    /// Social profiles of the site chrome not named after the brand or credited to someone else
+    /// (for the manifest).
     pub possible_profiles: &'a [String],
     /// The verified analyses, in rank order.
     pub analyses: &'a [PageAnalysis],
@@ -965,7 +966,7 @@ fn manifest(markup: &[KitEntry], possible_profiles: &[String], today: &str) -> S
         ],
         "entries": entries,
         "possibleProfiles": possible_profiles,
-        "possibleProfilesNote": "Social profiles in the site header or footer that are not named after the brand: add them to sameAs by hand if they are yours.",
+        "possibleProfilesNote": "Social profiles in the site header or footer that are not named after the brand, or that the text around them credits to someone else (a web agency, a partner): add them to sameAs by hand if they are yours.",
     });
     format!("{}\n", serde_json::to_string_pretty(&manifest).unwrap_or_default())
 }
