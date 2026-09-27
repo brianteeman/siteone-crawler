@@ -1185,7 +1185,7 @@ What it checks:
 **Cost.** One call per analyzed page, at most `--ai-max-pages` (default `100`) with the homepage always included, and no site-level call. A page takes about 2–8 K input and 0.5–1.6 K output tokens; a page cut at the output limit is asked again once with fewer blocks. `--ai-dry-run` prints the calls and a token (and cost) estimate without any API call. The deterministic checks run even without a usable AI configuration — `--ai-geo` alone needs no provider, endpoint, model or key; the per-page categories then read "Not assessed".
 
 - `--ai-geo` is its own pipeline (not an `--ai-actions` value): used alone it runs only the readiness check; combine it with explicit `--ai-actions=...`, `--ai-report`, `--ai-elaborate`, `--ai-profile` or `--ai-consistency` to run those too. With `--ai-consistency`, the "Entity clarity" card links the fact-consistency report of the same run.
-- `--ai-report-language` sets the language of the model's prose; the fixed texts are built in for English and Czech. The lead drafts stay in the page's language, and `llms.txt` leaves out the topics of pages whose `lang` differs from the report language.
+- `--ai-report-language` sets the language of the model's prose; the fixed texts are built in for English and Czech. The lead drafts and the meta descriptions in `llms.txt` stay in the page's language, as the page writes them.
 
 #### AI executive summary (`summary` action)
 
