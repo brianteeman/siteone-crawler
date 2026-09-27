@@ -9,7 +9,7 @@
 // Budgets are bytes of the final escaped user message (`source_message`), so what is measured is
 // exactly what is sent.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 
 use crate::ai::blocks::{Block, BlockKind, Region};
 use crate::ai::grounding::fact_signals;
@@ -25,13 +25,6 @@ pub const MAX_CHROME_LINES: usize = 300;
 /// a common line — can yield its fact.
 pub const MAX_LINES_PER_CHROME_SOURCE: usize = 5;
 
-/// The labels of single pages that hold the same place among the labels of one header/footer text
-/// on their pages (the first, the second, …) are the context of each page (a breadcrumb or a title
-/// right before the line, another on every page), not subjects, when there are at least this many
-/// of them and together they cover at least half of the pages that show the text (see
-/// `ChromeLines`).
-const MIN_PAGE_CONTEXT_LABELS: usize = 3;
-
 /// A header/footer line is fact-bearing only within these lengths (in characters).
 const MIN_LINE_CHARS: usize = 4;
 const MAX_LINE_CHARS: usize = 300;
@@ -44,12 +37,11 @@ const MAX_TITLE_CHARS: usize = 200;
 const MIN_BLOCK_BYTES: usize = 1024;
 
 /// The unique fact-bearing header/footer lines: `(text, label, pages)`, where the label is the
-/// nearest preceding line without a fact and `pages` is the exact, sorted set of page indexes
-/// that show the text under that label. A line is its text and its label, so one number for Sales
-/// and for Support is two lines, each with its own pages, whatever the order of the sections or
-/// the number of labels. Only labels of single pages that are the context of each page
-/// (`MIN_PAGE_CONTEXT_LABELS`: a breadcrumb before the line, another on every page) become one
-/// line without a label, with their pages. Ordered by the number of pages (descending), then by
+/// nearest preceding line without a fact in the same chrome landmark (`Block::landmark`: a
+/// breadcrumb in `nav` never labels a line of the footer) and `pages` is the exact, sorted set of
+/// page indexes that show the text under that label. A line is its text and its label, so one
+/// number for Sales and for Support is two lines, each with its own pages, whatever the order of
+/// the sections or the number of labels. Ordered by the number of pages (descending), then by
 /// text and label. `excluded` counts the lines left out by the cap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChromeLines {
@@ -219,26 +211,23 @@ fn h1_index(blocks: &[&Block]) -> Option<usize> {
 /// from a kept line only in at most two digits or letters (a changed or transposed digit — the
 /// variants most worth checking); the rest is counted in `excluded`.
 pub fn chrome_lines(pages_blocks: &[(usize, Vec<Block>)]) -> ChromeLines {
-    // Per text, per label, the pages that show the text under that label, and the place of the
-    // label among the text's labels on the first of those pages.
-    let mut entries: HashMap<String, HashMap<String, (BTreeSet<usize>, usize)>> = HashMap::new();
+    // Per text, per label, the pages that show the text under that label.
+    let mut entries: HashMap<String, HashMap<String, BTreeSet<usize>>> = HashMap::new();
     for (page, blocks) in pages_blocks {
-        let mut label = String::new();
-        let mut labels_of: HashMap<&str, Vec<String>> = HashMap::new();
+        let (mut label, mut landmark) = (String::new(), 0);
         for block in blocks.iter().filter(|b| b.region == Region::Chrome) {
+            // A label names the lines of its own landmark only.
+            if block.landmark != landmark {
+                label.clear();
+                landmark = block.landmark;
+            }
             let text = block.text.trim();
             if is_fact_line(text) {
-                let seen = labels_of.entry(text).or_default();
-                let place = seen.iter().position(|l| *l == label).unwrap_or_else(|| {
-                    seen.push(label.clone());
-                    seen.len() - 1
-                });
                 entries
                     .entry(text.to_string())
                     .or_default()
                     .entry(label.clone())
-                    .or_insert_with(|| (BTreeSet::new(), place))
-                    .0
+                    .or_default()
                     .insert(*page);
             } else if !text.is_empty() {
                 label = cap_chars(text, MAX_LABEL_CHARS);
@@ -249,7 +238,7 @@ pub fn chrome_lines(pages_blocks: &[(usize, Vec<Block>)]) -> ChromeLines {
     let mut lines: Vec<(String, String, Vec<usize>)> = entries
         .into_iter()
         .flat_map(|(text, labels)| {
-            label_lines(labels)
+            labels
                 .into_iter()
                 .map(move |(label, pages)| (text.clone(), label, pages.into_iter().collect()))
         })
@@ -287,42 +276,6 @@ pub fn chrome_lines(pages_blocks: &[(usize, Vec<Block>)]) -> ChromeLines {
         excluded: total - lines.len(),
         lines,
     }
-}
-
-/// The labels of one header/footer text with their pages and places, as its lines (see
-/// `ChromeLines`): each label on its own, except labels of single pages that are the context of
-/// each page (`MIN_PAGE_CONTEXT_LABELS`), which join the line without a label.
-fn label_lines(labels: HashMap<String, (BTreeSet<usize>, usize)>) -> Vec<(String, BTreeSet<usize>)> {
-    let shown = labels
-        .values()
-        .flat_map(|(pages, _)| pages)
-        .collect::<BTreeSet<_>>()
-        .len();
-    let mut lines: Vec<(String, BTreeSet<usize>)> = Vec::new();
-    let mut single_by_place: BTreeMap<usize, Vec<(String, BTreeSet<usize>)>> = BTreeMap::new();
-    for (label, (pages, place)) in labels {
-        if pages.len() == 1 && !label.is_empty() {
-            single_by_place.entry(place).or_default().push((label, pages));
-        } else {
-            lines.push((label, pages));
-        }
-    }
-    let mut context: BTreeSet<usize> = BTreeSet::new();
-    for single in single_by_place.into_values() {
-        let pages: BTreeSet<usize> = single.iter().flat_map(|(_, pages)| pages.iter().copied()).collect();
-        if single.len() >= MIN_PAGE_CONTEXT_LABELS && pages.len() * 2 >= shown {
-            context.extend(pages);
-        } else {
-            lines.extend(single);
-        }
-    }
-    if !context.is_empty() {
-        match lines.iter_mut().find(|(label, _)| label.is_empty()) {
-            Some((_, pages)) => pages.extend(context),
-            None => lines.push((String::new(), context)),
-        }
-    }
-    lines
 }
 
 fn is_fact_line(text: &str) -> bool {
@@ -619,6 +572,7 @@ mod tests {
             text: text.to_string(),
             collapsed: false,
             hidden: false,
+            landmark: 0,
         }
     }
 
@@ -825,8 +779,8 @@ mod tests {
     }
 
     #[test]
-    fn a_label_of_every_single_page_does_not_split_a_line_per_page() {
-        // A breadcrumb right before the footer's first line: another label on every page.
+    fn a_breadcrumb_in_another_landmark_never_labels_a_footer_line() {
+        // A breadcrumb in `nav` right before the footer's first line: another text on every page.
         let pages: Vec<(usize, Vec<Block>)> = (0..40)
             .map(|i| {
                 (
@@ -838,18 +792,20 @@ mod tests {
                 )
             })
             .collect();
-        let lines = chrome_lines(&pages);
         let all: Vec<usize> = (0..40).collect();
-        assert_eq!(
-            lines.lines,
-            vec![
-                ("Tel. 800 123 456".to_string(), String::new(), all.clone()),
-                ("Tel. 800 123 456".to_string(), "Support".to_string(), all.clone()),
-            ],
-            "the labels of single pages become one line without a label; Support keeps its own"
-        );
-        // A department of a single page, with the same number after the breadcrumb, keeps its
-        // label: the breadcrumbs hold the first place among the number's labels, it the third.
+        let expected = |text: &str, label: &str, pages: &[usize]| (text.to_string(), label.to_string(), pages.to_vec());
+        for count in [40, 2] {
+            let few: Vec<(usize, Vec<Block>)> = pages.iter().take(count).cloned().collect();
+            assert_eq!(
+                chrome_lines(&few).lines,
+                vec![
+                    expected("Tel. 800 123 456", "", &all[..count]),
+                    expected("Tel. 800 123 456", "Support", &all[..count]),
+                ],
+                "{count} pages: the footer's first line has no label, Support keeps its own"
+            );
+        }
+        // A department of a single page, with the same number, keeps its label.
         let (a, b) = ("Tel. 800 123 456", "Tel. 800 123 465");
         let mut with_department: Vec<(usize, Vec<Block>)> = pages.clone();
         let department = |i: usize, phone: &str| {
@@ -860,21 +816,33 @@ mod tests {
         };
         with_department[0] = (0, department(0, a));
         with_department[39] = (39, department(39, b));
-        let lines = chrome_lines(&with_department);
         assert_eq!(
-            lines.lines,
+            chrome_lines(&with_department).lines,
             vec![
-                (a.to_string(), String::new(), all.clone()),
-                (a.to_string(), "Support".to_string(), all.clone()),
-                (a.to_string(), "Complaints".to_string(), vec![0]),
-                (b.to_string(), "Complaints".to_string(), vec![39]),
+                expected(a, "", &all),
+                expected(a, "Support", &all),
+                expected(a, "Complaints", &[0]),
+                expected(b, "Complaints", &[39]),
             ]
         );
-        // Two labels of single pages are no evidence of page context: they stay labels.
-        let few: Vec<(usize, Vec<Block>)> = pages.into_iter().take(2).collect();
-        let lines = chrome_lines(&few);
-        assert_eq!(lines.lines.len(), 3);
-        assert!(lines.lines.iter().all(|(_, label, _)| !label.is_empty()));
+        // Text of the page inside the footer itself does label its lines: a line per page, as
+        // the page shows it.
+        let own: Vec<(usize, Vec<Block>)> = (0..3)
+            .map(|i| {
+                (
+                    i,
+                    blocks_from_html(&format!("<body><footer><p>Article {i}</p><p>{a}</p></footer></body>")),
+                )
+            })
+            .collect();
+        assert_eq!(
+            chrome_lines(&own).lines,
+            vec![
+                expected(a, "Article 0", &[0]),
+                expected(a, "Article 1", &[1]),
+                expected(a, "Article 2", &[2]),
+            ]
+        );
     }
 
     #[test]
@@ -914,6 +882,41 @@ mod tests {
             assert_eq!(lines.lines, expected, "{count} departments");
             assert_eq!(lines.excluded, 0);
         }
+    }
+
+    #[test]
+    fn a_department_box_of_one_page_keeps_its_label_whatever_the_other_pages_show() {
+        let (a, b) = ("800 123 456", "800 123 465");
+        let expected = |text: &str, label: &str, pages: &[usize]| (text.to_string(), label.to_string(), pages.to_vec());
+        // Four pages, each with one department box: Support, Sales and Billing show A, and Support
+        // on the last page B.
+        let pages = vec![
+            (0, department_footer(&[("Support", a)])),
+            (1, department_footer(&[("Sales", a)])),
+            (2, department_footer(&[("Billing", a)])),
+            (3, department_footer(&[("Support", b)])),
+        ];
+        assert_eq!(
+            chrome_lines(&pages).lines,
+            vec![
+                expected(a, "Billing", &[2]),
+                expected(a, "Sales", &[1]),
+                expected(a, "Support", &[0]),
+                expected(b, "Support", &[3]),
+            ]
+        );
+        // Branches: a box of its own branch on every page, one branch with another number.
+        let branches = ["Brno", "Ostrava", "Plzeň", "Praha", "Zlín"];
+        let mut pages: Vec<(usize, Vec<Block>)> = branches
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (i, department_footer(&[(name, a)])))
+            .collect();
+        pages.push((5, department_footer(&[("Praha", b)])));
+        let lines = chrome_lines(&pages).lines;
+        assert_eq!(lines.len(), 6, "{lines:?}");
+        assert!(lines.contains(&expected(a, "Praha", &[3])), "{lines:?}");
+        assert!(lines.contains(&expected(b, "Praha", &[5])), "{lines:?}");
     }
 
     #[test]

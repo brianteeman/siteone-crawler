@@ -64,6 +64,12 @@ pub struct Block {
     /// not show this text until a script does.
     #[serde(skip_serializing)]
     pub hidden: bool,
+    /// For a Chrome block, the outermost chrome landmark it is in (a `header`, `footer`, `nav`,
+    /// `aside`, `[role=banner]` or `[role=contentinfo]`), numbered from 1 in document order, so
+    /// that text of one landmark (a breadcrumb in `nav`) can be told from another's (the site
+    /// footer); 0 for a Main block.
+    #[serde(skip_serializing)]
+    pub landmark: usize,
 }
 
 /// Elements whose content is never visible text; `head` holds no body content.
@@ -223,6 +229,8 @@ struct Walker {
     asides: usize,
     main_headings: Vec<(usize, String)>,
     chrome_headings: Vec<(usize, String)>,
+    /// Outermost chrome landmarks opened so far: the number of the current one.
+    landmarks: usize,
 }
 
 impl Walker {
@@ -365,6 +373,9 @@ impl Walker {
             }
         }
 
+        if frame.chrome && self.chrome == 0 {
+            self.landmarks += 1;
+        }
         self.chrome += usize::from(frame.chrome);
         self.content += usize::from(frame.content);
         self.collapsed += usize::from(frame.collapsed);
@@ -649,6 +660,7 @@ impl Walker {
             text,
             collapsed: self.collapsed > 0,
             hidden: self.hidden > 0,
+            landmark: if self.chrome > 0 { self.landmarks } else { 0 },
         });
     }
 
@@ -789,6 +801,27 @@ mod tests {
 <svg><text>Svg 996</text></svg>
 <iframe src="x">Frame 995</iframe>
 </body></html>"#;
+
+    #[test]
+    fn each_chrome_block_names_its_outermost_landmark() {
+        let blocks = blocks_from_html(
+            "<body><header><p>Logo</p><nav><p>Menu</p></nav><p>Tel. 800 123 456</p></header>\
+             <nav aria-label=\"breadcrumb\"><p>Home / Article</p></nav>\
+             <main><p>Content</p><aside><p>Related</p></aside></main>\
+             <div role=\"contentinfo\"><p>Footer text</p></div><footer><p>Copyright</p></footer></body>",
+        );
+        let landmark = |text: &str| find(&blocks, text).landmark;
+        assert_eq!(
+            [landmark("Logo"), landmark("Menu"), landmark("Tel. 800 123 456")],
+            [1, 1, 1],
+            "a nav inside the header is the header's"
+        );
+        assert_eq!(landmark("Home / Article"), 2);
+        assert_eq!(landmark("Content"), 0, "the page's own content");
+        assert_eq!(landmark("Related"), 3);
+        assert_eq!(landmark("Footer text"), 4);
+        assert_eq!(landmark("Copyright"), 5);
+    }
 
     #[test]
     fn site_chrome_and_content_regions() {
@@ -1229,6 +1262,7 @@ mod tests {
             text: "Tarif: Basic | Cena měsíčně: 290 Kč".to_string(),
             collapsed: false,
             hidden: false,
+            landmark: 0,
         };
         assert_eq!(
             render_block(&block, "B12"),

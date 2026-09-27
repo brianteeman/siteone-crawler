@@ -937,6 +937,7 @@ mod tests {
             text: text.to_string(),
             collapsed: false,
             hidden: false,
+            landmark: 0,
         }
     }
 

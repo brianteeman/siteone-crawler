@@ -2279,6 +2279,7 @@ mod tests {
             text: "Jan Novák".to_string(),
             collapsed: false,
             hidden: false,
+            landmark: 0,
         };
         article.byline = Byline {
             author: Some(block.clone()),
