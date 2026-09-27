@@ -53,7 +53,7 @@ use self::doc::{
 use self::extract::{CAT_EXTRACT, build_extract_request, parse_facts, verify_facts};
 use self::judge::{
     CAT_REVIEW, Candidate, CandidateValue, ReviewResult, ValidatedResult, allocate, build_review_request, cohorts,
-    covered_values, groups_message, key_outcome, pack_batches, parse_reviews, render_group_within,
+    comparisons_done, groups_message, key_outcome, pack_batches, parse_reviews, render_group_within,
     review_call_max_tokens, review_groups_per_call, split_keys, uncovered_values, validate_with_date,
     with_values_first,
 };
@@ -533,9 +533,10 @@ pub async fn run(options: &CoreOptions, status: &Arc<Mutex<Status>>, output: &Ar
         keys: keys.len(),
         candidates: candidate_count,
         reviewed,
-        comparisons_done: review_results
+        comparisons_done: to_review
             .iter()
-            .map(|results| covered_values(results).len().saturating_sub(1))
+            .zip(&review_results)
+            .map(|(c, results)| comparisons_done(c, results))
             .sum(),
         reviews_capped: over_cap.len(),
         reviews_partial: to_review
@@ -1001,8 +1002,9 @@ struct Ask {
 /// One review batch. An answer cut at the output limit splits the batch in half and asks again
 /// for each half (at most `MAX_SPLIT_DEPTH` times). Once, a call asks again for what a usable
 /// answer left out: the groups it did not answer (live: a broken quote ended the JSON early), and
-/// the values of a group that none of its results judged — that group shown again with those
-/// values first. Each call asks for `review_call_max_tokens` of its groups. Returns the valid
+/// the values of a group that its results did not compare with the rest of the group (none judged
+/// them, or only apart from the rest: `judge::uncovered_values`) — that group shown again with
+/// those values first. Each call asks for `review_call_max_tokens` of its groups. Returns the valid
 /// results with the index of their group in `groups`, their value ids those of the group.
 async fn review_batch(
     client: Arc<AiClient>,
@@ -1061,7 +1063,8 @@ async fn review_batch(
                 if again {
                     continue;
                 }
-                // What the answers so far left out: whole groups, and values of answered groups.
+                // What the answers so far left out: whole groups, and values of answered groups not
+                // compared with the rest of their group.
                 let (mut left_out, mut partly) = (Vec::new(), false);
                 for ask in &asks {
                     let results: Vec<ValidatedResult> = out
@@ -1259,7 +1262,7 @@ fn assemble(locale: &ReportLocale, meta: Meta, a: Assembly) -> ConsistencyDoc {
                 }
             }
         }
-        // Values no result judged, even when asked again.
+        // Values no result compared with the rest of the group, even when asked again.
         let left_out = uncovered_values(candidate, results);
         if !left_out.is_empty() {
             counts.not_reviewed += 1;

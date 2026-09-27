@@ -6891,6 +6891,166 @@ fn ai_consistency_json_keeps_every_grouping_decision() {
     }
 }
 
+/// Four pages with the monthly price of one tariff: an introductory 10 EUR, a regular 20 EUR, a
+/// regular 30 EUR and a renewal 40 EUR. The first review answer judges 10 against 20 EUR and 30
+/// against 40 EUR, but never one pair against the other (the regular 20 against the regular 30
+/// EUR); the call asked again (30 and 40 EUR shown first, as values 1 and 2) answers with
+/// `reask`. Returns the review requests and the JSON report.
+fn consistency_disjoint_case(name: &str, reask: serde_json::Value) -> (Vec<String>, serde_json::Value) {
+    let tmp = TempDir::new(name);
+    let site = tmp.path.join("site");
+    std::fs::create_dir_all(&site).expect("the site dir");
+    let page = |h1: &str, price: &str, condition: &str, link: &str| {
+        format!(
+            "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>{h1}</title></head><body><main>\
+             <h1>{h1}</h1><p>Tariff Mini: {price} per month, {condition}.</p>{link}</main></body></html>"
+        )
+    };
+    let links = "<p><a href=\"/b\">B</a> <a href=\"/c\">C</a> <a href=\"/d\">D</a></p>";
+    std::fs::write(site.join("index.html"), page("Alpha", "10 EUR", "introductory", links)).expect("index");
+    std::fs::write(site.join("b.html"), page("Beta", "20 EUR", "regular", "")).expect("b");
+    std::fs::write(site.join("c.html"), page("Gamma", "30 EUR", "regular", "")).expect("c");
+    std::fs::write(site.join("d.html"), page("Delta", "40 EUR", "renewal", "")).expect("d");
+    let server = LocalServer::start(&site);
+    let route = |envelope: &'static str, marker: Option<&'static str>, content: serde_json::Value| MockRoute {
+        envelope,
+        marker,
+        response: chat_response(200, chat_answer(&content.to_string())),
+    };
+    let facts = |price: &str, condition: &str| {
+        serde_json::json!({"facts": [
+            {"block": "B2", "attribute_key": "price", "subject": "Tariff Mini", "attribute": "monthly price",
+             "value": price, "qualifiers": condition, "quote": format!("Tariff Mini: {price} per month"),
+             "normalized": ""},
+        ]})
+    };
+    let result = |values: [usize; 2], title: &str| {
+        serde_json::json!({
+            "group": 1, "values": values, "confidence": "explainable", "priority": "none",
+            "title": title, "explanation": "The conditions of the two prices differ.",
+            "benign_explanations": [], "check": "Verify the monthly prices."
+        })
+    };
+    let mock = MockLlm::start_routed(
+        vec![
+            route(
+                "<page_data>",
+                Some("<title>Alpha</title>"),
+                facts("10 EUR", "introductory"),
+            ),
+            route("<page_data>", Some("<title>Beta</title>"), facts("20 EUR", "regular")),
+            route("<page_data>", Some("<title>Gamma</title>"), facts("30 EUR", "regular")),
+            route("<page_data>", Some("<title>Delta</title>"), facts("40 EUR", "renewal")),
+            // Asked again: the values not compared with the others come first.
+            route("<groups>", Some("<value id=\"1\">\n<text>30 EUR</text>"), reask),
+            route(
+                "<groups>",
+                None,
+                serde_json::json!({"results": [
+                    result([1, 2], "Introductory and regular prices differ"),
+                    result([3, 4], "Regular and renewal prices differ"),
+                ]}),
+            ),
+        ],
+        Vec::new(),
+    );
+    let report_dir = tmp.path.join("reports");
+    let output = run_crawler(&[
+        "--config-file=/dev/null",
+        &format!("--url={}", server.url()),
+        LOCAL_ANALYZERS,
+        "--http-cache-dir=",
+        "--no-color",
+        "--ai-provider=openai-compatible",
+        &format!("--ai-endpoint={}", mock.url()),
+        "--ai-model=m",
+        "--ai-cache-dir=",
+        "--ai-api-key=sk-test",
+        "--ai-consistency",
+        &format!("--ai-report-dir={}", report_dir.display()),
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    let reviews: Vec<String> = mock
+        .request_bodies()
+        .iter()
+        .filter(|body| body.contains("<groups>"))
+        .map(|body| {
+            let request: serde_json::Value = serde_json::from_str(body).expect("a JSON request");
+            request["messages"][1]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    let json_path = std::fs::read_dir(&report_dir)
+        .expect("the report dir")
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .find(|path| path.extension().is_some_and(|e| e == "json"))
+        .expect("the JSON report");
+    let json = serde_json::from_str(&std::fs::read_to_string(json_path).expect("the report")).expect("JSON");
+    (reviews, json)
+}
+
+#[test]
+fn ai_consistency_reports_values_the_review_judged_only_apart() {
+    // Asked again, the review again judges 30/40 and 10/20 EUR only apart.
+    let reask = serde_json::json!({"results": [
+        {"group": 1, "values": [1, 2], "confidence": "explainable", "priority": "none",
+         "title": "Regular and renewal prices differ", "explanation": "The conditions differ.",
+         "benign_explanations": [], "check": "Verify the monthly prices."},
+        {"group": 1, "values": [3, 4], "confidence": "explainable", "priority": "none",
+         "title": "Introductory and regular prices differ", "explanation": "The conditions differ.",
+         "benign_explanations": [], "check": "Verify the monthly prices."},
+    ]});
+    let (reviews, json) = consistency_disjoint_case("ai-consistency-apart", reask);
+    assert_eq!(
+        reviews.len(),
+        2,
+        "the batch, and once more for the relation it left out"
+    );
+    assert!(
+        reviews[0].contains("<value id=\"1\">\n<text>10 EUR</text>"),
+        "{}",
+        reviews[0]
+    );
+    assert!(
+        reviews[1].contains("<value id=\"2\">\n<text>40 EUR</text>"),
+        "{}",
+        reviews[1]
+    );
+    let not_judged = json["notJudged"].as_array().expect("notJudged");
+    assert_eq!(not_judged.len(), 1, "{json}");
+    assert_eq!(not_judged[0]["status"], "not_reviewed_left_out");
+    assert_eq!(value_texts(&not_judged[0]), ["30 EUR", "40 EUR"]);
+    assert_eq!(
+        json["meta"]["comparisonsDone"], 2,
+        "10 against 20 and 30 against 40 EUR"
+    );
+    assert_eq!(json["meta"]["reviewsPartial"], 1);
+    assert_eq!(json["completeness"]["state"], "partial", "{}", json["completeness"]);
+    assert_eq!(json["completeness"]["reasons"][0]["code"], "not_reviewed_left_out");
+    assert_eq!(json["counts"]["notReviewed"], 1);
+    assert_eq!(json["explained"].as_array().map(Vec::len), Some(2), "{json}");
+}
+
+#[test]
+fn ai_consistency_review_asks_again_for_the_relation_between_subsets() {
+    // Asked again, the review compares the regular 30 EUR (its value 1) with the regular 20 EUR (4).
+    let reask = serde_json::json!({"results": [
+        {"group": 1, "values": [1, 4], "confidence": "possibly_inconsistent", "priority": "medium",
+         "title": "Regular monthly prices differ", "explanation": "Two regular monthly prices differ.",
+         "benign_explanations": [], "check": "Verify the regular monthly price."},
+    ]});
+    let (reviews, json) = consistency_disjoint_case("ai-consistency-bridged", reask);
+    assert_eq!(reviews.len(), 2);
+    assert_eq!(value_texts(&json["findings"][0]), ["20 EUR", "30 EUR"], "{json}");
+    assert_eq!(json["notJudged"].as_array().map(Vec::len), Some(0), "{json}");
+    assert_eq!(json["meta"]["comparisonsDone"], 3);
+    assert_eq!(json["meta"]["reviewsPartial"], 0);
+    assert_eq!(json["completeness"]["state"], "complete", "{}", json["completeness"]);
+}
+
 // --- The evaluation corpus of `--ai-consistency` (tests/fixtures/consistency/expected.json) ---
 
 fn consistency_corpus_dir() -> std::path::PathBuf {

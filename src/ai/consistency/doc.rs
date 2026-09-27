@@ -95,14 +95,16 @@ pub struct Meta {
     pub candidates: usize,
     /// Review groups (candidates or their cohorts) with a valid review result.
     pub reviewed: usize,
-    /// Values compared in the reviewed groups (each against the others: values − 1 per group).
+    /// Comparisons the valid review results made: per set of values they relate, values − 1
+    /// (`judge::comparisons_done`).
     pub comparisons_done: usize,
     /// Review groups not reviewed: over the review cap, after a failed call, or because
     /// `--ai-max-tokens` is too low for a review.
     pub reviews_capped: usize,
     pub reviews_failed: usize,
     pub reviews_skipped_budget: usize,
-    /// Reviewed groups with values that no result judged, even when asked again.
+    /// Reviewed groups with values that no result compared with the rest of the group (left out,
+    /// or judged only apart from it), even when asked again.
     pub reviews_partial: usize,
     pub grouping_incomplete: bool,
     pub items_not_cross_compared: usize,
@@ -235,7 +237,8 @@ pub struct ExplainedGroup {
 
 /// A difference that could not be judged: `insufficient_context`, or not reviewed
 /// (`not_reviewed_cap`, `not_reviewed_call_failed`, `not_reviewed_output_budget`, and
-/// `not_reviewed_left_out` for the values of a reviewed group that no result judged).
+/// `not_reviewed_left_out` for the values of a reviewed group that no result compared with the
+/// rest of the group: left out, or judged only apart from it).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NotJudgedGroup {
@@ -411,8 +414,8 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ),
     (
         "status_not_reviewed_left_out",
-        "Not reviewed: the review left these values out",
-        "Neposouzeno: posouzení tyto hodnoty vynechalo",
+        "Not reviewed: the review left these values out or never compared them with the rest of the group",
+        "Neposouzeno: posouzení tyto hodnoty vynechalo nebo je neporovnalo se zbytkem skupiny",
     ),
     (
         "show_items",
@@ -619,8 +622,8 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ),
     (
         "reason_not_reviewed_left_out",
-        "{n} difference was reviewed only in part: the review left some of its values out|{n} differences were reviewed only in part: the review left some of their values out",
-        "{n} rozdíl byl posouzen jen zčásti: posouzení vynechalo některé jeho hodnoty|{n} rozdíly byly posouzeny jen zčásti: posouzení vynechalo některé jejich hodnoty|{n} rozdílů bylo posouzeno jen zčásti: posouzení vynechalo některé jejich hodnoty",
+        "{n} difference was reviewed only in part: the review left some of its values out or did not compare them with the others|{n} differences were reviewed only in part: the review left some of their values out or did not compare them with the others",
+        "{n} rozdíl byl posouzen jen zčásti: posouzení vynechalo některé jeho hodnoty nebo je neporovnalo s ostatními|{n} rozdíly byly posouzeny jen zčásti: posouzení vynechalo některé jejich hodnoty nebo je neporovnalo s ostatními|{n} rozdílů bylo posouzeno jen zčásti: posouzení vynechalo některé jejich hodnoty nebo je neporovnalo s ostatními",
     ),
     (
         "reason_not_reviewed_output_budget",

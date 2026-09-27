@@ -370,22 +370,62 @@ pub fn cohorts(c: Candidate) -> Vec<Candidate> {
         .collect()
 }
 
-/// The values (ids) of a group that its valid review results judge.
-pub fn covered_values(results: &[ValidatedResult]) -> BTreeSet<usize> {
-    results
-        .iter()
-        .flat_map(|result| result.4.values.iter().copied())
-        .collect()
+/// The values (ids) of `c` in the sets its valid review results relate: a result relates the
+/// values it judges together, and two results that share a value relate their sets. A value no
+/// result names is a set of its own. Every value is in one set (ascending); the sets come
+/// largest first, then by their smallest id.
+fn related_sets(c: &Candidate, results: &[ValidatedResult]) -> Vec<Vec<usize>> {
+    fn root(parent: &mut [usize], mut id: usize) -> usize {
+        while parent[id] != id {
+            parent[id] = parent[parent[id]];
+            id = parent[id];
+        }
+        id
+    }
+    let count = c.values.len();
+    let mut parent: Vec<usize> = (0..=count).collect();
+    for result in results {
+        let ids: Vec<usize> = result
+            .4
+            .values
+            .iter()
+            .copied()
+            .filter(|id| (1..=count).contains(id))
+            .collect();
+        for pair in ids.windows(2) {
+            let (a, b) = (root(&mut parent, pair[0]), root(&mut parent, pair[1]));
+            parent[a.max(b)] = a.min(b);
+        }
+    }
+    let mut sets: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for id in 1..=count {
+        let at = root(&mut parent, id);
+        sets.entry(at).or_default().push(id);
+    }
+    let mut sets: Vec<Vec<usize>> = sets.into_values().collect();
+    sets.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.first().cmp(&b.first())));
+    sets
 }
 
-/// The values (ids, ascending) of `c` that no valid review result judges: the review left them
-/// out. None when the group has no result at all (then the whole group is not reviewed).
+/// The comparisons the valid review results of `c` made: in each set of values they relate
+/// (`related_sets`), one fewer than its values. Two results that judge 10 against 20 and 30
+/// against 40 EUR made 2, not 3: 20 and 30 EUR were never compared.
+pub fn comparisons_done(c: &Candidate, results: &[ValidatedResult]) -> usize {
+    related_sets(c, results).iter().map(|set| set.len() - 1).sum()
+}
+
+/// The values (ids, ascending) of `c` that the valid review results did not compare with the
+/// rest of the group: every value outside the largest set of values they relate
+/// (`related_sets`) — values the review left out, and values it judged only apart from the rest
+/// (results for 10/20 and for 30/40 EUR leave 30 and 40 EUR). None when the group has no result
+/// at all (then the whole group is not reviewed).
 pub fn uncovered_values(c: &Candidate, results: &[ValidatedResult]) -> Vec<usize> {
     if results.is_empty() {
         return Vec::new();
     }
-    let covered = covered_values(results);
-    (1..=c.values.len()).filter(|id| !covered.contains(id)).collect()
+    let mut rest: Vec<usize> = related_sets(c, results).into_iter().skip(1).flatten().collect();
+    rest.sort_unstable();
+    rest
 }
 
 /// `c` with the values `first` (ids) moved to the front, renumbered `1…`, and for each new id
@@ -1612,7 +1652,49 @@ mod tests {
             uncovered_values(group, &[]).is_empty(),
             "a group without results is not reviewed"
         );
-        assert_eq!(covered_values(&[judged(&[1, 3])]).len(), 2);
+        assert_eq!(comparisons_done(group, &[judged(&[1, 3])]), 1);
+    }
+
+    #[test]
+    fn values_judged_only_in_separate_subsets_are_not_one_comparison() {
+        let mut group = candidate(1, AttributeKey::Price, 1, true);
+        group.values = ["10 EUR", "20 EUR", "30 EUR", "40 EUR"]
+            .iter()
+            .enumerate()
+            .map(|(i, text)| value(i + 1, text, i..i + 1, true))
+            .collect();
+        let judged = |subsets: &[&[usize]]| -> Vec<ValidatedResult> {
+            subsets
+                .iter()
+                .map(|values| {
+                    let result = ReviewResult {
+                        group: 1,
+                        values: values.to_vec(),
+                        ..ReviewResult::default()
+                    };
+                    (0, Disposition::Explainable, None, None, result, false)
+                })
+                .collect()
+        };
+        // Every value named, but 10/20 and 30/40 never compared with each other.
+        let apart = judged(&[&[1, 2], &[3, 4]]);
+        assert_eq!(uncovered_values(&group, &apart), vec![3, 4]);
+        assert_eq!(comparisons_done(&group, &apart), 2);
+        // A result that shares a value with each subset bridges them.
+        let bridged = judged(&[&[1, 2], &[3, 4], &[2, 3]]);
+        assert!(uncovered_values(&group, &bridged).is_empty());
+        assert_eq!(comparisons_done(&group, &bridged), 3);
+        assert_eq!(comparisons_done(&group, &judged(&[&[1, 2, 3, 4]])), 3);
+        // Values left out, and the largest subset as the one the rest is measured against.
+        let left_out = judged(&[&[1, 2]]);
+        assert_eq!(uncovered_values(&group, &left_out), vec![3, 4]);
+        assert_eq!(comparisons_done(&group, &left_out), 1);
+        let larger = judged(&[&[1, 2], &[2, 3], &[3, 2]]);
+        assert_eq!(uncovered_values(&group, &larger), vec![4]);
+        assert_eq!(uncovered_values(&group, &judged(&[&[2, 3], &[4, 3]])), vec![1]);
+        // A group without results is not reviewed, not partly reviewed.
+        assert!(uncovered_values(&group, &[]).is_empty());
+        assert_eq!(comparisons_done(&group, &[]), 0);
     }
 
     fn batch_rendered() -> Vec<String> {
