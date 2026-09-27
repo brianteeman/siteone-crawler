@@ -223,7 +223,9 @@ pub fn proposed_robots(
             if before.ends_with_ruleless_group() {
                 return Err(
                     "robots.txt ends with a group without rules (User-agent lines after the last Allow or \
-                     Disallow line; a Crawl-delay line is no such rule), so appended groups would merge into it"
+                     Disallow line; a Crawl-delay line is no such rule, nor is a rule line that starts with a \
+                     no-break space or another non-ASCII space, which Google does not read), so appended groups \
+                     would merge into it"
                         .to_string(),
                 );
             }
@@ -1293,7 +1295,11 @@ mod tests {
         // For Google a rule behind a no-break space is no rule: appended groups would merge into
         // the Googlebot group and block Googlebot.
         let nbsp = "User-agent: Googlebot\n\u{a0}Disallow: /private\n";
-        assert!(refuse(ok(nbsp), &snippet).contains("group without rules"));
+        let why = refuse(ok(nbsp), &snippet);
+        assert!(
+            why.contains("group without rules") && why.contains("no-break space"),
+            "{why}"
+        );
 
         // A snippet that would also change `*` fails the policy-equivalence check.
         let why = refuse(
