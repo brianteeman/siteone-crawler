@@ -832,8 +832,9 @@ pub fn article(
 
 /// The author's name in a byline block: without a leading label (`By`, `Autor:`, `Napsala`, …)
 /// and without a date or reading time after a separator (`Jan Novák, 25. 9. 2026`). `None` when
-/// what is left is no bare name — it has a digit or a colon, or more than `MAX_AUTHOR_WORDS`
-/// words (`Posted on September 25, 2026 by …`): a missing author is better than a wrong one.
+/// what is left is no bare name — it has a digit or a colon, more than `MAX_AUTHOR_WORDS` words
+/// (`Posted on September 25, 2026 by …`) or is not written like a name (`is_person_name`): a
+/// missing author is better than a wrong one.
 fn author_name(text: &str) -> Option<String> {
     let mut name = text.trim();
     for label in AUTHOR_LABELS {
@@ -858,7 +859,29 @@ fn author_name(text: &str) -> Option<String> {
     let name = cut.and_then(|at| name.get(..at)).unwrap_or(name).trim();
     let words = name.split_whitespace().count();
     let bare = (1..=MAX_AUTHOR_WORDS).contains(&words) && !name.chars().any(|c| c.is_ascii_digit() || c == ':');
-    bare.then(|| name.to_string())
+    (bare && is_person_name(name)).then(|| name.to_string())
+}
+
+/// Lowercase words of a person's name (`Ludwig van Beethoven`, `Leonardo da Vinci`).
+const NAME_PARTICLES: &[&str] = &[
+    "af", "al", "bin", "da", "das", "de", "del", "della", "den", "der", "di", "do", "dos", "du", "ibn", "la", "le",
+    "st.", "ten", "ter", "van", "von", "y", "zu",
+];
+
+/// Written like a person's name: words of letters (with `-`, `'`, `’` and `.` for initials), each
+/// starting with a capital (or a letter of a script without case) but the name particles, and
+/// the first word never a particle. "Wear gloves" or "the editorial team" is no name.
+fn is_person_name(name: &str) -> bool {
+    name.split_whitespace().enumerate().all(|(at, word)| {
+        let letters = word
+            .chars()
+            .all(|c| c.is_alphabetic() || matches!(c, '-' | '\'' | '’' | '.'));
+        let capital = word
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_alphabetic() && !first.is_lowercase());
+        letters && (capital || (at > 0 && NAME_PARTICLES.contains(&word.to_lowercase().as_str())))
+    })
 }
 
 /// A ready-to-paste `<script type="application/ld+json">` element with the pretty JSON. `<`, `>`
@@ -1446,6 +1469,9 @@ mod tests {
             ("Written by: Jane Doe", "Jane Doe"),
             ("Napsala Eva Malá · 25. září 2026", "Eva Malá"),
             ("Jane Doe-Smith", "Jane Doe-Smith"),
+            ("Ludwig van Beethoven", "Ludwig van Beethoven"),
+            ("J. R. R. Tolkien", "J. R. R. Tolkien"),
+            ("Autorka: Věra O'Neill", "Věra O'Neill"),
         ] {
             let author = block(1, BlockKind::Paragraph, text);
             assert_eq!(
@@ -1462,6 +1488,10 @@ mod tests {
             "Autor článku: Jan Novák",
             "25. 9. 2026 | Jan Novák",
             "Jan Novák and the whole editorial team of Example",
+            // No person's name: words a name would capitalize.
+            "Wear gloves",
+            "By the editorial team",
+            "Safety first, always",
         ] {
             let author = block(1, BlockKind::Paragraph, text);
             let entity = article(url, &h1, Some(&author), None, false);

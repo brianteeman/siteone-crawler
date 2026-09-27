@@ -1237,7 +1237,8 @@ fn section_path(heading: &Block, blocks: &[Block]) -> Option<Vec<String>> {
         })
 }
 
-/// The author block (at most `MAX_AUTHOR_CHARS` characters, 2–6 words) and the date block (exactly
+/// The author block (no heading, at most `MAX_AUTHOR_CHARS` characters, 2–6 words) and the date
+/// block (exactly
 /// one date, labeled as a publication or a change but not both, see `date_role`) are kept when they
 /// are among the first `BYLINE_WINDOW` blocks of the page's own content after the H1 and the page
 /// shows them (not hidden for good).
@@ -1274,7 +1275,12 @@ fn verify_byline(
     let mut byline = Byline::default();
     if let Some(block) = author_block {
         let words = block.text.split_whitespace().count();
-        if near_h1(block) && block.text.chars().count() <= MAX_AUTHOR_CHARS && (2..=6).contains(&words) {
+        // A heading heads a section; it never names who wrote the page.
+        if block.kind != BlockKind::Heading
+            && near_h1(block)
+            && block.text.chars().count() <= MAX_AUTHOR_CHARS
+            && (2..=6).contains(&words)
+        {
             byline.author = Some(block.clone());
         } else {
             rejected.byline += 1;
@@ -1820,6 +1826,26 @@ mod tests {
             ),
         );
         assert!(before.faq_pairs.is_empty(), "an answer before its question");
+    }
+
+    #[test]
+    fn a_heading_is_no_author() {
+        let html = "<html lang=\"en\"><body><main><h1>How to sharpen a spade</h1>\
+            <h2>Essential Safety Precautions</h2><p>Published 1 September 2026</p>\
+            <p>Wear gloves and file the edge at a shallow angle.</p></main></body></html>";
+        let (page, blocks) = page_of(html);
+        let analysis = analyze(
+            &page,
+            &blocks,
+            &format!(
+                r#""byline":{{"author":"{}","date":"{}"}}"#,
+                r(&blocks, "Essential Safety Precautions"),
+                r(&blocks, "Published 1 September 2026")
+            ),
+        );
+        assert!(analysis.byline.author.is_none(), "{:?}", analysis.byline.author);
+        assert_eq!(analysis.byline.date, chrono::NaiveDate::from_ymd_opt(2026, 9, 1));
+        assert_eq!(analysis.rejected.byline, 1);
     }
 
     #[test]
