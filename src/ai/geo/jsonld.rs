@@ -20,6 +20,7 @@ use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;
 
 use crate::ai::blocks::{Block, Region};
+use crate::ai::geo::analyze::DateRole;
 use crate::ai::geo::controls::in_site_chrome;
 use crate::ai::geo::keys::normalized_url;
 use crate::ai::grounding::{find_token_bounded, numbers_in};
@@ -793,8 +794,15 @@ pub fn faq(page_url: &str, pairs: &[(Block, Vec<Block>)]) -> Option<Value> {
 }
 
 /// An Article (a BlogPosting for a blog) with the H1 as its headline, the author of a verified
-/// byline block and its date.
-pub fn article(page_url: &str, h1: &Block, author: Option<&Block>, date: Option<NaiveDate>, is_blog: bool) -> Value {
+/// byline block and its date: `datePublished`, or `dateModified` for a date the page labels as the
+/// last change.
+pub fn article(
+    page_url: &str,
+    h1: &Block,
+    author: Option<&Block>,
+    date: Option<(NaiveDate, DateRole)>,
+    is_blog: bool,
+) -> Value {
     let mut entity = Map::new();
     entity.insert("@context".to_string(), json!(SCHEMA_ORG));
     entity.insert(
@@ -806,8 +814,12 @@ pub fn article(page_url: &str, h1: &Block, author: Option<&Block>, date: Option<
     if let Some(name) = author.and_then(|block| author_name(&block.text)) {
         entity.insert("author".to_string(), json!({"@type": "Person", "name": name}));
     }
-    if let Some(date) = date {
-        entity.insert("datePublished".to_string(), json!(date.format("%Y-%m-%d").to_string()));
+    if let Some((date, role)) = date {
+        let key = match role {
+            DateRole::Published => "datePublished",
+            DateRole::Modified => "dateModified",
+        };
+        entity.insert(key.to_string(), json!(date.format("%Y-%m-%d").to_string()));
     }
     entity.insert("mainEntityOfPage".to_string(), json!(page_url));
     Value::Object(entity)
@@ -1359,7 +1371,7 @@ mod tests {
         let url = "https://example.com/blog/hypoteky";
         let h1 = block(0, BlockKind::Heading, "Jak vybrat hypotéku");
         let author = block(1, BlockKind::Paragraph, "Autor: Jan Novák");
-        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 25);
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 25).map(|date| (date, DateRole::Published));
         assert_eq!(
             article(url, &h1, Some(&author), date, false),
             json!({
@@ -1382,6 +1394,10 @@ mod tests {
                 "mainEntityOfPage": "https://example.com/blog/hypoteky"
             })
         );
+        let changed = chrono::NaiveDate::from_ymd_opt(2026, 9, 25).map(|date| (date, DateRole::Modified));
+        let entity = article(url, &h1, None, changed, false);
+        assert_eq!(entity["dateModified"], "2026-09-25");
+        assert!(entity.get("datePublished").is_none(), "{entity}");
         // A byline block may carry the date or the reading time after the name.
         for (text, name) in [
             ("Jan Novák, 25. 9. 2026", "Jan Novák"),

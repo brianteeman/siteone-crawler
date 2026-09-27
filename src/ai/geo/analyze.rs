@@ -335,6 +335,52 @@ pub struct Byline {
     pub author: Option<Block>,
     pub date_block: Option<Block>,
     pub date: Option<NaiveDate>,
+    /// What the date block says the date is; set with `date`.
+    pub date_role: Option<DateRole>,
+}
+
+/// What a byline date is: the article's publication, or its last change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DateRole {
+    Published,
+    Modified,
+}
+
+/// Word starts (lowercase, EN and CS) that label a date as the last change of an article, and as
+/// its publication.
+const MODIFIED_LABELS: &[&str] = &[
+    "updated",
+    "modified",
+    "revised",
+    "edited",
+    "aktualizov",
+    "aktualizace",
+    "upraven",
+    "změněn",
+    "revidov",
+];
+const PUBLISHED_LABELS: &[&str] = &["published", "posted", "publikov", "zveřejněn", "vydán"];
+
+/// The role of the date in a byline block: `Modified` under an update label ("Last updated",
+/// "Aktualizováno"), otherwise `Published` (a publication label, or a bare date by the title, as
+/// bylines show it); `None` when the block labels the date both ways.
+fn date_role(text: &str) -> Option<DateRole> {
+    let lower = text.to_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_alphabetic())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let labeled = |labels: &[&str]| {
+        words
+            .iter()
+            .any(|word| labels.iter().any(|label| word.starts_with(label)))
+    };
+    match (labeled(PUBLISHED_LABELS), labeled(MODIFIED_LABELS)) {
+        (_, false) => Some(DateRole::Published),
+        (false, true) => Some(DateRole::Modified),
+        (true, true) => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1108,8 +1154,8 @@ fn verify_faq_pairs(raw: &[RawFaqPair], shown: &Shown, rejected: &mut Rejected) 
 }
 
 /// The author block (at most `MAX_AUTHOR_CHARS` characters, 2–6 words) and the date block (exactly
-/// one date) are kept when they are among the first `BYLINE_WINDOW` blocks of the page's own content
-/// after the H1.
+/// one date, labeled as a publication or a change but not both, see `date_role`) are kept when they
+/// are among the first `BYLINE_WINDOW` blocks of the page's own content after the H1.
 fn verify_byline(
     raw: &RawByline,
     shown: &Shown,
@@ -1150,11 +1196,13 @@ fn verify_byline(
     }
     if let Some(block) = date_block {
         let dates = date_mentions(&block.text);
-        if near_h1(block) && dates.len() == 1 {
-            byline.date = dates.into_iter().next();
-            byline.date_block = Some(block.clone());
-        } else {
-            rejected.byline += 1;
+        match date_role(&block.text) {
+            Some(role) if near_h1(block) && dates.len() == 1 => {
+                byline.date = dates.into_iter().next();
+                byline.date_role = Some(role);
+                byline.date_block = Some(block.clone());
+            }
+            _ => rejected.byline += 1,
         }
     }
     byline

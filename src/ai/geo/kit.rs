@@ -465,7 +465,8 @@ pub fn markup_entries(
                     .any(|segment| segment.eq_ignore_ascii_case("blog") || segment.eq_ignore_ascii_case("blogs"))
             });
             let byline = &analysis.byline;
-            let json = jsonld::article(page.url, h1, byline.author.as_ref(), byline.date, is_blog);
+            let date = byline.date.zip(byline.date_role);
+            let json = jsonld::article(page.url, h1, byline.author.as_ref(), date, is_blog);
             let mut evidence = vec![block_evidence(h1)];
             if json.get("author").is_some()
                 && let Some(author) = &byline.author
@@ -1536,6 +1537,58 @@ mod tests {
         assert_eq!(article_entry.json["datePublished"], "2026-09-25");
         assert_eq!(article_entry.json["headline"], "Jak vybrat hypotéku");
         assert!(article_entry.notes.is_empty());
+    }
+
+    #[test]
+    fn an_article_date_is_published_or_modified_as_the_page_says() {
+        let (site, home_markup) = site();
+        let none = ExistingMarkup::default();
+        let article = |date_text: &str| -> serde_json::Value {
+            let html = format!(
+                "<html lang=\"en\"><body><main><article><h1>Maintaining your garden tools</h1>\
+                 <p>By Jane Smith</p><p>{date_text}</p><p>Clean and dry your tools after each use.</p>\
+                 </article></main></body></html>"
+            );
+            let mut analysis = analysis_of("https://example.com/blog/tools", &html, |blocks| {
+                format!(
+                    r#","byline":{{"author":"{}","date":"{}"}}"#,
+                    id(blocks, "By Jane Smith"),
+                    id(blocks, date_text)
+                )
+            });
+            analysis.page_type = PageType::Article;
+            let pages = [MarkupPage {
+                url: "https://example.com/blog/tools",
+                analysis: Some(&analysis),
+                existing: &none,
+                indexable: true,
+            }];
+            markup_entries(&site, &home_markup, &pages, &HashMap::new())
+                .into_iter()
+                .find(|entry| entry.kind == "BlogPosting")
+                .expect("the article")
+                .json
+        };
+        for (text, published, modified) in [
+            ("Last updated September 20, 2026", None, Some("2026-09-20")),
+            ("Aktualizováno 20. září 2026", None, Some("2026-09-20")),
+            ("Published September 20, 2026", Some("2026-09-20"), None),
+            ("September 20, 2026", Some("2026-09-20"), None),
+            // Both a publication and a change: which one the date is cannot be told.
+            ("Published and updated September 20, 2026", None, None),
+        ] {
+            let json = article(text);
+            assert_eq!(
+                json.get("datePublished").and_then(|date| date.as_str()),
+                published,
+                "{text}"
+            );
+            assert_eq!(
+                json.get("dateModified").and_then(|date| date.as_str()),
+                modified,
+                "{text}"
+            );
+        }
     }
 
     #[test]
