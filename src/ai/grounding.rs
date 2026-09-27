@@ -198,11 +198,12 @@ pub fn extend_over_operator(text: &str, span: (usize, usize)) -> (usize, usize) 
 
 /// The span of a number value in `text`, widened so that the value keeps the meaning the page
 /// gives it: over its unit (`10` of `10 EUR`, `€10`), over a sign joined to it (`-5 %`, `−5 %`,
-/// `-€5`), over the other end of a range it is one end of, with that end's own sign and currency
-/// (`10 %` or `5` of `5–10 %` → `5–10 %`, `10 %` of `-5–10 %` → `-5–10 %`, `5 %` of `-10–-5 %`
-/// → `-10–-5 %`, `20 EUR` of `10 EUR – 20 EUR`, `10 %` of `5 to 10 %`), and then over an
-/// operator before it (`extend_over_operator`). A dash is a sign only when it touches the number
-/// and follows no letter or digit (`COVID-19` has no `-19`, `Sleva – 5 %` no `-5 %`); a dash,
+/// `+5 %`, `-€5`, `€+10`), over the other end of a range it is one end of, with that end's own
+/// sign and currency (`10 %` or `5` of `5–10 %` → `5–10 %`, `10 %` of `-5–10 %` → `-5–10 %`,
+/// `10 %` of `-5–+10 %` → `-5–+10 %`, `5 %` of `-10–-5 %` → `-10–-5 %`, `20 EUR` of
+/// `10 EUR – 20 EUR`, `10 %` of `5 to 10 %`), and then over an operator before it
+/// (`extend_over_operator`). A dash or a `+` is a sign only when it touches the number and follows
+/// no letter or digit (`COVID-19` has no `-19`, `A+10` no `+10`, `Sleva – 5 %` no `-5 %`); a dash,
 /// `to`, `až` or `do` between two numbers is a range unless the two ends name different units
 /// (`290 Kč – 10 GB` is no range), and a word is none before a date (`10 do 31. 12.`) or after a
 /// value that ends in another word (`5 osob do 31`). A span that is not a range of `text` is
@@ -246,16 +247,27 @@ fn with_unit(text: &str, span: (usize, usize)) -> (usize, usize) {
 /// only after `od` (`od 5 do 10 %`), since `iPhone 15 do 20 000 Kč` means up to 20 000 Kč.
 const RANGE_WORDS: [&str; 3] = ["to", "až", "do"];
 
-/// Where a number value that starts at `start` of `text` starts with a sign joined to it and
-/// with the lower end of a range it is the upper end of (see `extend_number_span`). A range
-/// before the value wins over a sign (`5 –10 %` is a range), and a range may end before a sign
-/// (`-10–-5 %`).
+/// Where a number value that starts at `start` of `text` starts with a sign joined to it (and a
+/// currency symbol before the sign: `€-10`) and with the lower end of a range it is the upper end
+/// of (see `extend_number_span`). A range before the value wins over a dash as its sign (`5 –10 %`
+/// is a range), and a range may end before a sign (`-10–-5 %`, `-5–+10 %`).
 fn widen_left(text: &str, mut start: usize, value: &str, value_unit: Option<&str>) -> usize {
     let mut signed = false;
     loop {
         let before = text.get(..start).unwrap_or_default();
         let left = before.trim_end_matches(char::is_whitespace);
         let spaced = left.len() < before.len();
+        // A `+` joined to the number is its sign; a dash may join a range instead (below).
+        if !signed
+            && !spaced
+            && starts_with_amount(value)
+            && let Some(pre) = left.strip_suffix('+')
+            && !pre.chars().next_back().is_some_and(char::is_alphanumeric)
+        {
+            start = currency_before(pre);
+            signed = true;
+            continue;
+        }
         let Some((pre, word)) = connector_before(left, spaced) else {
             return start;
         };
@@ -279,7 +291,7 @@ fn widen_left(text: &str, mut start: usize, value: &str, value_unit: Option<&str
                 && starts_with_amount(value)
                 && !pre.chars().next_back().is_some_and(char::is_alphanumeric) =>
             {
-                start = pre.len();
+                start = currency_before(pre);
                 signed = true;
             }
             _ => return start,
@@ -307,7 +319,7 @@ fn widen_right(text: &str, span: (usize, usize), value: &str, value_unit: Option
     let rest = rest.trim_start();
     let rest = rest.strip_prefix(['€', '$', '£']).unwrap_or(rest);
     let rest = rest
-        .strip_prefix(is_dash)
+        .strip_prefix(is_sign)
         .filter(|signed| starts_with_amount(signed))
         .unwrap_or(rest);
     let rest = rest.strip_prefix(['€', '$', '£']).unwrap_or(rest);
@@ -378,8 +390,8 @@ fn after_od(text: &str, at: usize) -> bool {
 }
 
 /// Where the numeral that starts at `at` of `text` starts with a currency symbol and a sign
-/// joined to it (`€5`, `-5`, `€-5`, `-€5`). A dash after a letter or a digit is no sign
-/// (`A-5`).
+/// joined to it (`€5`, `-5`, `+5`, `€-5`, `-€5`). A dash or a `+` after a letter or a digit is no
+/// sign (`A-5`).
 fn signed_start(text: &str, at: usize) -> usize {
     let mut start = at;
     let (mut currency, mut sign) = (false, false);
@@ -387,7 +399,7 @@ fn signed_start(text: &str, at: usize) -> usize {
         let head = text.get(..start - c.len_utf8()).unwrap_or_default();
         if !currency && matches!(c, '€' | '$' | '£') {
             currency = true;
-        } else if !sign && is_dash(c) && !head.chars().next_back().is_some_and(char::is_alphanumeric) {
+        } else if !sign && is_sign(c) && !head.chars().next_back().is_some_and(char::is_alphanumeric) {
             sign = true;
         } else {
             break;
@@ -395,6 +407,16 @@ fn signed_start(text: &str, at: usize) -> usize {
         start -= c.len_utf8();
     }
     start
+}
+
+/// The end of `head`, moved back over a currency symbol it ends with (the `€` of `€-10`).
+fn currency_before(head: &str) -> usize {
+    head.len()
+        - head
+            .chars()
+            .next_back()
+            .filter(|c| matches!(c, '€' | '$' | '£'))
+            .map_or(0, char::len_utf8)
 }
 
 /// `s` starts with a digit, or with a currency symbol and a digit (`5`, `€5`).
@@ -406,6 +428,11 @@ fn starts_with_amount(s: &str) -> bool {
 
 fn is_dash(c: char) -> bool {
     matches!(c, '-' | '–' | '—' | '−')
+}
+
+/// A dash or a `+`: the sign of a number when joined to it.
+fn is_sign(c: char) -> bool {
+    c == '+' || is_dash(c)
 }
 
 /// The two ends of a range agree on their units unless both name one and they differ.
@@ -1076,11 +1103,7 @@ pub fn parse_number(value: &str, lang: &str) -> Option<ValueKey> {
     let mut rest = text.as_str();
 
     let mut op = take_word(&mut rest, OPERATORS);
-    let mut unit = take_word(&mut rest, PREFIX_CURRENCIES);
-    let negative = rest.starts_with('-') && rest.get(1..).is_some_and(starts_with_digit);
-    if negative {
-        rest = rest.get(1..).unwrap_or_default();
-    }
+    let (mut unit, negative) = take_signed_currency(&mut rest);
     if !starts_with_digit(rest) {
         return None;
     }
@@ -1093,11 +1116,7 @@ pub fn parse_number(value: &str, lang: &str) -> Option<ValueKey> {
             continue;
         };
         let mut after = after.trim_start();
-        let currency = take_word(&mut after, PREFIX_CURRENCIES);
-        let high_negative = after.starts_with('-') && after.get(1..).is_some_and(starts_with_digit);
-        if high_negative {
-            after = after.get(1..).unwrap_or_default();
-        }
+        let (currency, high_negative) = take_signed_currency(&mut after);
         if !starts_with_digit(after) || (currency.is_some() && unit.is_some() && currency != unit) {
             continue;
         }
@@ -1369,6 +1388,24 @@ fn decimal_separator(lang: &str) -> Option<char> {
 
 /// Take the first of `words` that `rest` starts with (a word must not run on into a letter) and
 /// return its canonical form; `rest` then continues after it, without leading spaces.
+/// A currency written before a number and a sign joined to the number, in either order (`€-5`,
+/// `-€5`, `+5`), taken from the start of `rest`: the currency, and whether the sign is a minus.
+/// A sign is one only when a digit or a currency symbol follows it.
+fn take_signed_currency(rest: &mut &str) -> (Option<&'static str>, bool) {
+    let take_sign = |rest: &mut &str| {
+        let sign = rest.chars().next().filter(|c| matches!(c, '-' | '+'))?;
+        let after = rest.get(1..)?;
+        (starts_with_digit(after) || after.starts_with(['€', '$', '£'])).then(|| {
+            *rest = after;
+            sign == '-'
+        })
+    };
+    let sign = take_sign(rest);
+    let currency = take_word(rest, PREFIX_CURRENCIES);
+    let negative = sign.or_else(|| take_sign(rest)).unwrap_or(false);
+    (currency, negative)
+}
+
 fn take_word(rest: &mut &str, words: &[(&str, &'static str)]) -> Option<&'static str> {
     let (word, canonical) = words.iter().find(|(word, _)| {
         rest.strip_prefix(word)
@@ -1805,14 +1842,11 @@ mod tests {
         assert_eq!(key("-10 – −5 %"), key("-10–-5 %"));
         assert_ne!(key("-10–-5 %"), key("-10–5 %"));
         assert_eq!(key("€-5 – €10"), Some(ValueKey::Exact("range:-5-10:EUR:".to_string())));
-        assert!(matches!(
-            value_key(ValueHint::Number, "-€5 – €10", "", "en", None),
-            ValueKey::Uncertain(_)
-        ));
-        assert!(matches!(
-            value_key(ValueHint::Number, "-€5", "", "en", None),
-            ValueKey::Uncertain(_)
-        ));
+        // A sign before the currency reads like one after it.
+        assert_eq!(key("-€5 – €10"), key("€-5 – €10"));
+        assert_eq!(key("-€5"), Some(ValueKey::Exact("num:-5:EUR:".to_string())));
+        assert_eq!(key("€-5"), key("-€5"));
+        assert_eq!(key("-5 €"), key("-€5"));
     }
 
     #[test]
@@ -1874,6 +1908,44 @@ mod tests {
         let key = |value: &str| parse_number(value, "en");
         assert_ne!(key("10 EUR"), key("10 USD"));
         assert_eq!(key("€10"), key("10 EUR"));
+    }
+
+    #[test]
+    fn a_plus_sign_of_either_end_is_part_of_a_number() {
+        let extended = |text: &str, value: &str| {
+            let start = text.rfind(value).expect("value");
+            let (a, b) = extend_number_span(text, (start, start + value.len()));
+            text[a..b].to_string()
+        };
+        // A `+` joined to the upper end does not hide the range before it.
+        assert_eq!(extended("Annual return -5–+10 %", "10 %"), "-5–+10 %");
+        assert_eq!(extended("Annual return -5 to +10 %", "10 %"), "-5 to +10 %");
+        assert_eq!(extended("Annual return -5 – +10 %", "10"), "-5 – +10 %");
+        assert_eq!(extended("Annual return +5–+10 %", "10 %"), "+5–+10 %");
+        // From the lower end, over the upper end's `+`.
+        assert_eq!(extended("Annual return -5–+10 %", "-5"), "-5–+10 %");
+        assert_eq!(extended("Annual return -5 to +10 %", "5"), "-5 to +10 %");
+        // A `+` of a single number, before or after its currency, and a minus after a currency.
+        assert_eq!(extended("Annual return +5 %", "5 %"), "+5 %");
+        assert_eq!(extended("Change +€10", "10"), "+€10");
+        assert_eq!(extended("Change €+10", "10"), "€+10");
+        assert_eq!(extended("Change €-10", "10"), "€-10");
+        assert_eq!(extended("Fee €-5 – €+10", "10"), "€-5 – €+10");
+        // A `+` after a letter or a digit is no sign.
+        assert_eq!(extended("Model A+10 %", "10 %"), "10 %");
+        assert_eq!(extended("Balení 2+10 %", "10 %"), "10 %");
+        // The keys: a `+` changes nothing, so the range is the one written without it.
+        let key = |value: &str| parse_number(value, "en");
+        assert_eq!(key("-5–+10 %"), Some(ValueKey::Exact("range:-5-10:%:".to_string())));
+        assert_eq!(key("-5 to +10 %"), key("-5–10 %"));
+        assert_eq!(key("-5 – +10 %"), key("-5–10 %"));
+        assert_eq!(key("+5–+10 %"), key("5–10 %"));
+        assert_eq!(key("+5 %"), key("5 %"));
+        assert_eq!(key("+€10"), key("€10"));
+        assert_eq!(key("€+10"), key("€10"));
+        assert_eq!(key("€-10"), Some(ValueKey::Exact("num:-10:EUR:".to_string())));
+        assert_eq!(key("€-5 – €+10"), key("-5–10 EUR"));
+        assert_ne!(key("-5–+10 %"), key("10 %"));
     }
 
     #[test]

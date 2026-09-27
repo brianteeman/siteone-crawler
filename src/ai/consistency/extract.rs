@@ -597,6 +597,32 @@ mod tests {
         );
     }
 
+    /// One fact per page — `(text of its only block, value)`, quoted as the whole text — kept with
+    /// `lang`, and what `split_keys` makes of them as one key: the occurrences, the number of
+    /// candidates and of consistent facts.
+    fn one_key(lang: &str, attribute_key: &str, pages: &[(&str, &str)]) -> (Vec<Occurrence>, usize, usize) {
+        let mut occ = Vec::new();
+        let mut next_id = 0;
+        for (id, (text, value)) in pages.iter().enumerate() {
+            let mut source = page_source();
+            source.id = id;
+            source.blocks = vec![block("B1", text, &[], &[id])];
+            let raw = vec![fact("B1", attribute_key, value, text)];
+            let (kept, ungrounded) = verify_facts(raw, &source, lang, None, &mut next_id);
+            assert_eq!((kept.len(), ungrounded), (1, 0), "{text}");
+            occ.extend(kept);
+        }
+        let key = FactKey {
+            id: 0,
+            attribute_key: AttributeKey::parse(attribute_key),
+            name: "Key".to_string(),
+            aliases: Vec::new(),
+            occurrence_ids: (0..occ.len()).collect(),
+        };
+        let (candidates, consistent) = crate::ai::consistency::judge::split_keys(&[key], &occ);
+        (occ, candidates.len(), consistent.len())
+    }
+
     #[test]
     fn a_negative_range_quoted_by_its_upper_end_is_a_difference_from_the_positive_one() {
         // One page states -5–10 %, two pages 5–10 %; the model returns only the upper end `10 %`
@@ -607,34 +633,30 @@ mod tests {
             ("Annual return -5 to 10 %", "10 %"),
             ("Annual return -10–-5 %", "5 %"),
         ] {
-            let mut occ = Vec::new();
-            let mut next_id = 0;
-            for (id, (text, value)) in [
-                (text, value),
-                ("Annual return 5–10 %", "5–10 %"),
-                ("Annual return 5–10 %", "5–10 %"),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let mut source = page_source();
-                source.id = id;
-                source.blocks = vec![block("B1", text, &[], &[id])];
-                let raw = vec![fact("B1", "interest_rate", value, text)];
-                let (kept, ungrounded) = verify_facts(raw, &source, "en", None, &mut next_id);
-                assert_eq!((kept.len(), ungrounded), (1, 0), "{text}");
-                occ.extend(kept);
-            }
+            let positive = ("Annual return 5–10 %", "5–10 %");
+            let (occ, candidates, consistent) = one_key("en", "interest_rate", &[(text, value), positive, positive]);
             assert_ne!(occ[0].value_key, occ[1].value_key, "{text}: {:?}", occ[0].value);
-            let key = FactKey {
-                id: 0,
-                attribute_key: AttributeKey::InterestRate,
-                name: "Annual return".to_string(),
-                aliases: Vec::new(),
-                occurrence_ids: vec![0, 1, 2],
-            };
-            let (candidates, consistent) = crate::ai::consistency::judge::split_keys(&[key], &occ);
-            assert_eq!((candidates.len(), consistent.len()), (1, 0), "{text}");
+            assert_eq!((candidates, consistent), (1, 0), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_range_with_a_plus_sign_quoted_by_its_upper_end_is_the_whole_range() {
+        for text in ["Annual return -5–+10 %", "Annual return -5 to +10 %"] {
+            // Against a plain 10 % on two pages: a difference.
+            let plain = ("Annual return 10 %", "10 %");
+            let (occ, candidates, consistent) = one_key("en", "interest_rate", &[(text, "10 %"), plain, plain]);
+            assert_eq!(
+                occ[0].value_key,
+                ValueKey::Exact("range:-5-10:%:".to_string()),
+                "{text}: {:?}",
+                occ[0].value
+            );
+            assert_eq!((candidates, consistent), (1, 0), "{text}");
+            // Against the whole range written without the `+`: the same value.
+            let range = ("Annual return -5–10 %", "-5–10 %");
+            let (_, candidates, consistent) = one_key("en", "interest_rate", &[(text, "10 %"), range, range]);
+            assert_eq!((candidates, consistent), (0, 1), "{text}");
         }
     }
 
