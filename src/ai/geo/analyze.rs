@@ -56,6 +56,9 @@ const MAX_TYPE_CHARS: usize = 60;
 const ENTITY_TYPES: &[&str] = &["Product", "Service", "Event", "LocalBusiness", "Person"];
 /// Marks a block of the site chrome in the prompt.
 const CHROME_MARK: &str = " (site header/footer)";
+/// Question marks of the scripts FAQ pages are written in (Latin and Cyrillic, full-width, Arabic,
+/// Greek).
+const QUESTION_MARKS: &[char] = &['?', '？', '؟', '\u{37e}'];
 
 static TITLE_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse("title").unwrap());
 static HTML_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse("html[lang]").unwrap());
@@ -544,6 +547,14 @@ pub(crate) fn shown_text(element: ElementRef) -> String {
         }
     }
     text
+}
+
+/// Whether a text is a question: it ends with a question mark, before any closing quotes or
+/// brackets.
+pub(crate) fn is_question(text: &str) -> bool {
+    text.trim_end()
+        .trim_end_matches(['"', '\'', '”', '’', '»', ')', ']'])
+        .ends_with(QUESTION_MARKS)
 }
 
 /// Text compared without any whitespace and without the invisible soft hyphens and zero-width
@@ -1219,7 +1230,7 @@ fn verify_faq_pairs(raw: &[RawFaqPair], shown: &Shown, rejected: &mut Rejected) 
             .min(next_question_on_page(question, shown.blocks));
         let (mut answers, all_valid) = shown.resolve(&pair.answer, &mut rejected.block_ids);
         answers.sort_by_key(|answer| answer.id);
-        let is_question = question.kind == BlockKind::Heading || question.text.trim_end().ends_with(['?', '？']);
+        let is_question = question.kind == BlockKind::Heading || is_question(&question.text);
         let in_place = question.region == Region::Main
             && !question.hidden
             && answers.iter().all(|answer| {
@@ -1238,10 +1249,11 @@ fn verify_faq_pairs(raw: &[RawFaqPair], shown: &Shown, rejected: &mut Rejected) 
 }
 
 /// Where the answer of `question` ends on the page, whatever pairs the model returned: at the
-/// next block of the page's own content that starts another question — for a heading, the next
-/// heading, `summary` or `dt` outside its own section (its subsections belong to its answer); for
-/// a question in a paragraph, also the next text ending with a question mark. `usize::MAX` when
-/// none follows.
+/// next block of the page's own content that starts another question, whatever element holds
+/// either — a text that is a question (`is_question`: a heading, a paragraph, a list item, a `dt`
+/// or a `summary`), or a heading, `summary` or `dt` outside the question's own section (the
+/// subsections of a heading belong to its answer unless they ask a question themselves).
+/// `usize::MAX` when none follows.
 fn next_question_on_page(question: &Block, blocks: &[Block]) -> usize {
     let own = section_path(question, blocks);
     let in_section = |heading: &Block| {
@@ -1252,13 +1264,7 @@ fn next_question_on_page(question: &Block, blocks: &[Block]) -> usize {
     blocks
         .iter()
         .filter(|block| block.id > question.id && block.region == Region::Main)
-        .find(|block| {
-            if block.kind == BlockKind::Heading {
-                !in_section(block)
-            } else {
-                question.kind != BlockKind::Heading && block.text.trim_end().ends_with(['?', '？'])
-            }
-        })
+        .find(|block| is_question(&block.text) || (block.kind == BlockKind::Heading && !in_section(block)))
         .map_or(usize::MAX, |block| block.id)
 }
 
@@ -2041,6 +2047,78 @@ mod tests {
             id("Yes.")
         ));
         assert!(paragraph.is_empty(), "{paragraph:?}");
+    }
+
+    #[test]
+    fn an_answer_ends_at_the_next_question_whatever_element_holds_either() {
+        // (the page's questions and answers, the question and the answer the model paired)
+        let kept = |content: &str, question: &str, answer: &str| -> bool {
+            let html =
+                format!("<html lang=\"en\"><body><main><h1>Delivery and returns</h1>{content}</main></body></html>");
+            let (page, blocks) = page_of(&html);
+            let json = format!(
+                r#""faq_pairs":[{{"question":"{}","answer":["{}"]}}]"#,
+                r(&blocks, question),
+                r(&blocks, answer)
+            );
+            !analyze(&page, &blocks, &json).faq_pairs.is_empty()
+        };
+        let q1 = "Are returns free?";
+        let wrong = "Delivery is free on all orders.";
+        for crossing in [
+            "<h2>Are returns free?</h2><p>Return labels cost EUR 15.</p><p>Is delivery free?</p><p>Delivery is free on all orders.</p>",
+            "<h2>Are returns free?</h2><p>Return labels cost EUR 15.</p><h3>Is delivery free?</h3><p>Delivery is free on all orders.</p>",
+            "<h2>Are returns free?</h2><p>Return labels cost EUR 15.</p><ul><li>Is delivery free?</li><li>Delivery is free on all orders.</li></ul>",
+            "<h2>Are returns free?</h2><p>Return labels cost EUR 15.</p><dl><dt>Is delivery free</dt><dd>Delivery is free on all orders.</dd></dl>",
+            "<h2>Are returns free?</h2><p>Return labels cost EUR 15.</p><details><summary>Is delivery free</summary><p>Delivery is free on all orders.</p></details>",
+            "<p>Are returns free?</p><p>Return labels cost EUR 15.</p><li>Is delivery free?</li><p>Delivery is free on all orders.</p>",
+            "<ul><li>Are returns free?</li><li>Return labels cost EUR 15.</li><li>Is delivery free?</li><li>Delivery is free on all orders.</li></ul>",
+            "<dl><dt>Are returns free?</dt><dd>Return labels cost EUR 15.</dd><dt>Is delivery free?</dt><dd>Delivery is free on all orders.</dd></dl>",
+            "<details><summary>Are returns free?</summary><p>Return labels cost EUR 15.</p></details>\
+             <details><summary>Is delivery free?</summary><p>Delivery is free on all orders.</p></details>",
+        ] {
+            assert!(
+                !kept(crossing, q1, wrong),
+                "an answer taken across another question: {crossing}"
+            );
+        }
+        // A heading that is no question does not take the answer of a question under it.
+        assert!(!kept(
+            "<h2>Payment</h2><h3>Can I pay by card?</h3><p>Yes, by Visa.</p>",
+            "Payment",
+            "Yes, by Visa."
+        ));
+        // Controls: answers of the question's own subsections, a definition list, a disclosure,
+        // a paragraph question and an answer in several blocks stay.
+        assert!(kept(
+            "<h2>How do I pay?</h2><h3>Online</h3><p>By card.</p><h3>In a shop</h3><p>In cash.</p>",
+            "How do I pay?",
+            "In cash."
+        ));
+        for (content, question, answer) in [
+            (
+                "<dl><dt>Are returns free?</dt><dd>Return labels cost EUR 15.</dd></dl>",
+                q1,
+                "Return labels cost EUR 15.",
+            ),
+            (
+                "<details><summary>Are returns free?</summary><p>Return labels cost EUR 15.</p></details>",
+                q1,
+                "Return labels cost EUR 15.",
+            ),
+            (
+                "<p>Are returns free?</p><p>Return labels cost EUR 15.</p>",
+                q1,
+                "Return labels cost EUR 15.",
+            ),
+            (
+                "<h2>Are returns free?</h2><p>Return labels cost EUR 15.</p><ul><li>Labels are sent by e-mail.</li></ul>",
+                q1,
+                "Labels are sent by e-mail.",
+            ),
+        ] {
+            assert!(kept(content, question, answer), "{content}");
+        }
     }
 
     #[test]

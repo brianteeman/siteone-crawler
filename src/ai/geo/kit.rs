@@ -17,7 +17,7 @@ use unicode_normalization::char::is_combining_mark;
 
 use crate::ai::blocks::Block;
 use crate::ai::geo::agents::{AI_AGENTS, AiAgent, Purpose};
-use crate::ai::geo::analyze::{Answered, PageAnalysis, PageType, block_ref};
+use crate::ai::geo::analyze::{Answered, PageAnalysis, PageType, block_ref, is_question};
 use crate::ai::geo::discovery::{CrawlEnd, SitemapProposal};
 use crate::ai::geo::findings::ORGANIZATION_TYPES;
 use crate::ai::geo::jsonld::{self, ExistingMarkup};
@@ -41,9 +41,6 @@ const MAX_SLUG_CHARS: usize = 60;
 /// FAQPage markup needs a list: a single question heading with its paragraph (such as "What would
 /// you improve?") is no FAQ.
 const FAQ_MIN_QUESTIONS: usize = 2;
-/// Question marks of the scripts FAQ pages are written in (Latin and Cyrillic, full-width, Arabic,
-/// Greek).
-const QUESTION_MARKS: &[char] = &['?', '？', '؟', '\u{37e}'];
 const FAQ_NOTE: &str = "FAQ rich results no longer appear in Google (since 7 May 2026): keep this markup only for real, visible questions and answers.";
 
 /// One file of the kit, relative to the kit directory.
@@ -490,14 +487,6 @@ pub fn markup_entries(
         }
     }
     entries
-}
-
-/// Whether a text is a question: it ends with a question mark, before any closing quotes or
-/// brackets.
-fn is_question(text: &str) -> bool {
-    text.trim_end()
-        .trim_end_matches(['"', '\'', '”', '’', '»', ')', ']'])
-        .ends_with(QUESTION_MARKS)
 }
 
 fn one_line(text: &str) -> String {
