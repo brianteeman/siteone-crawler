@@ -1540,6 +1540,56 @@ mod tests {
     }
 
     #[test]
+    fn no_markup_is_built_from_content_hidden_for_good() {
+        let (site, home_markup) = site();
+        let none = ExistingMarkup::default();
+        let faq_of = |questions: &str| -> Option<serde_json::Value> {
+            let html = format!(
+                "<html lang=\"en\"><body><main><h1>Garden FAQ</h1>\
+                 <p>Current terms are available by contacting support.</p>{questions}</main></body></html>"
+            );
+            let mut analysis = analysis_of("https://example.com/faq", &html, |blocks| {
+                format!(
+                    r#","faq_pairs":[{{"question":"{}","answer":["{}"]}},{{"question":"{}","answer":["{}"]}}]"#,
+                    id(blocks, "Is every product free?"),
+                    id(blocks, "Every product is free of charge."),
+                    id(blocks, "Is shipping always free?"),
+                    id(blocks, "All shipping is free.")
+                )
+            });
+            analysis.page_type = PageType::Faq;
+            let pages = [MarkupPage {
+                url: "https://example.com/faq",
+                analysis: Some(&analysis),
+                existing: &none,
+                indexable: true,
+            }];
+            markup_entries(&site, &home_markup, &pages, &HashMap::new())
+                .into_iter()
+                .find(|entry| entry.kind == "FAQPage")
+                .map(|entry| entry.json)
+        };
+        let pairs = "<h2>Is every product free?</h2><p>Every product is free of charge.</p>\
+                     <h2>Is shipping always free?</h2><p>All shipping is free.</p>";
+        for hidden in [
+            format!("<div hidden>{pairs}</div>"),
+            format!("<div style=\"display: none\">{pairs}</div>"),
+        ] {
+            assert_eq!(faq_of(&hidden), None, "{hidden}");
+        }
+        // A visitor can open a disclosure, a tab panel or a `hidden="until-found"` section.
+        for shown in [
+            "<details><summary>Is every product free?</summary><p>Every product is free of charge.</p></details>\
+             <details><summary>Is shipping always free?</summary><p>All shipping is free.</p></details>"
+                .to_string(),
+            format!("<div role=\"tabpanel\" hidden>{pairs}</div>"),
+            format!("<div hidden=\"until-found\">{pairs}</div>"),
+        ] {
+            assert!(faq_of(&shown).is_some(), "{shown}");
+        }
+    }
+
+    #[test]
     fn an_article_date_is_published_or_modified_as_the_page_says() {
         let (site, home_markup) = site();
         let none = ExistingMarkup::default();

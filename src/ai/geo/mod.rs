@@ -205,7 +205,12 @@ fn page_checks(
         nosnippet_share: (main_chars > 0).then(|| nosnippet as f64 / main_chars as f64),
         canonical_elsewhere: canonical_elsewhere(&document, url),
     };
-    let visible: Vec<&str> = blocks.iter().map(|block| block.text.as_str()).collect();
+    // Markup must match what the page shows: text hidden for good does not count.
+    let visible: Vec<&str> = blocks
+        .iter()
+        .filter(|block| !block.hidden)
+        .map(|block| block.text.as_str())
+        .collect();
     let markup = jsonld::existing(&document, &visible.join("\n"));
     (blocks, controls, markup)
 }
@@ -904,6 +909,34 @@ mod tests {
         assert!(
             robots_origins_to_fetch(&status, &[], &[]).is_empty(),
             "every origin has a state"
+        );
+    }
+
+    #[test]
+    fn markup_values_hidden_for_good_are_not_visible() {
+        let html = r#"<html><head><script type="application/ld+json">
+            {"@context":"https://schema.org","@type":"Product","name":"Retired widget","offers":{"@type":"Offer","price":0}}
+            </script></head><body><main><h1>Garden tools</h1><div hidden><p>Retired widget costs 0 USD</p></div>
+            <details><summary>Current widget</summary><p>The current widget costs 12 USD.</p></details></main></body></html>"#;
+        let (_, _, markup) = page_checks("https://example.com/", html, None, Utc::now());
+        let invisible: Vec<&str> = markup
+            .invisible_values
+            .iter()
+            .map(|(_, value)| value.as_str())
+            .collect();
+        assert_eq!(invisible, ["Retired widget", "0"], "{:?}", markup.invisible_values);
+        // Text behind a disclosure is visible once opened.
+        let html = html
+            .replace("Retired widget costs", "Current widget costs")
+            .replace(r#""name":"Retired widget""#, r#""name":"Current widget""#);
+        let (_, _, markup) = page_checks("https://example.com/", &html, None, Utc::now());
+        assert!(
+            markup
+                .invisible_values
+                .iter()
+                .all(|(_, value)| value != "Current widget"),
+            "{:?}",
+            markup.invisible_values
         );
     }
 

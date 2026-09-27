@@ -19,8 +19,8 @@ use serde_json::{Map, Value, json};
 use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;
 
-use crate::ai::blocks::{Block, Region};
-use crate::ai::geo::analyze::DateRole;
+use crate::ai::blocks::{Block, Region, hidden_for_good};
+use crate::ai::geo::analyze::{DateRole, shown_text};
 use crate::ai::geo::controls::in_site_chrome;
 use crate::ai::geo::keys::normalized_url;
 use crate::ai::grounding::{find_token_bounded, numbers_in};
@@ -378,7 +378,8 @@ pub fn website(site_name: &str, origin: &str) -> Value {
     })
 }
 
-/// The kit's Organization entity from the homepage's site chrome: a `logo` (the first image of
+/// The kit's Organization entity from what the homepage's site chrome shows (nothing hidden for
+/// good, see `blocks::hides_for_good`): a `logo` (the first image of
 /// the site header, or linking to the homepage, whose `src`, `alt` or `class` says "logo" — not a
 /// partner's or a payment logo in the footer), a `contactPoint` from the first `tel:` and
 /// `mailto:` links whose values the chrome blocks show, and `sameAs` with the social profiles
@@ -402,7 +403,9 @@ pub fn organization(
 
     let logo = homepage
         .select(&IMG_SELECTOR)
-        .filter(|img| in_site_chrome(*img) && (in_site_header(*img) || links_home(*img, base)))
+        .filter(|img| {
+            in_site_chrome(*img) && !hidden_for_good(*img) && (in_site_header(*img) || links_home(*img, base))
+        })
         .filter(|img| {
             ["src", "alt", "class"].iter().any(|attr| {
                 img.value()
@@ -421,14 +424,14 @@ pub fn organization(
 
     let chrome_text = chrome_blocks
         .iter()
-        .filter(|block| block.region == Region::Chrome)
+        .filter(|block| block.region == Region::Chrome && !block.hidden)
         .map(|block| block.text.as_str())
         .collect::<Vec<_>>()
         .join("\n");
     let visible = Visible::new(&chrome_text, "");
     let links: Vec<ElementRef> = homepage
         .select(&LINK_SELECTOR)
-        .filter(|link| in_site_chrome(*link))
+        .filter(|link| in_site_chrome(*link) && !hidden_for_good(*link))
         .collect();
     let href = |link: &ElementRef| link.value().attr("href").unwrap_or_default().trim().to_string();
 
@@ -656,23 +659,20 @@ fn compact(text: &str) -> String {
 /// A page's name for a breadcrumb: its first H1 outside the site chrome, or else its title
 /// without a site suffix (`Pricing | Example` → `Pricing`).
 pub fn page_name(document: &Html, site_name: &str) -> Option<String> {
-    let collapse = |element: ElementRef| {
-        element
-            .text()
-            .collect::<String>()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
+    let collapse = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    // The H1 as a visitor sees it: without hidden text, SVG titles or scripts.
     if let Some(h1) = document
         .select(&H1_SELECTOR)
-        .filter(|h1| !in_site_chrome(*h1))
-        .map(collapse)
+        .filter(|h1| !in_site_chrome(*h1) && !hidden_for_good(*h1))
+        .map(|h1| collapse(&shown_text(h1)))
         .find(|text| !text.is_empty())
     {
         return Some(h1);
     }
-    let title = document.select(&TITLE_SELECTOR).next().map(collapse)?;
+    let title = document
+        .select(&TITLE_SELECTOR)
+        .next()
+        .map(|title| collapse(&title.text().collect::<String>()))?;
     if title.is_empty() {
         return None;
     }
@@ -749,8 +749,9 @@ pub fn breadcrumb(page_url: &str, crawled: &HashMap<String, String>) -> Option<V
 }
 
 /// A FAQPage from visible questions with their answers, in document order. A pair is kept only
-/// when its question and answer blocks are the page's own content (Main region), it has an
-/// answer, and every answer block lies between its question and the next pair's question — so
+/// when its question and answer blocks are the page's own content (Main region) that the page
+/// shows (not hidden for good), it has an answer, and every answer block lies between its
+/// question and the next pair's question — so
 /// pairs can neither cross nor share an answer, and no question can be another's answer. `None`
 /// when no pair is left.
 pub fn faq(page_url: &str, pairs: &[(Block, Vec<Block>)]) -> Option<Value> {
@@ -763,10 +764,14 @@ pub fn faq(page_url: &str, pairs: &[(Block, Vec<Block>)]) -> Option<Value> {
             let next_question = ordered.get(at + 1).map_or(usize::MAX, |(next, _)| next.id);
             !question.text.trim().is_empty()
                 && question.region == Region::Main
+                && !question.hidden
                 && !answers.is_empty()
-                && answers
-                    .iter()
-                    .all(|answer| answer.region == Region::Main && answer.id > question.id && answer.id < next_question)
+                && answers.iter().all(|answer| {
+                    answer.region == Region::Main
+                        && !answer.hidden
+                        && answer.id > question.id
+                        && answer.id < next_question
+                })
         })
         .filter_map(|(_, (question, answers))| {
             let texts: Vec<&str> = answers
@@ -882,6 +887,7 @@ mod tests {
             heading_path: Vec::new(),
             text: text.to_string(),
             collapsed: false,
+            hidden: false,
         }
     }
 
@@ -1178,6 +1184,35 @@ mod tests {
     }
 
     #[test]
+    fn organization_ignores_logos_contacts_and_profiles_hidden_for_good() {
+        let html = r#"<html><body><header>
+              <div hidden>
+                <img src="/retired-logo.svg" alt="Old logo">
+                <a href="mailto:retired@example.com">retired@example.com</a>
+                <a href="https://www.linkedin.com/company/example/posts/">Old social feed</a>
+              </div>
+              <img src="/current-logo.svg" alt="Example logo">
+              <a href="mailto:support@example.com">support@example.com</a>
+            </header></html>"#;
+        let base = url::Url::parse("https://example.com/").unwrap();
+        let chrome: Vec<Block> = blocks_from_html(html)
+            .into_iter()
+            .filter(|block| block.region == Region::Chrome)
+            .collect();
+        let (organization, possible) = organization(
+            "Example",
+            "https://example.com",
+            &Html::parse_document(html),
+            &chrome,
+            &base,
+        );
+        assert_eq!(organization["logo"], "https://example.com/current-logo.svg");
+        assert_eq!(organization["contactPoint"][0]["email"], "support@example.com");
+        assert!(organization.get("sameAs").is_none(), "{organization}");
+        assert!(possible.is_empty(), "{possible:?}");
+    }
+
+    #[test]
     fn organization_without_chrome_signals_has_no_optional_properties() {
         let html = r#"<html><body><main><img src="/logo.png"><a href="tel:+420800123456">+420 800 123 456</a>
             <a href="https://www.linkedin.com/company/example">LinkedIn</a></main></body></html>"#;
@@ -1271,6 +1306,12 @@ mod tests {
             Some("Questions - answers")
         );
         assert_eq!(name("<title> </title>"), None);
+        assert_eq!(
+            name("<main><h1>Garden service<span hidden>INTERNAL_ONLY</span><svg><title>ICON_ONLY</title></svg></h1></main>")
+                .as_deref(),
+            Some("Garden service"),
+            "only the text a visitor sees"
+        );
     }
 
     #[test]

@@ -482,7 +482,7 @@ pub fn analyzed_page(url: &str, html: &str) -> AnalyzedPage {
 /// The text of an element as its blocks show it: without the text of scripts, styles, SVG and
 /// other non-text elements, and of hidden inline elements (a block of their own), with a `<br>`
 /// as a space.
-fn shown_text(element: ElementRef) -> String {
+pub(crate) fn shown_text(element: ElementRef) -> String {
     const NOT_TEXT: &[&str] = &["script", "style", "template", "noscript", "svg", "iframe"];
     let hidden = |node: ego_tree::NodeRef<Node>| {
         node.value().as_element().is_some_and(|element| {
@@ -1116,8 +1116,9 @@ fn verify_lead(raw: &RawAnalysis, shown: &Shown, lang: &str, rejected: &mut Reje
 }
 
 /// A pair is kept when its blocks are the page's own content (not the site chrome the homepage
-/// shows), its question block is a heading, a `summary` or a `dt`, or ends with a question mark,
-/// and every answer block comes after it and before the next pair's question.
+/// shows) that the page shows (not hidden for good, see `Block::hidden`), its question block is a
+/// heading, a `summary` or a `dt`, or ends with a question mark, and every answer block comes after
+/// it and before the next pair's question.
 fn verify_faq_pairs(raw: &[RawFaqPair], shown: &Shown, rejected: &mut Rejected) -> Vec<FaqPair> {
     let mut pairs: Vec<(&Block, &RawFaqPair)> = Vec::new();
     for pair in raw {
@@ -1138,9 +1139,10 @@ fn verify_faq_pairs(raw: &[RawFaqPair], shown: &Shown, rejected: &mut Rejected) 
         answers.sort_by_key(|answer| answer.id);
         let is_question = question.kind == BlockKind::Heading || question.text.trim_end().ends_with(['?', '？']);
         let in_place = question.region == Region::Main
-            && answers
-                .iter()
-                .all(|answer| answer.region == Region::Main && answer.id > question.id && answer.id < next_question);
+            && !question.hidden
+            && answers.iter().all(|answer| {
+                answer.region == Region::Main && !answer.hidden && answer.id > question.id && answer.id < next_question
+            });
         if is_question && all_valid && !answers.is_empty() && in_place {
             kept.push(FaqPair {
                 question: (*question).clone(),
@@ -1155,7 +1157,8 @@ fn verify_faq_pairs(raw: &[RawFaqPair], shown: &Shown, rejected: &mut Rejected) 
 
 /// The author block (at most `MAX_AUTHOR_CHARS` characters, 2–6 words) and the date block (exactly
 /// one date, labeled as a publication or a change but not both, see `date_role`) are kept when they
-/// are among the first `BYLINE_WINDOW` blocks of the page's own content after the H1.
+/// are among the first `BYLINE_WINDOW` blocks of the page's own content after the H1 and the page
+/// shows them (not hidden for good).
 fn verify_byline(
     raw: &RawByline,
     shown: &Shown,
@@ -1164,13 +1167,14 @@ fn verify_byline(
     rejected: &mut Rejected,
 ) -> Byline {
     let near_h1 = |block: &Block| {
-        h1.is_some_and(|h1| {
-            let after = blocks
-                .iter()
-                .filter(|other| other.id > h1 && other.id <= block.id && other.region == Region::Main)
-                .count();
-            block.region == Region::Main && block.id > h1 && (1..=BYLINE_WINDOW).contains(&after)
-        })
+        !block.hidden
+            && h1.is_some_and(|h1| {
+                let after = blocks
+                    .iter()
+                    .filter(|other| other.id > h1 && other.id <= block.id && other.region == Region::Main)
+                    .count();
+                block.region == Region::Main && block.id > h1 && (1..=BYLINE_WINDOW).contains(&after)
+            })
     };
     let mut resolve = |reference: &str| -> Option<&Block> {
         if reference.trim().is_empty() {

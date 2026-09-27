@@ -59,6 +59,10 @@ pub struct Block {
     /// inline `display:none`, `.tab-pane:not(.active)`, `.accordion-collapse:not(.show)` or
     /// `.collapse:not(.show)`.
     pub collapsed: bool,
+    /// Collapsed with no control a visitor could open it by (see `hides_for_good`): the page does
+    /// not show this text until a script does.
+    #[serde(skip_serializing)]
+    pub hidden: bool,
 }
 
 /// Elements whose content is never visible text; `head` holds no body content.
@@ -129,6 +133,7 @@ struct Frame {
     chrome: bool,
     content: bool,
     collapsed: bool,
+    hidden: bool,
     /// A `summary` that shows its closed `details`.
     uncollapsed: bool,
     closed_details: bool,
@@ -203,6 +208,7 @@ struct Walker {
     chrome: usize,
     content: usize,
     collapsed: usize,
+    hidden: usize,
     /// Open cells of data tables; text inside goes to the current cell.
     cells: usize,
     main_headings: Vec<(usize, String)>,
@@ -289,6 +295,7 @@ impl Walker {
         frame.content = matches!(tag, "article" | "main") || role.as_deref() == Some("main");
         frame.closed_details = tag == "details" && el.attr("open").is_none();
         frame.collapsed = frame.closed_details || hides(element);
+        frame.hidden = hides_for_good(element);
         frame.uncollapsed = tag == "summary" && self.frames.last().is_some_and(|parent| parent.closed_details);
 
         if INLINE.contains(&tag) && !frame.chrome && !frame.content {
@@ -341,6 +348,7 @@ impl Walker {
         self.chrome += usize::from(frame.chrome);
         self.content += usize::from(frame.content);
         self.collapsed += usize::from(frame.collapsed);
+        self.hidden += usize::from(frame.hidden);
         if frame.uncollapsed {
             self.collapsed = self.collapsed.saturating_sub(1);
         }
@@ -378,6 +386,7 @@ impl Walker {
             self.collapsed += 1;
         }
         self.collapsed = self.collapsed.saturating_sub(usize::from(frame.collapsed));
+        self.hidden = self.hidden.saturating_sub(usize::from(frame.hidden));
         self.content = self.content.saturating_sub(usize::from(frame.content));
         if frame.chrome {
             self.chrome = self.chrome.saturating_sub(1);
@@ -564,6 +573,7 @@ impl Walker {
             heading_path: headings.iter().map(|(_, text)| text.clone()).collect(),
             text,
             collapsed: self.collapsed > 0,
+            hidden: self.hidden > 0,
         });
     }
 
@@ -590,6 +600,34 @@ fn hides(element: ElementRef) -> bool {
         || (class("tab-pane") && !class("active"))
         || (class("accordion-collapse") && !class("show"))
         || (class("collapse") && !class("show"))
+}
+
+/// True when the element hides its content from every visitor until a script shows it: `[hidden]`
+/// (but `hidden="until-found"`, which the browser opens for a search or a link) or an inline
+/// `display:none`, on anything but a tab panel (`[role=tabpanel]`, opened by its tab). A closed
+/// `details`, a Bootstrap tab pane or collapse, and `aria-hidden` (hidden from assistive technology
+/// only) do not hide their content for good.
+pub fn hides_for_good(element: ElementRef) -> bool {
+    let el = element.value();
+    if el
+        .attr("role")
+        .is_some_and(|role| role.trim().eq_ignore_ascii_case("tabpanel"))
+    {
+        return false;
+    }
+    el.attr("hidden")
+        .is_some_and(|value| !value.trim().eq_ignore_ascii_case("until-found"))
+        || el.attr("style").is_some_and(|style| {
+            let style: String = style.chars().filter(|c| !c.is_whitespace()).collect();
+            style.to_ascii_lowercase().contains("display:none")
+        })
+}
+
+/// True when the element or one of its ancestors `hides_for_good`.
+pub fn hidden_for_good(element: ElementRef) -> bool {
+    std::iter::once(element)
+        .chain(element.ancestors().filter_map(ElementRef::wrap))
+        .any(hides_for_good)
 }
 
 /// A table used for page layout rather than data: it contains headings or other tables, or says
@@ -860,6 +898,31 @@ mod tests {
             BlockKind::Heading,
             "a summary heads its disclosure"
         );
+        // Only content no visitor can open is hidden for good.
+        for hidden in ["Hidden attribute", "Styled hidden", "staré 300"] {
+            assert!(find(&blocks, hidden).hidden, "{hidden} should be hidden for good");
+        }
+        for openable in [
+            "Skrytá cena 390 Kč",
+            "Tab two",
+            "Accordion closed",
+            "Collapse closed",
+            "Aria hidden",
+        ] {
+            assert!(!find(&blocks, openable).hidden, "{openable} can be opened");
+        }
+        assert!(blocks.iter().filter(|block| block.hidden).all(|block| block.collapsed));
+        let blocks = blocks_from_html(
+            r#"<body><main><div role="tabpanel" hidden><p>Panel two</p></div>
+            <div hidden="until-found"><p>Found on search</p></div><p>Shown</p></main></body>"#,
+        );
+        for openable in ["Panel two", "Found on search"] {
+            assert!(
+                find(&blocks, openable).collapsed && !find(&blocks, openable).hidden,
+                "{openable}"
+            );
+        }
+        assert!(!find(&blocks, "Shown").hidden);
     }
 
     #[test]
@@ -929,6 +992,7 @@ mod tests {
             heading_path: vec!["Ceník".to_string(), "Tarify".to_string()],
             text: "Tarif: Basic | Cena měsíčně: 290 Kč".to_string(),
             collapsed: false,
+            hidden: false,
         };
         assert_eq!(
             render_block(&block, "B12"),

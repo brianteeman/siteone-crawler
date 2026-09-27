@@ -2214,6 +2214,7 @@ mod tests {
             heading_path: Vec::new(),
             text: "Jan Novák".to_string(),
             collapsed: false,
+            hidden: false,
         };
         article.byline = Byline {
             author: Some(block.clone()),

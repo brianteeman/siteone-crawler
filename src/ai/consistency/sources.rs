@@ -579,6 +579,7 @@ mod tests {
             heading_path: vec!["Nadpis".to_string()],
             text: text.to_string(),
             collapsed: false,
+            hidden: false,
         }
     }
 
