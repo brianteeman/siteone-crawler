@@ -715,7 +715,8 @@ pub fn has_offered_blocks(blocks: &[Block], is_homepage: bool) -> bool {
 /// (and the site chrome of the homepage) as numbered lines inside `<page_data>`; every value is
 /// escaped. When the whole message would exceed `input_bytes`, blocks are chosen by score — the H1
 /// and the header row of every table with a chosen row always — within the budget, no block taking
-/// more than a quarter of it, and listed in document order.
+/// more than a quarter of it, never a heading without the first block of its section, and listed
+/// in document order.
 #[allow(clippy::too_many_arguments)]
 pub fn build_page_request(
     page: &AnalyzedPage,
@@ -849,6 +850,16 @@ fn choose_blocks(
         if used + cost <= room {
             used += cost;
             chosen.extend(lines);
+        }
+    }
+    // A heading shown without the first block of its section reads as an empty section: it is
+    // left out, and so is a parent heading that then shows nothing of its section (the H1 stays).
+    for (at, block) in offered.iter().enumerate().rev() {
+        if block.kind == BlockKind::Heading
+            && Some(block.id) != h1
+            && offered.get(at + 1).is_some_and(|next| !chosen.contains_key(&next.id))
+        {
+            chosen.remove(&block.id);
         }
     }
     let shortened = chosen.values().filter(|(_, shortened)| *shortened).count();
@@ -1589,6 +1600,50 @@ mod tests {
         let analysis = verify_analysis(raw, &page, &blocks, &coverage);
         assert_eq!(analysis.vague_references.len(), 1);
         assert_eq!(analysis.rejected.block_ids, 1);
+    }
+
+    #[test]
+    fn a_heading_is_never_shown_without_the_start_of_its_section() {
+        // Fact blocks (prices) win the budget, headings come next, plain text last: without care
+        // the "Výhody" heading would be shown without any of its text, and the model would call
+        // the section empty.
+        let mut html = String::from("<html lang=\"cs\"><body><main><h1>Ceník</h1><h2>Tarify</h2>");
+        for i in 0..8 {
+            html.push_str(&format!("<p>Tarif {i} stojí {} Kč měsíčně.</p>", 100 + i));
+        }
+        html.push_str("<h2>Výhody</h2><h3>Pro firmy</h3>");
+        for i in 0..10 {
+            html.push_str(&format!(
+                "<p>Výhoda číslo {i} je popsaná dlouhým obecným textem bez čísel.</p>"
+            ));
+        }
+        html.push_str("<h2>Kontakt</h2><p>Volejte 800 123 456.</p></main></body></html>");
+        let (page, blocks) = page_of(&html);
+        let mut orphans = Vec::new();
+        let mut reduced = 0;
+        for budget in (700..2_400).step_by(10) {
+            let (_, coverage) = request(&page, &blocks, false, budget);
+            if coverage.is_complete() {
+                continue;
+            }
+            reduced += 1;
+            let included: HashSet<usize> = coverage.included.iter().copied().collect();
+            assert!(included.contains(&find(&blocks, "Ceník").id), "the H1 stays");
+            for block in blocks.iter().filter(|block| included.contains(&block.id)) {
+                if block.kind != BlockKind::Heading || Some(block.id) == coverage.h1 {
+                    continue;
+                }
+                let next = blocks
+                    .iter()
+                    .find(|next| next.id > block.id)
+                    .expect("the section's text");
+                if !included.contains(&next.id) {
+                    orphans.push(format!("{budget}: {:?} without {:?}", block.text, next.text));
+                }
+            }
+        }
+        assert!(reduced > 50, "{reduced} reduced selections");
+        assert!(orphans.is_empty(), "{orphans:#?}");
     }
 
     #[test]
