@@ -238,7 +238,9 @@ pub struct Discovery {
 
 /// Parses a sitemap: a `<urlset>` or a `<sitemapindex>` root (with any namespace prefix), the
 /// `<loc>` and `<lastmod>` of each `<url>` / `<sitemap>` (elements of extensions, such as image
-/// locations, are ignored). Invalid XML, another root element and a truncated file are errors.
+/// locations, are ignored). Invalid XML (an undefined entity, an invalid character reference, a
+/// second root element, text outside the root), another root element and a truncated file are
+/// errors.
 pub fn parse_sitemap(xml: &str) -> Result<ParsedSitemap, String> {
     #[derive(Clone, Copy)]
     enum Field {
@@ -254,11 +256,26 @@ pub fn parse_sitemap(xml: &str) -> Result<ParsedSitemap, String> {
     let mut entry: Option<SitemapEntry> = None;
     let mut field: Option<Field> = None;
     let mut text = String::new();
+    let mut root_closed = false;
     loop {
         let event = reader
             .read_event_into(&mut buf)
             .map_err(|error| format!("invalid XML at byte {}: {}", reader.error_position(), error))?;
         match event {
+            Event::Start(_) | Event::Empty(_) | Event::Text(_) | Event::CData(_) | Event::GeneralRef(_)
+                if root_closed =>
+            {
+                return Err(format!(
+                    "invalid XML at byte {}: content after the root element",
+                    reader.buffer_position()
+                ));
+            }
+            Event::Text(_) | Event::CData(_) | Event::GeneralRef(_) if depth == 0 => {
+                return Err(format!(
+                    "invalid XML at byte {}: text outside the root element",
+                    reader.buffer_position()
+                ));
+            }
             Event::Start(ref element) | Event::Empty(ref element) => {
                 let is_empty = matches!(event, Event::Empty(_));
                 depth += 1;
@@ -283,19 +300,33 @@ pub fn parse_sitemap(xml: &str) -> Result<ParsedSitemap, String> {
                 if is_empty {
                     field = None;
                     depth -= 1;
+                    root_closed = depth == 0;
                 }
             }
             Event::Text(ref content) if field.is_some() => {
                 text.push_str(&content.decode().map_err(|error| error.to_string())?);
             }
             Event::CData(ref content) if field.is_some() => text.push_str(&String::from_utf8_lossy(content)),
-            Event::GeneralRef(ref reference) if field.is_some() => {
-                if let Ok(Some(ch)) = reference.resolve_char_ref() {
-                    text.push(ch);
-                } else if let Ok(name) = reference.decode()
-                    && let Some(value) = quick_xml::escape::resolve_xml_entity(&name)
-                {
-                    text.push_str(value);
+            Event::GeneralRef(ref reference) => {
+                // Only the predefined entities and valid character references are text: a sitemap
+                // declares no entities of its own.
+                let resolved = match reference.resolve_char_ref() {
+                    Ok(Some(ch)) if is_xml_char(ch) => Some(ch.to_string()),
+                    Ok(None) => reference
+                        .decode()
+                        .ok()
+                        .and_then(|name| quick_xml::escape::resolve_xml_entity(&name).map(str::to_string)),
+                    _ => None,
+                };
+                let Some(value) = resolved else {
+                    return Err(format!(
+                        "invalid XML at byte {}: an undefined entity or an invalid character reference &{};",
+                        reader.buffer_position(),
+                        String::from_utf8_lossy(reference)
+                    ));
+                };
+                if field.is_some() {
+                    text.push_str(&value);
                 }
             }
             Event::End(ref element) => {
@@ -313,6 +344,7 @@ pub fn parse_sitemap(xml: &str) -> Result<ParsedSitemap, String> {
                     _ => {}
                 }
                 depth = depth.saturating_sub(1);
+                root_closed = depth == 0;
             }
             Event::Eof => break,
             _ => {}
@@ -324,6 +356,11 @@ pub fn parse_sitemap(xml: &str) -> Result<ParsedSitemap, String> {
     }
     let kind = kind.ok_or_else(|| "no <urlset> or <sitemapindex> root element".to_string())?;
     Ok(ParsedSitemap { kind, entries })
+}
+
+/// A character XML 1.0 allows in a document (`Char`).
+fn is_xml_char(ch: char) -> bool {
+    matches!(ch, '\u{9}' | '\u{a}' | '\u{d}' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..)
 }
 
 /// The `lastmod` statistics of a sitemap's entries; `now` is when the crawl ran.
@@ -866,9 +903,31 @@ mod tests {
             "<rss><channel><title>Feed</title></channel></rss>",
             "Not XML at all",
             "",
+            // An undeclared entity, and an invalid character reference, are no text.
+            "<urlset><url><loc>https://example.com/a&bogus;b</loc></url></urlset>",
+            "<urlset><url><loc>https://example.com/a&#0;b</loc></url></urlset>",
+            "<urlset><!-- &bogus; is a comment --><url><loc>https://e.test/</loc><x>&bogus;</x></url></urlset>",
+            // A second root element, and text outside the root.
+            "<urlset></urlset><urlset><url><loc>https://example.com/second</loc></url></urlset>",
+            "<urlset/><urlset><url><loc>https://example.com/second</loc></url></urlset>",
+            "<urlset><url><loc>https://example.com/</loc></url></urlset>trailing text",
         ] {
             assert!(parse_sitemap(malformed).is_err(), "{malformed:?} parsed");
         }
+        // Character references and CDATA are text.
+        let parsed = parse_sitemap(
+            "<?xml version=\"1.0\"?>\n<urlset><url><loc><![CDATA[https://e.test/a&b]]></loc></url>\
+             <url><loc>https://e.test/&#x10D;&#269;</loc></url></urlset>\n<!-- the end -->\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed
+                .entries
+                .iter()
+                .map(|entry| entry.loc.as_str())
+                .collect::<Vec<_>>(),
+            ["https://e.test/a&b", "https://e.test/čč"]
+        );
     }
 
     #[test]
