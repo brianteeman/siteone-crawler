@@ -6122,6 +6122,24 @@ fn robots_txt_fetch_state_follows_redirects_and_reports_a_loop() {
         matches!(&state, RobotsFetchState::Unavailable { status_or_error } if status_or_error.contains("redirect")),
         "{state:?}"
     );
+
+    // A loop through a Location with credentials names the URL without them.
+    let with_credentials = RedirectServer::start(
+        &tmp.path,
+        vec![Redirect {
+            host: None,
+            path: Some("/robots.txt"),
+            location: "http://someone:SYNTHETIC-ROBOTS-PASSWORD@127.0.0.1:{port}/robots.txt",
+        }],
+    );
+    let port = with_credentials.port();
+    let state = robots_fetch_state(&format!("http://127.0.0.1:{port}/"), &[]);
+    assert_eq!(
+        state,
+        RobotsFetchState::Unavailable {
+            status_or_error: format!("redirect loop at http://127.0.0.1:{port}/robots.txt"),
+        }
+    );
 }
 
 #[test]

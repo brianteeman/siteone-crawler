@@ -1674,8 +1674,9 @@ impl Crawler {
             };
             let target_url = target.to_string();
             if visited.contains(&target_url) {
+                // The state reaches reports: never with the credentials of a Location.
                 return RobotsFetchState::Unavailable {
-                    status_or_error: format!("redirect loop at {}", target_url),
+                    status_or_error: format!("redirect loop at {}", utils::redact_url_userinfo(&target_url)),
                 };
             }
             if visited.len() > MAX_REDIRECTS {
