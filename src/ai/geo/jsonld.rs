@@ -836,18 +836,8 @@ pub fn article(
 /// (`Posted on September 25, 2026 by …`) or is not written like a name (`is_person_name`): a
 /// missing author is better than a wrong one.
 fn author_name(text: &str) -> Option<String> {
-    let mut name = text.trim();
-    for label in AUTHOR_LABELS {
-        if let Some(rest) = name
-            .get(..label.len())
-            .filter(|prefix| prefix.eq_ignore_ascii_case(label))
-            .and_then(|_| name.get(label.len()..))
-            .filter(|rest| rest.starts_with(':') || rest.starts_with(char::is_whitespace))
-        {
-            name = rest.trim_start_matches(':').trim();
-            break;
-        }
-    }
+    let name = text.trim();
+    let name = without_author_label(name).unwrap_or(name);
     let cut = BYLINE_SEPARATORS
         .iter()
         .filter_map(|separator| name.find(separator))
@@ -860,6 +850,19 @@ fn author_name(text: &str) -> Option<String> {
     let words = name.split_whitespace().count();
     let bare = (1..=MAX_AUTHOR_WORDS).contains(&words) && !name.chars().any(|c| c.is_ascii_digit() || c == ':');
     (bare && is_person_name(name)).then(|| name.to_string())
+}
+
+/// The rest of a byline after its leading author label (`By`, `Autor:`, `Napsala`, …, followed
+/// by a colon or a space); `None` without one.
+pub(crate) fn without_author_label(text: &str) -> Option<&str> {
+    let text = text.trim();
+    AUTHOR_LABELS.iter().find_map(|label| {
+        text.get(..label.len())
+            .filter(|prefix| prefix.eq_ignore_ascii_case(label))
+            .and_then(|_| text.get(label.len()..))
+            .filter(|rest| rest.starts_with(':') || rest.starts_with(char::is_whitespace))
+            .map(|rest| rest.trim_start_matches(':').trim())
+    })
 }
 
 /// Lowercase words of a person's name (`Ludwig van Beethoven`, `Leonardo da Vinci`).

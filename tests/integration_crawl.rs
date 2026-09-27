@@ -7427,7 +7427,7 @@ const GEO_FAQ: &str = r#"<!DOCTYPE html>
 /// An article with its author and date right below the title.
 const GEO_ARTICLE: &str = r#"<!DOCTYPE html>
 <html lang="en"><head><title>How to sharpen a spade | Acme</title></head><body><main><article>
-<h1>How to sharpen a spade</h1><p>Jane Smith</p><p>1 September 2026</p>
+<h1>How to sharpen a spade</h1><p>By Jane Smith</p><p>1 September 2026</p>
 <p>A sharp spade cuts roots easily. File the edge at a 45 degree angle.</p>
 </article></main></body></html>"#;
 
@@ -7820,7 +7820,7 @@ fn geo_routes() -> (Vec<MockRoute>, Vec<MockResponse>) {
                 "lead": "File the edge of a spade at a 45 degree angle.",
                 "lead_blocks": [article("A sharp spade cuts roots easily. File the edge at a 45 degree angle.")],
                 "faq_pairs": [],
-                "byline": {"author": article("Jane Smith"), "date": article("1 September 2026")},
+                "byline": {"author": article("By Jane Smith"), "date": article("1 September 2026")},
                 "entity_drafts": []
             })),
         },

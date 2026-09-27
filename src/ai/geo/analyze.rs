@@ -5,9 +5,9 @@
 // `<page_data>` and answers with block ids, never with free facts. Every id is checked against the
 // blocks the model was shown, and every excerpt, FAQ pair, byline and entity value in the result is
 // the crawler's own copy of a block: a lead stays a draft whose numbers must occur in its cited
-// blocks, FAQ pairs must follow their question in page order, a byline must sit right after the H1,
-// and an entity value must occur in its block on token boundaries. What fails a check is dropped
-// and counted, never repaired.
+// blocks, FAQ pairs must follow their question in page order, a byline must sit right after the H1
+// (and name an author only when the page marks it as one), and an entity value must occur in its
+// block on token boundaries. What fails a check is dropped and counted, never repaired.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -18,9 +18,9 @@ use scraper::{ElementRef, Html, Node, Selector};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use crate::ai::blocks::{Block, BlockKind, Region, render_block, style_hides};
+use crate::ai::blocks::{Block, BlockKind, Region, hidden_for_good, render_block, style_hides};
 use crate::ai::geo::controls::{EnginePolicy, in_site_chrome};
-use crate::ai::geo::jsonld::ExistingMarkup;
+use crate::ai::geo::jsonld::{ExistingMarkup, without_author_label};
 use crate::ai::geo::prompts;
 use crate::ai::grounding::{date_mentions, fact_signals, find_token_bounded, numbers_in};
 use crate::ai::normalize::{normalize_json_response, repair_json_with_status};
@@ -64,6 +64,14 @@ static TITLE_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse("title").un
 static HTML_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse("html[lang]").unwrap());
 static H1_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse("h1").unwrap());
 static META_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse("meta[name][content]").unwrap());
+/// The candidates of `authorship_marks` (a class is checked there).
+static AUTHOR_SELECTOR: Lazy<Selector> = Lazy::new(|| {
+    Selector::parse(
+        "[rel~=author], [itemprop~=author], a[href*=\"/author/\"], a[href*=\"/authors/\"], \
+         a[href*=\"/autor/\"], a[href*=\"/autori/\"], [class]",
+    )
+    .unwrap()
+});
 
 /// A page chosen for analysis, as the prompt and the verification need it.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -79,6 +87,9 @@ pub struct AnalyzedPage {
     /// The page's own `<meta name="description">`, whitespace collapsed (at most
     /// `MAX_DESCRIPTION_CHARS` characters); empty without one.
     pub description: String,
+    /// What the page marks as its author (`authorship_marks`): the evidence a byline needs.
+    #[serde(skip_serializing)]
+    pub authors: Vec<String>,
 }
 
 /// What the model was shown of a page.
@@ -346,7 +357,11 @@ pub struct FaqPair {
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Byline {
+    /// A byline block the page marks as its author (a label or markup, see `verify_byline`).
     pub author: Option<Block>,
+    /// A block the model named as the author that passes every other check but that nothing on
+    /// the page marks as the author: shown for review, never used as markup.
+    pub unconfirmed_author: Option<Block>,
     pub date_block: Option<Block>,
     pub date: Option<NaiveDate>,
     /// What the date block says the date is; set with `date`.
@@ -512,7 +527,51 @@ pub fn analyzed_page(url: &str, html: &str) -> AnalyzedPage {
             .and_then(|meta| meta.value().attr("content"))
             .map(|content| clip(&collapse(content.to_string()), MAX_DESCRIPTION_CHARS))
             .unwrap_or_default(),
+        authors: authorship_marks(&document),
     }
+}
+
+/// The texts a page marks as its author, whitespace collapsed, at most `MAX_AUTHOR_CHARS`
+/// characters each (a longer one is an author box or a whole post, no byline): `<meta
+/// name="author">`, and the shown text of the page's own content (not the site chrome, nothing
+/// hidden for good) in `rel=author`, `itemprop=author`, a link to an author page (`/author/`,
+/// `/autor/`, …), or an element whose class names an author or a byline (`author`, `byline`,
+/// `autor`, case-insensitive).
+fn authorship_marks(document: &Html) -> Vec<String> {
+    let collapse = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let meta = document
+        .select(&META_SELECTOR)
+        .filter(|meta| {
+            meta.value()
+                .attr("name")
+                .is_some_and(|name| name.trim().eq_ignore_ascii_case("author"))
+        })
+        .filter_map(|meta| meta.value().attr("content").map(collapse));
+    let marked = document
+        .select(&AUTHOR_SELECTOR)
+        .filter(|element| {
+            let el = element.value();
+            let names_author = |value: &str| {
+                value
+                    .split_whitespace()
+                    .any(|value| value.eq_ignore_ascii_case("author"))
+            };
+            let class = el.attr("class").unwrap_or_default().to_lowercase();
+            el.attr("rel").is_some_and(names_author)
+                || el.attr("itemprop").is_some_and(names_author)
+                || (el.name() == "a"
+                    && el.attr("href").is_some_and(|href| {
+                        ["/author/", "/authors/", "/autor/", "/autori/"]
+                            .iter()
+                            .any(|path| href.contains(path))
+                    }))
+                || ["author", "byline", "autor"].iter().any(|name| class.contains(name))
+        })
+        .filter(|element| !in_site_chrome(*element) && !hidden_for_good(*element))
+        .map(|element| collapse(&shown_text(element)));
+    meta.chain(marked)
+        .filter(|text| !text.is_empty() && text.chars().count() <= MAX_AUTHOR_CHARS)
+        .collect()
 }
 
 /// The text of an element as its blocks show it: without the text of scripts, styles, SVG and
@@ -1154,7 +1213,7 @@ pub fn verify_analysis(raw: RawAnalysis, page: &AnalyzedPage, blocks: &[Block], 
 
     let lead = verify_lead(&raw, &shown, &page.lang, &mut rejected);
     let faq_pairs = verify_faq_pairs(&raw.faq_pairs, &shown, &mut rejected);
-    let byline = verify_byline(&raw.byline, &shown, blocks, coverage.h1, &mut rejected);
+    let byline = verify_byline(&raw.byline, &shown, blocks, coverage.h1, &page.authors, &mut rejected);
     let entity_drafts = verify_entity_drafts(&raw.entity_drafts, &shown, &mut rejected);
 
     PageAnalysis {
@@ -1285,15 +1344,19 @@ fn section_path(heading: &Block, blocks: &[Block]) -> Option<Vec<String>> {
 }
 
 /// The author block (no heading, at most `MAX_AUTHOR_CHARS` characters, 2–6 words) and the date
-/// block (exactly
-/// one date, labeled as a publication or a change but not both, see `date_role`) are kept when they
-/// are among the first `BYLINE_WINDOW` blocks of the page's own content after the H1 and the page
-/// shows them (not hidden for good).
+/// block (exactly one date, labeled as a publication or a change but not both, see `date_role`) are
+/// kept when they are among the first `BYLINE_WINDOW` blocks of the page's own content after the H1
+/// and the page shows them (not hidden for good). Capital letters do not make a name: the author
+/// block is the author only when the page says so — it starts with an author label (`By`,
+/// `Autor:`, see `jsonld::without_author_label`), or it and one of the page's `authors` (its
+/// authorship markup) contain each other on token boundaries. Otherwise it is kept as an
+/// unconfirmed author, for review only.
 fn verify_byline(
     raw: &RawByline,
     shown: &Shown,
     blocks: &[Block],
     h1: Option<usize>,
+    authors: &[String],
     rejected: &mut Rejected,
 ) -> Byline {
     let near_h1 = |block: &Block| {
@@ -1328,7 +1391,14 @@ fn verify_byline(
             && block.text.chars().count() <= MAX_AUTHOR_CHARS
             && (2..=6).contains(&words)
         {
-            byline.author = Some(block.clone());
+            let marked = authors.iter().any(|author| {
+                find_token_bounded(&block.text, author).is_some() || find_token_bounded(author, &block.text).is_some()
+            });
+            if without_author_label(&block.text).is_some() || marked {
+                byline.author = Some(block.clone());
+            } else {
+                byline.unconfirmed_author = Some(block.clone());
+            }
         } else {
             rejected.byline += 1;
         }
@@ -2001,6 +2071,109 @@ mod tests {
     }
 
     #[test]
+    fn an_author_needs_a_byline_label_or_markup_that_names_the_author() {
+        // (the <head>, the site header, the byline, the author block the model cited)
+        let byline = |head: &str, chrome: &str, byline: &str, author: &str| -> Byline {
+            let html = format!(
+                "<html lang=\"en\"><head>{head}</head><body><header>{chrome}</header><main><article>\
+                 <h1>How to sharpen a spade</h1>{byline}<p>Published 1 September 2026</p>\
+                 <p>Wear gloves and file the edge at a shallow angle.</p></article></main></body></html>"
+            );
+            let (page, blocks) = page_of(&html);
+            let cited = blocks
+                .iter()
+                .find(|block| block.region == Region::Main && block.text == author)
+                .map(|block| block_ref(block.id))
+                .unwrap_or_else(|| panic!("no block {author:?}"));
+            analyze(
+                &page,
+                &blocks,
+                &format!(
+                    r#""byline":{{"author":"{cited}","date":"{}"}}"#,
+                    r(&blocks, "Published 1 September 2026")
+                ),
+            )
+            .byline
+        };
+        for (head, byline_html, author) in [
+            ("", "<p>By Jane Smith</p>", "By Jane Smith"),
+            ("", "<p>Autor: Jan Novák</p>", "Autor: Jan Novák"),
+            (
+                "",
+                "<p><a rel=\"author\" href=\"/team/jane\">Jane Smith</a></p>",
+                "Jane Smith",
+            ),
+            ("", "<p><span itemprop=\"author\">Jane Smith</span></p>", "Jane Smith"),
+            ("", "<div class=\"post-byline\"><p>Jane Smith</p></div>", "Jane Smith"),
+            ("", "<p class=\"entry-Author\">Jane Smith</p>", "Jane Smith"),
+            (
+                "",
+                "<p><a href=\"/author/jane-smith/\">Jane Smith</a></p>",
+                "Jane Smith",
+            ),
+            (
+                "<meta name=\"author\" content=\"Jane Smith\">",
+                "<p>Jane Smith</p>",
+                "Jane Smith",
+            ),
+        ] {
+            let found = byline(head, "", byline_html, author);
+            assert_eq!(
+                found.author.map(|block| block.text),
+                Some(author.to_string()),
+                "{byline_html}"
+            );
+        }
+        for (head, chrome, byline_html, author) in [
+            (
+                "",
+                "",
+                "<p>Essential Safety Precautions</p>",
+                "Essential Safety Precautions",
+            ),
+            ("", "", "<p>Jane Smith</p>", "Jane Smith"),
+            ("", "", "<p><a href=\"/team/jane\">Jane Smith</a></p>", "Jane Smith"),
+            (
+                "",
+                "",
+                "<p>Jane Smith</p><p class=\"author\" hidden>Jane Smith</p>",
+                "Jane Smith",
+            ),
+            (
+                "",
+                "<span class=\"author\">Jane Smith</span>",
+                "<p>Jane Smith</p>",
+                "Jane Smith",
+            ),
+            (
+                "<meta name=\"author\" content=\"Acme Tools\">",
+                "",
+                "<p>Jane Smith</p>",
+                "Jane Smith",
+            ),
+            (
+                "",
+                "",
+                "<div class=\"author-box\"><p>Essential Safety Precautions</p><p>Jane Smith writes about garden \
+                 tools for Acme and has sharpened spades, hoes and axes for twenty years in her workshop.</p></div>",
+                "Essential Safety Precautions",
+            ),
+        ] {
+            let found = byline(head, chrome, byline_html, author);
+            assert!(
+                found.author.is_none(),
+                "no authorship evidence: {byline_html} {chrome} {head}"
+            );
+            assert_eq!(
+                found.unconfirmed_author.map(|block| block.text),
+                Some(author.to_string()),
+                "kept for review: {byline_html}"
+            );
+            assert!(found.date.is_some(), "the date stands on its own");
+        }
+    }
+
+    #[test]
     fn a_faq_answer_must_belong_to_its_own_question_on_the_page() {
         let html = "<html lang=\"en\"><body><main><h1>Delivery and returns</h1>\
             <h2>Are returns free?</h2><p>Return labels cost EUR 15.</p>\
@@ -2153,12 +2326,12 @@ mod tests {
     fn a_byline_counts_only_right_after_the_h1() {
         let mut html = String::from(
             "<html lang=\"cs\"><body><header><p>Redakce Example</p></header><main><article>\
-             <h1>Jak vybrat hypotéku</h1><p>Jan Novák</p><p>Publikováno 25. září 2026</p>",
+             <h1>Jak vybrat hypotéku</h1><p class=\"author\">Jan Novák</p><p>Publikováno 25. září 2026</p>",
         );
         for i in 1..=14 {
             html.push_str(&format!("<p>Odstavec článku číslo {}.</p>", "i".repeat(i)));
         }
-        html.push_str("<p>Petr Svoboda</p><p>1. října 2026</p></article></main></body></html>");
+        html.push_str("<p class=\"author\">Petr Svoboda</p><p>1. října 2026</p></article></main></body></html>");
         let (page, blocks) = page_of(&html);
         let byline = |author: &str, date: &str| {
             analyze(
@@ -2334,7 +2507,7 @@ mod tests {
             "Jak na <script>var x = 1;</script>hypotéku",
         ] {
             let html = format!(
-                "<html lang=\"cs\"><body><main><article><h1>{heading}</h1><p>Jan Novák</p>\
+                "<html lang=\"cs\"><body><main><article><h1>{heading}</h1><p class=\"author\">Jan Novák</p>\
                  <p>25. září 2026</p><p>Text článku.</p></article></main></body></html>"
             );
             let (page, blocks) = page_of(&html);

@@ -1366,7 +1366,7 @@ mod tests {
         <h2>Lze splatit předčasně?</h2><p>Ano, bez poplatku &lt;/script&gt;.</p></main></body></html>";
 
     const ARTICLE_PAGE: &str = "<html lang=\"cs\"><body><main><article><h1>Jak vybrat hypotéku</h1>\
-        <p>Jan Novák</p><p>25. září 2026</p><p>Text článku.</p></article></main></body></html>";
+        <p class=\"author\">Jan Novák</p><p>25. září 2026</p><p>Text článku.</p></article></main></body></html>";
 
     fn faq_analysis() -> PageAnalysis {
         analysis_of("https://example.com/faq", FAQ_PAGE, |blocks| {
@@ -1581,6 +1581,58 @@ mod tests {
             format!("<div hidden=\"until-found\">{pairs}</div>"),
         ] {
             assert!(faq_of(&shown).is_some(), "{shown}");
+        }
+    }
+
+    #[test]
+    fn an_article_names_only_an_author_the_page_marks_as_its_author() {
+        let (site, home_markup) = site();
+        let none = ExistingMarkup::default();
+        let entry = |byline: &str, author: &str| -> KitEntry {
+            let html = format!(
+                "<html lang=\"en\"><body><main><article><h1>How to sharpen a spade</h1>{byline}\
+                 <p>Published 1 September 2026</p><p>Wear gloves and file the edge.</p></article></main></body></html>"
+            );
+            let mut analysis = analysis_of("https://example.com/guides/spade", &html, |blocks| {
+                format!(
+                    r#","byline":{{"author":"{}","date":"{}"}}"#,
+                    id(blocks, author),
+                    id(blocks, "Published 1 September 2026")
+                )
+            });
+            analysis.page_type = PageType::Article;
+            let pages = [MarkupPage {
+                url: "https://example.com/guides/spade",
+                analysis: Some(&analysis),
+                existing: &none,
+                indexable: true,
+            }];
+            markup_entries(&site, &home_markup, &pages, &HashMap::new())
+                .into_iter()
+                .find(|entry| entry.kind == "Article")
+                .expect("the article")
+        };
+        for (byline, author) in [
+            ("<p>Essential Safety Precautions</p>", "Essential Safety Precautions"),
+            ("<p>Jane Smith</p>", "Jane Smith"),
+        ] {
+            let article = entry(byline, author);
+            assert_eq!(article.json.get("author"), None, "{byline}");
+            assert!(
+                !article.evidence.iter().any(|evidence| evidence.contains(author)),
+                "{:?}",
+                article.evidence
+            );
+            assert_eq!(article.json["datePublished"], "2026-09-01", "the date is kept");
+        }
+        for (byline, author) in [
+            ("<p>By Jane Smith</p>", "By Jane Smith"),
+            (
+                "<p><a rel=\"author\" href=\"/team/jane\">Jane Smith</a></p>",
+                "Jane Smith",
+            ),
+        ] {
+            assert_eq!(entry(byline, author).json["author"]["name"], "Jane Smith", "{byline}");
         }
     }
 

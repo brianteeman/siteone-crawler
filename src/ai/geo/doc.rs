@@ -1306,11 +1306,16 @@ impl GeoDoc {
             }
             if page.page_type == crate::ai::geo::analyze::PageType::Article {
                 let missing = text(locale, "label.byline_missing").to_string();
-                let author = page
-                    .byline
-                    .author
-                    .as_ref()
-                    .map_or_else(|| missing.clone(), |block| block.text.clone());
+                let author = match (&page.byline.author, &page.byline.unconfirmed_author) {
+                    (Some(author), _) => author.text.clone(),
+                    // Named by the model, but not marked as the author by the page: review only.
+                    (None, Some(named)) => fill(
+                        text(locale, "label.byline_unconfirmed"),
+                        std::slice::from_ref(&named.text),
+                        0,
+                    ),
+                    (None, None) => missing.clone(),
+                };
                 let date = page
                     .byline
                     .date
@@ -2047,6 +2052,7 @@ fn page_json(page: &PageAnalysis) -> Value {
         })).collect::<Vec<_>>(),
         "byline": {
             "author": page.byline.author.as_ref().map(block_json),
+            "unconfirmedAuthor": page.byline.unconfirmed_author.as_ref().map(block_json),
             "dateBlock": page.byline.date_block.as_ref().map(block_json),
             "date": page.byline.date.map(|date| date.format("%Y-%m-%d").to_string()),
         },
@@ -2448,6 +2454,10 @@ const EN: &[(&str, &str)] = &[
     ("priority.low", "low"),
     ("label.byline", "Author and date"),
     ("label.byline_missing", "not found near the title"),
+    (
+        "label.byline_unconfirmed",
+        "not confirmed (\"{0}\" has no author label or markup, so the kit does not use it)",
+    ),
     ("label.lead", "Lead draft (review before publishing; see leads.md)"),
     ("label.failed_pages", "Pages whose analysis failed"),
     ("label.existing", "Existing markup on the key pages"),
@@ -3297,6 +3307,10 @@ const CS: &[(&str, &str)] = &[
     ("label.byline", "Autor a datum"),
     ("label.byline_missing", "u titulku nenalezeno"),
     (
+        "label.byline_unconfirmed",
+        "nepotvrzeno („{0}“ nemá popisek ani značku autora, sada ho proto nepoužije)",
+    ),
+    (
         "label.lead",
         "Návrh úvodu (před zveřejněním zkontrolujte; viz leads.md)",
     ),
@@ -3985,6 +3999,30 @@ mod tests {
     const KIT_DIR: &str = "ai-geo-kit.example.com.20260926-1000";
 
     #[test]
+    fn an_author_the_page_does_not_mark_is_shown_for_review_only() {
+        for language in ["en", "cs"] {
+            let mut doc = sample(language, true);
+            let page = &mut doc.pages[0];
+            page.page_type = crate::ai::geo::analyze::PageType::Article;
+            page.byline.unconfirmed_author = blocks_from_html("<main><p>Essential Safety Precautions</p></main>")
+                .into_iter()
+                .next();
+            let locale = ReportLocale::new(language);
+            let note = fill(
+                text(&locale, "label.byline_unconfirmed"),
+                &["Essential Safety Precautions".to_string()],
+                0,
+            );
+            let md = doc.to_markdown(KIT_DIR);
+            assert!(md.contains(&note), "{language}: {md}");
+            let json = doc.to_json();
+            let byline = &json["pages"][0]["byline"];
+            assert!(byline["author"].is_null(), "{byline}");
+            assert_eq!(byline["unconfirmedAuthor"]["text"], "Essential Safety Precautions");
+        }
+    }
+
+    #[test]
     fn the_evidence_box_comes_first_and_the_manual_checks_are_listed() {
         for language in ["en", "cs"] {
             let doc = sample(language, true);
@@ -4219,6 +4257,7 @@ mod tests {
                 "label.sitemap_withheld",
                 "label.consistency_link",
                 "label.consistency_partial",
+                "label.byline_unconfirmed",
             ]
             .map(str::to_string),
         );

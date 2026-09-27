@@ -2284,6 +2284,7 @@ mod tests {
             date_block: Some(block),
             date: chrono::NaiveDate::from_ymd_opt(2026, 9, 25),
             date_role: Some(crate::ai::geo::analyze::DateRole::Published),
+            ..Byline::default()
         };
         signed.analysis.pages[0] = article;
         assert!(issues(&signed, CategoryId::EntityClarity).is_empty());
