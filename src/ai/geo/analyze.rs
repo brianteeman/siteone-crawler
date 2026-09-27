@@ -13,12 +13,13 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::NaiveDate;
+use ego_tree::iter::Edge;
 use once_cell::sync::Lazy;
 use scraper::{ElementRef, Html, Node, Selector};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use crate::ai::blocks::{Block, BlockKind, Region, hidden_for_good, render_block, style_hides};
+use crate::ai::blocks::{Block, BlockKind, Region, hidden_for_good, is_inline, render_block, style_hides};
 use crate::ai::geo::controls::{EnginePolicy, in_site_chrome};
 use crate::ai::geo::jsonld::{ExistingMarkup, without_author_label};
 use crate::ai::geo::prompts;
@@ -582,7 +583,7 @@ fn authorship_marks(document: &Html) -> Vec<String> {
 
 /// The text of an element as its blocks show it: without the text of scripts, styles, SVG and
 /// other non-text elements, and of hidden inline elements (a block of their own), with a `<br>`
-/// as a space.
+/// and the edges of a nested block element (`<div>`, `<p>`, …) as a space. The walk is iterative.
 pub(crate) fn shown_text(element: ElementRef) -> String {
     const NOT_TEXT: &[&str] = &["script", "style", "template", "noscript", "svg", "iframe"];
     let hidden = |node: ego_tree::NodeRef<Node>| {
@@ -595,19 +596,34 @@ pub(crate) fn shown_text(element: ElementRef) -> String {
                 || element.attr("style").is_some_and(style_hides)
         })
     };
+    let sets_apart = |node: ego_tree::NodeRef<Node>| {
+        node.value()
+            .as_element()
+            .is_some_and(|child| child.name() == "br" || !is_inline(child.name()))
+    };
     let mut text = String::new();
-    for node in element.descendants() {
-        let shown = !node
-            .ancestors()
-            .take_while(|ancestor| ancestor.id() != element.id())
-            .any(hidden)
-            && !hidden(node);
-        if !shown {
-            continue;
-        }
-        match node.value() {
-            Node::Text(part) => text.push_str(part),
-            Node::Element(child) if child.name() == "br" => text.push(' '),
+    // The depth inside a hidden element whose text is left out.
+    let mut skipped = 0usize;
+    for edge in element.traverse() {
+        match edge {
+            Edge::Open(node) if node.id() != element.id() => {
+                if skipped > 0 || hidden(node) {
+                    skipped += usize::from(node.value().is_element());
+                    continue;
+                }
+                match node.value() {
+                    Node::Text(part) => text.push_str(part),
+                    _ if sets_apart(node) => text.push(' '),
+                    _ => {}
+                }
+            }
+            Edge::Close(node) if node.id() != element.id() => {
+                if skipped > 0 {
+                    skipped -= usize::from(node.value().is_element());
+                } else if sets_apart(node) {
+                    text.push(' ');
+                }
+            }
             _ => {}
         }
     }

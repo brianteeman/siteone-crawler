@@ -1599,6 +1599,15 @@ mod tests {
             Some("Garden service"),
             "only the text a visitor sees"
         );
+        // Blocks nested in the heading are set apart, inline elements are not.
+        assert_eq!(
+            name("<main><h1><div>Pricing</div><div>for <b>small</b> teams</div></h1></main>").as_deref(),
+            Some("Pricing for small teams")
+        );
+        assert_eq!(
+            name("<main><h1><span>Pri</span><em>cing</em><br>plans</h1></main>").as_deref(),
+            Some("Pricing plans")
+        );
     }
 
     #[test]
