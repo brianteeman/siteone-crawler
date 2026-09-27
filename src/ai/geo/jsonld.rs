@@ -464,8 +464,7 @@ pub fn organization(
         url.set_query(None);
         url.set_fragment(None);
         let url = url.to_string();
-        let handle = compact(&profile.handle);
-        if profile.organization && tokens.iter().any(|token| handle.contains(token.as_str())) {
+        if profile.organization && tokens.iter().any(|token| names_brand(&profile.handle, token)) {
             push_unique(&mut same_as, &url);
             possible.retain(|known| *known != url);
         } else if !same_as.contains(&url) {
@@ -596,6 +595,52 @@ fn brand_tokens(site_name: &str, host: Option<&str>) -> Vec<String> {
     tokens.retain(|token| token.chars().count() >= 3);
     tokens.dedup();
     tokens
+}
+
+/// Whether a profile handle names the brand `token` (a `brand_tokens` entry) as a word or a run
+/// of words: `aster`, `aster-garden-tools`, `AsterTools` and `aster_2026` do, `blaster`,
+/// `asteroid` and `astercz` do not (another name, or one that cannot be told apart from it).
+fn names_brand(handle: &str, token: &str) -> bool {
+    let words = handle_words(handle);
+    (0..words.len()).any(|start| {
+        let mut joined = String::new();
+        for word in &words[start..] {
+            joined.push_str(word);
+            if joined == token {
+                return true;
+            }
+            if !token.starts_with(joined.as_str()) {
+                return false;
+            }
+        }
+        false
+    })
+}
+
+/// The words of a handle, each `compact`: split at any other character, where a lowercase letter
+/// meets an uppercase one, and between letters and digits.
+fn handle_words(handle: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut previous: Option<char> = None;
+    for c in handle.chars() {
+        let boundary = previous.is_some_and(|previous| {
+            (previous.is_lowercase() && c.is_uppercase()) || (previous.is_alphabetic() != c.is_alphabetic())
+        });
+        if !c.is_alphanumeric() || boundary {
+            words.push(compact(&current));
+            current.clear();
+        }
+        if c.is_alphanumeric() {
+            current.push(c);
+            previous = Some(c);
+        } else {
+            previous = None;
+        }
+    }
+    words.push(compact(&current));
+    words.retain(|word| !word.is_empty());
+    words
 }
 
 /// Lowercase letters and digits only, without diacritics: `Example s.r.o.` → `examplesro`.
@@ -1022,20 +1067,59 @@ mod tests {
                 "contactPoint": [{"@type": "ContactPoint", "telephone": "+420800123456", "email": "info@example.com"}],
                 "sameAs": [
                     "https://www.linkedin.com/company/example-s-r-o/",
-                    "https://www.facebook.com/examplecz",
                     "https://www.youtube.com/@ExampleOfficial",
                     "https://github.com/example",
                     "https://bsky.app/profile/example.com"
                 ]
             })
         );
-        // A founder's profile and a profile not named after the brand are only suggested; share
-        // and intent links are no profiles at all.
+        // A founder's profile and a profile not named after the brand (as a word) are only
+        // suggested; share and intent links are no profiles at all.
         assert_eq!(
             possible,
             [
                 "https://www.linkedin.com/in/jan-novak-founder",
+                "https://www.facebook.com/examplecz",
                 "https://www.instagram.com/someoneelse/"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_profile_is_the_brand_only_when_its_handle_names_the_brand_as_a_word() {
+        let html = r#"<body><main><h1>Aster tools</h1></main><footer>
+            <p>Website built by <a href="https://github.com/blaster">Blaster, an independent web agency</a>.</p>
+            <a href="https://github.com/aster">Aster on GitHub</a>
+            <a href="https://www.instagram.com/asteroid.photos/">Asteroid</a>
+            <a href="https://www.youtube.com/@AsterTools">YouTube</a>
+            <a href="https://www.linkedin.com/company/aster-garden-tools/">LinkedIn</a>
+            <a href="https://x.com/aster_2026">X</a>
+            <a href="https://www.facebook.com/astercz">Facebook</a>
+        </footer></body>"#;
+        let base = url::Url::parse("https://aster.example/").unwrap();
+        let (organization, possible) = organization(
+            "Aster",
+            "https://aster.example",
+            &Html::parse_document(html),
+            &[],
+            &base,
+        );
+        assert_eq!(
+            organization["sameAs"],
+            json!([
+                "https://github.com/aster",
+                "https://www.youtube.com/@AsterTools",
+                "https://www.linkedin.com/company/aster-garden-tools/",
+                "https://x.com/aster_2026"
+            ])
+        );
+        // A handle that only contains the brand's letters is another name; left for the owner.
+        assert_eq!(
+            possible,
+            [
+                "https://github.com/blaster",
+                "https://www.instagram.com/asteroid.photos/",
+                "https://www.facebook.com/astercz"
             ]
         );
     }
