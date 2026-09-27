@@ -251,9 +251,16 @@ fn breadcrumb_levels(page_url: &str, into: &mut HashSet<String>) {
 }
 
 /// The deterministic checks over the crawl, and the pages chosen for the analysis with their
-/// blocks, signals and markup. Reads `status` only; `crawl_end` says whether the crawl covered
-/// the whole site (for the sitemap proposal).
-fn prepare(options: &CoreOptions, status: &Status, now: DateTime<Utc>, crawl_end: CrawlEnd) -> Prepared {
+/// blocks, signals and markup. Reads `status` only; `crawl_end` and `robots_skipped` (the URLs
+/// robots.txt kept the crawler from) say whether the crawl covered the whole site (for the
+/// sitemap proposal).
+fn prepare(
+    options: &CoreOptions,
+    status: &Status,
+    now: DateTime<Utc>,
+    crawl_end: CrawlEnd,
+    robots_skipped: &[String],
+) -> Prepared {
     let key: Vec<KeyPage> = key_pages(status, &options.ai_include, &options.ai_exclude);
     let key_urls: Vec<String> = key.iter().map(|page| page.url.clone()).collect();
     let policy: Vec<OriginPolicy> = paths_by_origin(&key_urls)
@@ -318,6 +325,7 @@ fn prepare(options: &CoreOptions, status: &Status, now: DateTime<Utc>, crawl_end
         max_visited_urls: options.max_visited_urls,
         max_depth: options.max_depth,
         url_filters: !options.include_regex.is_empty() || !options.ignore_regex.is_empty(),
+        robots_skipped: robots_skipped.to_vec(),
     };
     let homepage_robots = url::Url::parse(&homepage_url)
         .ok()
@@ -447,12 +455,14 @@ fn prepare(options: &CoreOptions, status: &Status, now: DateTime<Utc>, crawl_end
 
 /// Entry point for `--ai-geo`. Fail-soft: never panics, never aborts the crawl. The deterministic
 /// checks run even when the AI configuration cannot be built; the per-page categories are then
-/// "not assessed".
+/// "not assessed". `crawl_end` and `robots_skipped` (the URLs robots.txt kept the crawler from,
+/// which reach `status` only after the AI phase) tell how much of the site the crawl covered.
 pub async fn run(
     options: &CoreOptions,
     status: &Arc<Mutex<Status>>,
     output: &Arc<Mutex<Box<dyn Output>>>,
     crawl_end: CrawlEnd,
+    robots_skipped: &[String],
 ) {
     let _ = output;
     // Own the usage ledger only when running standalone: the actions and the other pipelines
@@ -474,7 +484,7 @@ pub async fn run(
             Ok(s) => s,
             Err(_) => return,
         };
-        prepare(options, &st, now, crawl_end)
+        prepare(options, &st, now, crawl_end, robots_skipped)
     };
     let Prepared {
         mut checks,

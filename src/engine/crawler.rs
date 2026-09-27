@@ -23,6 +23,8 @@ static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// Set when the queue refused a new URL at `--max-queue-length` (reset when a crawl starts): the
 /// crawl then does not cover every URL it found.
 static QUEUE_FULL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set when a link to a page was not queued because it is longer than `--max-url-length`.
+static URL_TOO_LONG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Asks the running crawl to wind down, as Ctrl+C would.
 pub fn request_stop() {
@@ -239,6 +241,7 @@ impl Crawler {
     /// Main crawl loop. Processes URLs concurrently with rate limiting.
     pub async fn run(&mut self) -> CrawlerResult<()> {
         QUEUE_FULL.store(false, Ordering::SeqCst);
+        URL_TOO_LONG.store(false, Ordering::SeqCst);
         // Add initial URL to queue
         self.add_url_to_queue(&self.initial_parsed_url.clone(), None, UrlSource::InitUrl as i32);
 
@@ -401,6 +404,11 @@ impl Crawler {
     /// Whether the queue refused a new URL at `--max-queue-length` during this crawl.
     pub fn dropped_urls_at_queue_limit(&self) -> bool {
         QUEUE_FULL.load(Ordering::SeqCst)
+    }
+
+    /// Whether a link to a page was dropped for being longer than `--max-url-length`.
+    pub fn dropped_urls_over_max_length(&self) -> bool {
+        URL_TOO_LONG.load(Ordering::SeqCst)
     }
 
     /// Take the next URL from the queue (breadth-first order)
@@ -1339,6 +1347,9 @@ impl Crawler {
         let is_url_with_sitemap = Self::is_sitemap_url(url);
         let is_url_too_long = full_url.len() as i64 > options.max_url_length;
         let allowed_only_html = options.crawl_only_html_files();
+        if is_url_too_long && is_url_with_html && !is_in_queue && !is_already_visited {
+            URL_TOO_LONG.store(true, Ordering::SeqCst);
+        }
 
         if !is_in_queue
             && !is_already_visited

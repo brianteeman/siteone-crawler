@@ -322,10 +322,26 @@ impl Manager {
                 crate::ai::geo::discovery::CrawlEnd::UrlLimit
             } else if crawler.dropped_urls_at_queue_limit() {
                 crate::ai::geo::discovery::CrawlEnd::QueueLimit
+            } else if crawler.dropped_urls_over_max_length() {
+                crate::ai::geo::discovery::CrawlEnd::UrlLengthLimit
             } else {
                 crate::ai::geo::discovery::CrawlEnd::Complete
             };
-            crate::ai::geo::run(options.as_ref(), crawler.get_status(), crawler.get_output(), crawl_end).await;
+            // The skipped URLs reach the status only in `run_post_crawl`.
+            let robots_skipped: Vec<String> = crawler
+                .get_skipped()
+                .iter()
+                .filter(|entry| entry.reason == crate::types::SkippedReason::RobotsTxt)
+                .map(|entry| entry.url.clone())
+                .collect();
+            crate::ai::geo::run(
+                options.as_ref(),
+                crawler.get_status(),
+                crawler.get_output(),
+                crawl_end,
+                &robots_skipped,
+            )
+            .await;
         }
         if options.ai_enabled && runs_ai {
             crate::events::phase("ai", crate::events::PhaseState::Finished);

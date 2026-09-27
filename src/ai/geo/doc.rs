@@ -2248,7 +2248,15 @@ const EN: &[(&str, &str)] = &[
     ),
     (
         "sitemap_withheld.failed_urls",
-        "some linked URLs of the site could not be fetched (errors, timeouts or rate limiting), so pages behind them may be missing",
+        "some linked URLs of the site could not be fetched (refused, errors, timeouts, rate limiting or redirects that lead nowhere), so pages behind them may be missing",
+    ),
+    (
+        "sitemap_withheld.robots_skipped",
+        "robots.txt kept the crawler from pages that Googlebot or Bingbot may crawl, so these pages and the pages behind them may be missing",
+    ),
+    (
+        "sitemap_withheld.url_length_limit",
+        "the crawl skipped links longer than --max-url-length",
     ),
     (
         "sitemap_withheld.single_page",
@@ -3078,7 +3086,15 @@ const CS: &[(&str, &str)] = &[
     ),
     (
         "sitemap_withheld.failed_urls",
-        "některé odkazované URL webu nešlo načíst (chyby, vypršení času nebo omezení počtu požadavků), takže stránky za nimi mohou chybět",
+        "některé odkazované URL webu nešlo načíst (odmítnutí, chyby, vypršení času, omezení počtu požadavků nebo přesměrování, která nikam nevedou), takže stránky za nimi mohou chybět",
+    ),
+    (
+        "sitemap_withheld.robots_skipped",
+        "robots.txt nepustil crawler na stránky, které smí procházet Googlebot nebo Bingbot, takže tyto stránky a stránky za nimi mohou chybět",
+    ),
+    (
+        "sitemap_withheld.url_length_limit",
+        "procházení vynechalo odkazy delší než --max-url-length",
     ),
     (
         "sitemap_withheld.single_page",

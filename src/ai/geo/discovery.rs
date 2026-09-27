@@ -162,6 +162,8 @@ pub enum CrawlEnd {
     UrlLimit,
     /// Dropped URLs because the queue was full (`--max-queue-length`).
     QueueLimit,
+    /// Dropped links to pages longer than `--max-url-length`.
+    UrlLengthLimit,
 }
 
 /// How much of the site the crawl covered: a sitemap is proposed only for a crawl of all of it.
@@ -175,6 +177,8 @@ pub struct CrawlScope {
     pub max_depth: i64,
     /// `--include-regex` or `--ignore-regex` limited the URLs crawled.
     pub url_filters: bool,
+    /// The URLs the crawler did not fetch because robots.txt disallows them for it.
+    pub robots_skipped: Vec<String>,
 }
 
 /// A page of the proposed sitemap.
@@ -609,9 +613,10 @@ pub fn discovery(status: &Status, key: &[KeyPage], declared: &[String], now: Dat
 /// Bingbot, each once, with a `lastmod` only from a plausible `Last-Modified`. The error names why
 /// there is none: `sitemap_exists` (declared in robots.txt or crawled), `robots_unknown`
 /// (robots.txt, which may declare one, was not read), `robots_not_utf8`, `single_page`,
-/// `interrupted`, `url_limit`, `queue_limit`, `limited_scope` (`--max-depth`, `--include-regex`,
-/// `--ignore-regex`), `failed_urls` (a linked URL of the site could not be fetched, so pages behind
-/// it may be missing), `no_pages` or `too_many_urls`.
+/// `interrupted`, `url_limit`, `queue_limit`, `url_length_limit`, `limited_scope` (`--max-depth`,
+/// `--include-regex`, `--ignore-regex`), `failed_urls` (a linked URL of the site failed, was
+/// refused or redirects nowhere, so pages behind it may be missing), `robots_skipped` (robots.txt
+/// kept the crawler from pages Googlebot or Bingbot may crawl), `no_pages` or `too_many_urls`.
 pub fn sitemap_proposal(
     status: &Status,
     discovery: &Discovery,
@@ -641,6 +646,7 @@ pub fn sitemap_proposal(
         CrawlEnd::Interrupted => return Err("interrupted"),
         CrawlEnd::UrlLimit => return Err("url_limit"),
         CrawlEnd::QueueLimit => return Err("queue_limit"),
+        CrawlEnd::UrlLengthLimit => return Err("url_length_limit"),
     }
     if scope.max_depth > 0 || scope.url_filters {
         return Err("limited_scope");
@@ -649,16 +655,35 @@ pub fn sitemap_proposal(
         .map(|url| url.origin())
         .map_err(|_| "no_pages")?;
     let visited = status.get_visited_urls();
-    // A link (or a sitemap or redirect entry) of the site that failed hides what is behind it.
+    let by_url = visits_by_url(&visited);
+    // A link (or a sitemap or redirect entry) of the site that failed, was refused or redirects
+    // nowhere hides what is behind it; a page that does not exist (404, 410) or needs a login
+    // (401, which engines do not have either) hides nothing public.
     let failed = visited.iter().any(|visit| {
+        let code = visit.status_code;
         !visit.is_external
             && matches!(visit.source_attr, SOURCE_A_HREF | SOURCE_SITEMAP | SOURCE_REDIRECT)
-            && (visit.status_code == 429
-                || visit.status_code >= 500
-                || (visit.status_code < 0 && visit.status_code != -6))
+            && (((400..=499).contains(&code) && !matches!(code, 401 | 404 | 410))
+                || code >= 500
+                || (code < 0 && code != -6)
+                || redirects_nowhere(visit, &by_url))
     });
     if failed {
         return Err("failed_urls");
+    }
+    // Pages that robots.txt kept the crawler from while Googlebot or Bingbot may crawl them were
+    // never seen, nor the pages behind them.
+    let unseen = scope.robots_skipped.iter().any(|skipped| {
+        url::Url::parse(skipped).is_ok_and(|url| {
+            let path = &url[url::Position::BeforePath..];
+            url.origin() == origin
+                && rules
+                    .as_ref()
+                    .is_none_or(|rules| rules.is_allowed("Googlebot", path) || rules.is_allowed("Bingbot", path))
+        })
+    });
+    if unseen {
+        return Err("robots_skipped");
     }
     let mut left_out = LeftOut::default();
     let mut urls = Vec::new();
@@ -735,6 +760,34 @@ fn same_site(page: &url::Url, target: &str) -> bool {
         .ok()
         .and_then(|target| target.host_str().map(site))
         .is_some_and(|host| page.host_str().map(site) == Some(host))
+}
+
+/// A redirect that never reaches a crawled answer: it loops, or its last hop has no usable
+/// `Location` or leads to a URL of the same site that was not crawled.
+fn redirects_nowhere(visit: &VisitedUrl, by_url: &HashMap<String, &VisitedUrl>) -> bool {
+    if !(301..=308).contains(&visit.status_code) {
+        return false;
+    }
+    let chain = redirect_chain(visit, by_url);
+    if chain.loops_to.is_some() {
+        return true;
+    }
+    let Some(last) = chain
+        .visits
+        .last()
+        .filter(|last| (301..=308).contains(&last.status_code))
+    else {
+        return false;
+    };
+    let Ok(base) = url::Url::parse(&last.url) else {
+        return true;
+    };
+    let target = last
+        .extras
+        .as_ref()
+        .and_then(|extras| extras.get("Location"))
+        .and_then(|location| base.join(location).ok());
+    target.is_none_or(|target| same_site(&base, target.as_str()))
 }
 
 /// Where a redirect leads: the end of its crawled chain, or else its `Location`.
@@ -1431,6 +1484,7 @@ mod tests {
             max_visited_urls: 10_000,
             max_depth: 0,
             url_filters: false,
+            robots_skipped: Vec::new(),
         }
     }
 
@@ -1609,10 +1663,11 @@ mod tests {
             change(&mut scope);
             scope
         };
-        let cases: [(CrawlScope, &str); 6] = [
+        let cases: [(CrawlScope, &str); 7] = [
             (scope(|scope| scope.single_page = true), "single_page"),
             (scope(|scope| scope.end = CrawlEnd::UrlLimit), "url_limit"),
             (scope(|scope| scope.end = CrawlEnd::QueueLimit), "queue_limit"),
+            (scope(|scope| scope.end = CrawlEnd::UrlLengthLimit), "url_length_limit"),
             (scope(|scope| scope.end = CrawlEnd::Interrupted), "interrupted"),
             (scope(|scope| scope.max_depth = 2), "limited_scope"),
             (scope(|scope| scope.url_filters = true), "limited_scope"),
@@ -1691,6 +1746,89 @@ mod tests {
             );
             assert_eq!(propose(&status), Err("failed_urls"), "HTTP {code}");
         }
+        // A page refused to the crawler hides its content and the pages behind it; a page that
+        // does not exist, or needs a login (which engines do not have either), hides nothing
+        // public.
+        for (code, withheld) in [
+            (403, true),
+            (400, true),
+            (451, true),
+            (401, false),
+            (404, false),
+            (410, false),
+        ] {
+            let mut status = site_without_sitemap();
+            add(
+                &mut status,
+                page(
+                    "refused",
+                    "home",
+                    SOURCE_A_HREF,
+                    "https://example.com/refused",
+                    code,
+                    None,
+                ),
+                None,
+            );
+            let expected = if withheld { Err("failed_urls") } else { Ok(5) };
+            assert_eq!(propose(&status), expected, "HTTP {code}");
+        }
+        // A redirect that loops, or leads to a page of the site that was not crawled, never
+        // reaches the page behind it; one to another site is not the site's.
+        for (location, withheld) in [
+            ("/catalog", true),
+            ("/catalog-new", true),
+            ("https://other.example/catalog", false),
+        ] {
+            let mut status = site_without_sitemap();
+            add(
+                &mut status,
+                page(
+                    "catalog",
+                    "home",
+                    SOURCE_A_HREF,
+                    "https://example.com/catalog",
+                    302,
+                    Some(location),
+                ),
+                None,
+            );
+            let expected = if withheld { Err("failed_urls") } else { Ok(5) };
+            assert_eq!(propose(&status), expected, "{location}");
+        }
+    }
+
+    #[test]
+    fn no_sitemap_is_proposed_when_robots_txt_kept_the_crawler_from_pages_engines_may_crawl() {
+        // SiteOne Crawler obeys `*`, which disallows /catalog; Googlebot has its own group.
+        let rules =
+            robots("User-agent: *\nDisallow: /catalog\nDisallow: /admin\n\nUser-agent: Googlebot\nDisallow: /admin\n");
+        let status = site_without_sitemap();
+        let propose = |skipped: &[&str]| {
+            let scope = CrawlScope {
+                robots_skipped: skipped.iter().map(|url| url.to_string()).collect(),
+                ..complete_scope()
+            };
+            sitemap_proposal(
+                &status,
+                &Discovery::default(),
+                "https://example.com/",
+                &rules,
+                &scope,
+                now(),
+            )
+            .map(|proposal| proposal.urls.len())
+        };
+        assert_eq!(
+            propose(&["https://example.com/admin", "https://other.example/catalog"]),
+            Ok(5),
+            "no engine may crawl /admin either; another site is not this one"
+        );
+        assert_eq!(
+            propose(&["https://example.com/admin", "https://example.com/catalog?page=2"]),
+            Err("robots_skipped"),
+            "Googlebot may crawl /catalog"
+        );
     }
 
     #[test]

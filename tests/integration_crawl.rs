@@ -7445,6 +7445,11 @@ const GEO_APP_SHELL: &str = r#"<!DOCTYPE html>
 /// shell, a visible FAQ, an article with a byline and a footer with a brand and a founder
 /// LinkedIn.
 fn geo_site() -> RecordingServer {
+    geo_site_with(GEO_ROBOTS, "403 Forbidden")
+}
+
+/// The GEO fixture site with another robots.txt and another answer of `/private`.
+fn geo_site_with(robots: &str, private_status: &str) -> RecordingServer {
     let html = |path: &'static str, status: Option<&str>, body: &str| {
         let mut headers = vec![("Content-Type", "text/html; charset=utf-8".to_string())];
         if let Some(status) = status {
@@ -7460,14 +7465,14 @@ fn geo_site() -> RecordingServer {
         Route {
             path: "/robots.txt",
             headers: vec![("Content-Type", "text/plain".to_string())],
-            body: GEO_ROBOTS.as_bytes().to_vec(),
+            body: robots.as_bytes().to_vec(),
         },
         html("/", None, GEO_HOME),
         html("/faq", None, GEO_FAQ),
         html("/blog/first-post", None, GEO_ARTICLE),
         html(
             "/private",
-            Some("403 Forbidden"),
+            Some(private_status),
             "<html><head><title>Forbidden</title></head><body><p>Forbidden</p></body></html>",
         ),
         html("/hidden", None, GEO_NOINDEX),
@@ -8240,8 +8245,9 @@ fn ai_geo_compares_the_raw_html_with_the_rendered_page_in_browser_mode() {
 /// at `--max-visited-urls` says why there is none.
 #[test]
 fn ai_geo_proposes_a_sitemap_only_after_a_complete_crawl() {
-    let server = geo_site();
-    let crawl = |name: &str, extra: &[&str]| {
+    // `/private` needs a login: nothing public is behind it.
+    let server = geo_site_with(GEO_ROBOTS, "401 Unauthorized");
+    let crawl_site = |server: &RecordingServer, name: &str, extra: &[&str]| {
         let tmp = TempDir::new(name);
         let reports = tmp.path.join("reports");
         let report_dir = format!("--ai-report-dir={}", reports.display());
@@ -8253,7 +8259,7 @@ fn ai_geo_proposes_a_sitemap_only_after_a_complete_crawl() {
             report_dir.as_str(),
         ];
         args.extend_from_slice(extra);
-        let output = crawl_geo(&server, &args);
+        let output = crawl_geo(server, &args);
         assert_eq!(
             output.status.code(),
             Some(0),
@@ -8266,6 +8272,7 @@ fn ai_geo_proposes_a_sitemap_only_after_a_complete_crawl() {
             .expect("the kit");
         (tmp, reports.join(kit))
     };
+    let crawl = |name: &str, extra: &[&str]| crawl_site(&server, name, extra);
 
     let (_tmp, kit) = crawl("ai-geo-sitemap", &[]);
     let xml = std::fs::read_to_string(kit.join("sitemap/sitemap.proposed.xml")).expect("the proposed sitemap");
@@ -8275,7 +8282,7 @@ fn ai_geo_proposes_a_sitemap_only_after_a_complete_crawl() {
         assert!(xml.contains(&format!("<loc>{base}{path}</loc>")), "{path}: {xml}");
     }
     assert!(!xml.contains("/hidden<"), "a noindex page is left out: {xml}");
-    assert!(!xml.contains("/private<"), "a 403 page is left out: {xml}");
+    assert!(!xml.contains("/private<"), "a 401 page is left out: {xml}");
     let coverage: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(kit.join("sitemap/coverage.json")).expect("coverage.json"))
             .expect("JSON");
@@ -8296,6 +8303,40 @@ fn ai_geo_proposes_a_sitemap_only_after_a_complete_crawl() {
     let readme = std::fs::read_to_string(kit.join("README.md")).expect("README.md");
     assert!(
         readme.contains("sitemap.proposed.xml was not generated: the crawl dropped URLs at --max-queue-length"),
+        "{readme}"
+    );
+
+    // A link longer than --max-url-length was not followed.
+    let (_tmp, kit) = crawl("ai-geo-sitemap-length", &["--max-url-length=30"]);
+    assert!(!kit.join("sitemap").exists(), "no proposal after skipped long links");
+    let readme = std::fs::read_to_string(kit.join("README.md")).expect("README.md");
+    assert!(
+        readme.contains("sitemap.proposed.xml was not generated: the crawl skipped links longer than --max-url-length"),
+        "{readme}"
+    );
+
+    // A page refused to the crawler (403) may hide the pages behind it.
+    let refused = geo_site();
+    let (_tmp, kit) = crawl_site(&refused, "ai-geo-sitemap-refused", &[]);
+    assert!(!kit.join("sitemap").exists(), "no proposal after a refused link");
+    let readme = std::fs::read_to_string(kit.join("README.md")).expect("README.md");
+    assert!(
+        readme.contains("sitemap.proposed.xml was not generated: some linked URLs of the site could not be fetched"),
+        "{readme}"
+    );
+
+    // robots.txt keeps SiteOne Crawler (`*`) from /faq, which Googlebot may crawl.
+    let robots = geo_site_with(
+        "User-agent: *\nDisallow: /faq\n\nUser-agent: Googlebot\nAllow: /\n",
+        "401 Unauthorized",
+    );
+    let (_tmp, kit) = crawl_site(&robots, "ai-geo-sitemap-robots", &[]);
+    assert!(!kit.join("sitemap").exists(), "no proposal without /faq");
+    let readme = std::fs::read_to_string(kit.join("README.md")).expect("README.md");
+    assert!(
+        readme.contains(
+            "sitemap.proposed.xml was not generated: robots.txt kept the crawler from pages that Googlebot or Bingbot may crawl"
+        ),
         "{readme}"
     );
 }

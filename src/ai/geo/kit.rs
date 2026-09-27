@@ -1848,6 +1848,7 @@ mod tests {
                 max_visited_urls: 10_000,
                 max_depth: 0,
                 url_filters: false,
+                robots_skipped: Vec::new(),
             },
         }
     }
