@@ -534,15 +534,20 @@ pub fn organization(
     (Value::Object(entity), possible)
 }
 
-/// The text around a link as its block reads it: the link's `title` and `aria-label`, and the text
-/// of its nearest ancestor that is no inline element (the link's own text included), without the
-/// text of the blocks nested in that ancestor. The walk is iterative.
+/// The text around a link as its block reads it: the link's `title` and `aria-label`, the heading
+/// of its part of the site chrome (`chrome_section_heading`), and the text of its nearest ancestor
+/// that is no inline element (the link's own text included), without the text of the blocks
+/// nested in that ancestor. The walk is iterative.
 fn link_context(link: ElementRef) -> String {
     let mut text: String = ["title", "aria-label"]
         .iter()
         .filter_map(|attr| link.value().attr(attr))
         .map(|value| format!("{value} "))
         .collect();
+    if let Some(heading) = chrome_section_heading(link) {
+        text.push_str(&heading);
+        text.push(' ');
+    }
     let root = link
         .ancestors()
         .filter_map(ElementRef::wrap)
@@ -570,6 +575,42 @@ fn link_context(link: ElementRef) -> String {
         }
     }
     text
+}
+
+/// The heading of the part of the site chrome a link is in (a footer column's "Partners"): the
+/// nearest `h1`–`h6` among the earlier siblings of the link and of its ancestors up to the chrome's
+/// root (`header`, `footer`, `nav`, `aside`, `[role=banner]`, `[role=contentinfo]`), unless an
+/// earlier sibling holding a heading of its own (another part) comes first.
+fn chrome_section_heading(link: ElementRef) -> Option<String> {
+    let is_heading = |element: &ElementRef| matches!(element.value().name(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6");
+    let is_root = |element: &ElementRef| {
+        let role = element
+            .value()
+            .attr("role")
+            .map(|role| role.trim().to_ascii_lowercase());
+        matches!(element.value().name(), "header" | "footer" | "nav" | "aside")
+            || matches!(role.as_deref(), Some("banner" | "contentinfo"))
+    };
+    let mut node = link;
+    loop {
+        for sibling in node.prev_siblings().filter_map(ElementRef::wrap) {
+            if is_heading(&sibling) {
+                return Some(shown_text(sibling));
+            }
+            if sibling
+                .descendants()
+                .filter_map(ElementRef::wrap)
+                .any(|element| is_heading(&element))
+            {
+                return None;
+            }
+        }
+        let parent = node.parent().and_then(ElementRef::wrap)?;
+        if is_root(&parent) {
+            return None;
+        }
+        node = parent;
+    }
 }
 
 /// Whether the text around a link credits someone else (`CREDIT_MARKERS`, compared as words
@@ -1340,6 +1381,19 @@ mod tests {
             r#"<a href="https://www.instagram.com/asterdesign/">Aster Design on Instagram</a>"#,
         );
         assert_eq!(same_as, json!(["https://www.instagram.com/asterdesign/"]));
+        // A footer column headed "Partners" credits the accounts in it; the heading of another
+        // column labels nothing in this one.
+        let (same_as, possible) = profiles(
+            "Aster",
+            r#"<div><h4>Partners</h4><p>Our friends:</p><ul><li><a href="https://github.com/aster-labs"><svg></svg></a></li></ul></div>
+               <div><h4>Follow us</h4><ul><li><a href="https://github.com/aster"><svg></svg></a></li></ul></div>
+               <div><ul><li><a href="https://www.facebook.com/aster"><svg></svg></a></li></ul></div>"#,
+        );
+        assert_eq!(
+            same_as,
+            json!(["https://github.com/aster", "https://www.facebook.com/aster"])
+        );
+        assert_eq!(possible, ["https://github.com/aster-labs"]);
     }
 
     #[test]
