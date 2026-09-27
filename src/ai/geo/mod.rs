@@ -826,6 +826,29 @@ fn request_bytes(request: &ChatRequest) -> usize {
             .sum::<usize>()
 }
 
+/// Why a page gets no analysis call: none of its blocks fits the input budget next to its URL, title
+/// and signals, so the model would see nothing of the page.
+const NO_ROOM: &str =
+    "no block of the page fits the input budget next to its URL, title and signals (raise --ai-context-window)";
+
+/// The full request of a page and the 30 % smaller one for a retry after a truncated answer; `Err`
+/// when the full one would show no block (`NO_ROOM`).
+#[allow(clippy::type_complexity)]
+fn page_requests(
+    page: &Chosen,
+    budgets: &Budgets,
+    language: &str,
+    temperature: f32,
+) -> Result<((ChatRequest, Coverage), (ChatRequest, Coverage)), String> {
+    let full = page_request(page, budgets.input_bytes, budgets, language, temperature);
+    if full.1.included.is_empty() {
+        return Err(NO_ROOM.to_string());
+    }
+    let shown: usize = full.0.messages.iter().map(|message| message.content.len()).sum();
+    let reduced = page_request(page, shown * 7 / 10, budgets, language, temperature);
+    Ok((full, reduced))
+}
+
 /// One analysis call per chosen page, in parallel under the semaphore; each is one unit of
 /// `geo:pages` (its subject the page path). An answer cut at the output limit is asked once more
 /// with a 30 % smaller block selection. Returns each page's raw answer with what it was shown, or
@@ -841,21 +864,20 @@ async fn analyze_all(
     progress::start(TASK_PAGES, "GEO: pages", chosen.len() as u64);
     let mut handles = Vec::with_capacity(chosen.len());
     for page in chosen {
-        let full = page_request(page, budgets.input_bytes, budgets, language, temperature);
-        let shown: usize = full.0.messages.iter().map(|message| message.content.len()).sum();
-        let reduced = page_request(page, shown * 7 / 10, budgets, language, temperature);
+        let requests = page_requests(page, budgets, language, temperature);
         let (client, sem) = (client.clone(), sem.clone());
         handles.push(tokio::spawn(progress::unit(
             TASK_PAGES,
             crate::ai::runner::url_path_and_query(&page.page.url),
             async move {
+                let (full, reduced) = requests?;
                 let _permit = sem.acquire_owned().await.ok();
                 match client
                     .complete_parsed_n(&full.0, CAT_PAGE, PARSE_ATTEMPTS, parse_analysis)
                     .await
                 {
                     Ok((raw, _)) => Ok((raw, full.1)),
-                    Err(error) if error.to_string().contains(TRUNCATED) => client
+                    Err(error) if error.to_string().contains(TRUNCATED) && !reduced.1.included.is_empty() => client
                         .complete_parsed_n(&reduced.0, CAT_PAGE, PARSE_ATTEMPTS, parse_analysis)
                         .await
                         .map(|(raw, _)| (raw, reduced.1))
@@ -954,6 +976,38 @@ mod tests {
             "{:?}",
             markup.invisible_values
         );
+    }
+
+    #[test]
+    fn a_page_without_room_for_any_block_is_not_sent() {
+        // A long URL and a title of angle brackets (escaped for the prompt) take the whole budget.
+        let url = format!("https://example.com/{}", "a".repeat(1_980));
+        let html = format!(
+            "<html lang=\"en\"><head><title>{}</title></head><body><main><h1>Tools</h1>\
+             <p>Acme sells garden tools.</p></main></body></html>",
+            "&lt;".repeat(300)
+        );
+        let html = html.as_str();
+        let blocks = blocks_from_html(html);
+        let chosen = Chosen {
+            page: analyzed_page(&url, html),
+            signals: page_signals(&url, html),
+            signals_line: String::new(),
+            is_homepage: false,
+            existing: ExistingMarkup::default(),
+            indexable: true,
+            blocks,
+        };
+        let budgets = |input_bytes: usize| Budgets {
+            input_bytes,
+            max_tokens: 1_000,
+        };
+        let refused = page_requests(&chosen, &budgets(3_072), "en", 0.0).map(|_| ());
+        assert!(refused.as_ref().is_err_and(|why| why.contains("budget")), "{refused:?}");
+        let (full, reduced) = page_requests(&chosen, &budgets(20_000), "en", 0.0).expect("room for the blocks");
+        assert!(!full.1.included.is_empty());
+        // A retry with 30 % fewer bytes has no room left: `analyze_all` does not send it.
+        assert!(reduced.1.included.is_empty());
     }
 
     #[test]

@@ -47,6 +47,11 @@ const MAX_TITLE_CHARS: usize = 300;
 /// The page's own meta description is cut to this many characters.
 const MAX_DESCRIPTION_CHARS: usize = 300;
 const MAX_URL_CHARS: usize = 2_000;
+/// The `<signals>` line of a page is cut to this many characters, …
+const MAX_SIGNALS_CHARS: usize = 600;
+/// … and lists at most this many structured-data types of a kind, each at most `MAX_TYPE_CHARS`.
+const MAX_SIGNAL_TYPES: usize = 8;
+const MAX_TYPE_CHARS: usize = 60;
 /// The entity types of review drafts; any other type is dropped.
 const ENTITY_TYPES: &[&str] = &["Product", "Service", "Event", "LocalBusiness", "Person"];
 /// Marks a block of the site chrome in the prompt.
@@ -559,20 +564,32 @@ fn same_text(a: &str, b: &str) -> bool {
     compact(a) == compact(b)
 }
 
-/// The `<signals>` line: the page's existing structured data, its effective snippet controls per
-/// engine and the collapsed share of its own text.
+/// The `<signals>` line: the page's existing structured data (at most `MAX_SIGNAL_TYPES` types of a
+/// kind), its effective snippet controls per engine and the collapsed share of its own text.
 pub fn signals_text(
     markup: &ExistingMarkup,
     google: &EnginePolicy,
     bing: &EnginePolicy,
     collapsed_share: Option<f64>,
 ) -> String {
+    // A page may declare any number of types of any length: a few, shortened, stand for them.
+    let types = |types: &[String]| {
+        let mut list: Vec<String> = types
+            .iter()
+            .take(MAX_SIGNAL_TYPES)
+            .map(|kind| clip(kind, MAX_TYPE_CHARS))
+            .collect();
+        if types.len() > MAX_SIGNAL_TYPES {
+            list.push(format!("{} more", types.len() - MAX_SIGNAL_TYPES));
+        }
+        list.join(", ")
+    };
     let mut data: Vec<String> = Vec::new();
     if !markup.jsonld_types.is_empty() {
-        data.push(format!("JSON-LD {}", markup.jsonld_types.join(", ")));
+        data.push(format!("JSON-LD {}", types(&markup.jsonld_types)));
     }
     if !markup.other_types.is_empty() {
-        data.push(format!("Microdata/RDFa {}", markup.other_types.join(", ")));
+        data.push(format!("Microdata/RDFa {}", types(&markup.other_types)));
     } else if markup.has_microdata || markup.has_rdfa {
         data.push("Microdata/RDFa without a type".to_string());
     }
@@ -726,7 +743,7 @@ pub fn build_page_request(
             sanitize_for_prompt(&truncate_chars(&page.lang, 35)),
             is_homepage,
             sanitize_for_prompt(&truncate_chars(&page.title, MAX_TITLE_CHARS)),
-            sanitize_for_prompt(signals),
+            sanitize_for_prompt(&truncate_chars(signals, MAX_SIGNALS_CHARS)),
             coverage
         )
     };
@@ -2192,5 +2209,32 @@ mod tests {
             ),
             "existing structured data: none; Google snippet controls: none; Bing: none; collapsed text: 0 %"
         );
+    }
+
+    #[test]
+    fn page_signals_cannot_take_the_input_budget() {
+        // A page may declare any number of types of any length.
+        let hostile = ExistingMarkup {
+            jsonld_types: std::iter::once("x".repeat(100_000))
+                .chain((0..50).map(|i| format!("Type{i}")))
+                .collect(),
+            other_types: (0..50).map(|i| format!("Other{i}")).collect(),
+            ..ExistingMarkup::default()
+        };
+        let line = signals_text(&hostile, &EnginePolicy::default(), &EnginePolicy::default(), None);
+        assert!(line.len() < 1_000, "{} bytes", line.len());
+        assert!(line.contains("Type0") && line.contains("more"), "{line}");
+
+        // Whatever the caller passes, the message keeps its budget and the page's blocks.
+        let (page, blocks) = page_of(LOAN);
+        let budget = 3_072;
+        let signals = format!("existing structured data: JSON-LD {}", "&".repeat(100_000));
+        let (request, coverage) = build_page_request(&page, &blocks, &signals, false, "cs", budget, 4_000, 0.0);
+        assert!(
+            request.messages[0].content.len() <= budget,
+            "{} bytes",
+            request.messages[0].content.len()
+        );
+        assert!(!coverage.included.is_empty(), "{coverage:?}");
     }
 }
