@@ -1525,6 +1525,25 @@ mod tests {
     }
 
     #[test]
+    fn a_faq_question_is_shown_under_its_parent_headings_only() {
+        let (page, blocks) = page_of(
+            "<html lang=\"en\"><body><main><h1>Delivery and returns</h1>\
+             <h2>Are returns free?</h2><p>Return labels cost EUR 15.</p>\
+             <h2>Is delivery free?</h2><p>Delivery is free on all orders.</p>\
+             <h2>Do you accept cards?</h2><p>Yes, Visa and Mastercard.</p></main></body></html>",
+        );
+        let (req, _) = request(&page, &blocks, false, 1_000_000);
+        let message = user(&req);
+        for line in [
+            "B4 [Delivery and returns] Is delivery free?",
+            "B5 [Delivery and returns > Is delivery free?] Delivery is free on all orders.",
+            "B6 [Delivery and returns] Do you accept cards?",
+        ] {
+            assert!(message.lines().any(|known| known == line), "{line} in {message}");
+        }
+    }
+
+    #[test]
     fn the_request_lists_main_blocks_and_the_site_chrome_of_the_homepage_only() {
         let (page, blocks) = page_of(LOAN);
         let (req, coverage) = request(&page, &blocks, false, 1_000_000);

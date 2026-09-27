@@ -7421,6 +7421,7 @@ const GEO_FAQ: &str = r#"<!DOCTYPE html>
 <h1>Frequently asked questions</h1>
 <h2>How long does delivery take?</h2><p>Delivery takes 3 working days.</p>
 <h2>Can I return a tool?</h2><p>Yes, within 30 days of purchase.</p>
+<p>Our support team answers every e-mail within one working day.</p>
 </main></body></html>"#;
 
 /// An article with its author and date right below the title.
@@ -7699,10 +7700,10 @@ fn ai_geo_retries_a_truncated_answer_with_fewer_blocks() {
         "questions": []
     });
     let routes = vec![
-        // The smaller request of /faq (5 blocks offered, fewer shown) is answered in full…
+        // The smaller request of /faq (6 blocks offered, fewer shown) is answered in full…
         MockRoute {
             envelope: "<page_data>",
-            marker: Some(" of 5 blocks included"),
+            marker: Some(" of 6 blocks included"),
             response: chat_response(200, chat_answer(&answer.to_string())),
         },
         // …the full one is always cut at the output limit.
@@ -7740,7 +7741,7 @@ fn ai_geo_retries_a_truncated_answer_with_fewer_blocks() {
             .iter()
             .all(|body| body.contains("all blocks included"))
     );
-    assert!(faq_requests[2].contains(" of 5 blocks included"));
+    assert!(faq_requests[2].contains(" of 6 blocks included"));
     let json_name = geo_outputs(&report_dir)
         .into_iter()
         .find(|name| name.ends_with(".json"))
@@ -7754,11 +7755,11 @@ fn ai_geo_retries_a_truncated_answer_with_fewer_blocks() {
         .find(|page| page["url"] == format!("{}faq", server.url()))
         .unwrap_or_else(|| panic!("the FAQ page was analyzed: {}", json["failedPages"]));
     let coverage = &faq["coverage"];
-    assert_eq!(coverage["total"], 5, "{coverage}");
+    assert_eq!(coverage["total"], 6, "{coverage}");
     assert!(
         coverage["included"]
             .as_array()
-            .is_some_and(|included| included.len() < 5),
+            .is_some_and(|included| included.len() < 6),
         "{coverage}"
     );
 }

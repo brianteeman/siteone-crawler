@@ -500,14 +500,20 @@ impl Walker {
         if text.is_empty() {
             return;
         }
+        // A heading closes the sections of its own and deeper levels before it: its path holds
+        // its parents only.
+        self.headings_mut().retain(|(open, _)| *open < level);
         self.emit(BlockKind::Heading, &text);
-        let headings = if self.chrome > 0 {
+        self.headings_mut().push((level, text));
+    }
+
+    /// The heading path of the region being read.
+    fn headings_mut(&mut self) -> &mut Vec<(usize, String)> {
+        if self.chrome > 0 {
             &mut self.chrome_headings
         } else {
             &mut self.main_headings
-        };
-        headings.retain(|(open, _)| *open < level);
-        headings.push((level, text));
+        }
     }
 
     fn finish_row(&mut self) {
@@ -628,11 +634,17 @@ impl Walker {
         } else {
             (Region::Main, &self.main_headings)
         };
+        // Text inside an open heading (a hidden part of it) is the heading's: its parents only.
+        let within = self.buffers.iter().rev().find_map(|buffer| buffer.level);
         self.blocks.push(Block {
             id: self.blocks.len(),
             region,
             kind,
-            heading_path: headings.iter().map(|(_, text)| text.clone()).collect(),
+            heading_path: headings
+                .iter()
+                .filter(|(level, _)| within.is_none_or(|within| *level < within))
+                .map(|(_, text)| text.clone())
+                .collect(),
             text,
             collapsed: self.collapsed > 0,
             hidden: self.hidden > 0,
@@ -831,6 +843,67 @@ mod tests {
         assert_eq!(path("Zákaznická linka 800 123 456"), ["Kontakty"]);
         assert_eq!(path("Brand"), Vec::<String>::new());
         assert_eq!(find(&blocks, "Ceník").kind, BlockKind::Heading);
+    }
+
+    const FAQ: &str = "<body><main><h1>Delivery and returns</h1>\
+        <h2>Are returns free?</h2><p>Return labels cost EUR 15.</p>\
+        <h2>Is delivery free?</h2><p>Delivery is free on all orders.</p>\
+        <h3>Abroad</h3><p>EUR 10 outside the EU.</p><h3>Express</h3><p>EUR 5 more.</p>\
+        <h2>Payment<span hidden>internal note</span></h2><p>By card.</p>\
+        <h1>Other topic</h1><p>Text.</p></main>\
+        <footer><h3>Contact</h3><p>Call us</p><h3>Address</h3><p>Prague</p></footer></body>";
+
+    #[test]
+    fn a_heading_path_holds_its_parents_never_a_previous_sibling() {
+        let blocks = blocks_from_html(FAQ);
+        let path = |text: &str| find(&blocks, text).heading_path.clone();
+        assert_eq!(path("Is delivery free?"), ["Delivery and returns"]);
+        assert_eq!(path("Abroad"), ["Delivery and returns", "Is delivery free?"]);
+        assert_eq!(path("Express"), ["Delivery and returns", "Is delivery free?"]);
+        assert_eq!(
+            path("EUR 5 more."),
+            ["Delivery and returns", "Is delivery free?", "Express"]
+        );
+        assert_eq!(
+            path("Payment"),
+            ["Delivery and returns"],
+            "an H2 closes the H2 and H3 before it"
+        );
+        assert_eq!(
+            path("internal note"),
+            ["Delivery and returns"],
+            "text inside a heading has the heading's path"
+        );
+        assert_eq!(path("By card."), ["Delivery and returns", "Payment"]);
+        assert_eq!(path("Other topic"), Vec::<String>::new());
+        assert_eq!(path("Text."), ["Other topic"]);
+        assert_eq!(path("Address"), Vec::<String>::new(), "the chrome has its own path");
+        assert_eq!(path("Prague"), ["Address"]);
+    }
+
+    #[test]
+    fn the_fact_extraction_input_shows_a_heading_under_its_parents_only() {
+        use crate::ai::consistency::model::Page;
+        use crate::ai::consistency::sources::{page_source, source_message};
+        let page = Page {
+            index: 0,
+            url: "https://example.com/faq".to_string(),
+            path: "/faq".to_string(),
+            title: "Delivery and returns".to_string(),
+        };
+        let message = source_message(
+            &page_source(&page, &blocks_from_html(FAQ), 100_000),
+            "Delivery and returns",
+        );
+        for line in [
+            "B4 [Delivery and returns] Is delivery free?",
+            "B6 [Delivery and returns > Is delivery free?] Abroad",
+            "B8 [Delivery and returns > Is delivery free?] Express",
+            "B11 [Delivery and returns] Payment",
+            "B13 [] Other topic",
+        ] {
+            assert!(message.lines().any(|known| known == line), "{line} in {message}");
+        }
     }
 
     #[test]
