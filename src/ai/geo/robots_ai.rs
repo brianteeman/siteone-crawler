@@ -85,13 +85,16 @@ impl AiRobots {
         for (index, line) in text.split(['\n', '\r']).enumerate() {
             let start = offset;
             offset += line.len() + 1;
-            let Some((field, key, _, has_colon)) = record(prefix(line, MAX_LINE_BYTES)) else {
-                continue;
-            };
-            if field == Field::UserAgent {
+            let line_prefix = prefix(line, MAX_LINE_BYTES);
+            // A parser that trims any Unicode whitespace may read a user-agent line where Google
+            // reads an unknown one, and only a rule whose key is set off by spaces and tabs alone
+            // closes the list of user agents for every parser.
+            if record_trimmed(line_prefix, char::is_whitespace).is_some_and(|(field, ..)| field == Field::UserAgent) {
                 last_agent_line = Some(index);
             }
-            if has_colon && (key.eq_ignore_ascii_case("allow") || key.eq_ignore_ascii_case("disallow")) {
+            if let Some((_, key, _, true)) = record_trimmed(line_prefix, |c| c == ' ' || c == '\t')
+                && (key.eq_ignore_ascii_case("allow") || key.eq_ignore_ascii_case("disallow"))
+            {
                 last_strict_rule_line = Some(index);
             }
             if start >= MAX_PARSED_BYTES {
@@ -191,8 +194,9 @@ impl AiRobots {
     }
 
     /// Whether a group appended to the file could merge into the last one: a user-agent line (in
-    /// any spelling Google accepts) comes after the last `Allow:` / `Disallow:` line that a strict
-    /// RFC 9309 parser reads. Checked over the whole file, also past the 500 KiB that are parsed.
+    /// any spelling Google accepts, also behind Unicode whitespace) comes after the last `Allow:` /
+    /// `Disallow:` line that a strict RFC 9309 parser reads (set off by spaces and tabs only).
+    /// Checked over the whole file, also past the 500 KiB that are parsed.
     pub fn ends_with_ruleless_group(&self) -> bool {
         self.ends_with_ruleless_group
     }
@@ -263,12 +267,18 @@ impl AiRobots {
 
 /// A robots.txt line as Google's parser reads it: the comment is dropped, the key ends at the first
 /// colon — or, without a colon, the line must be exactly two words — and the key is recognized by
-/// its start, including the misspellings Google accepts. Returns the field, the key, the value
-/// and whether a colon separated them.
+/// its start, including the misspellings Google accepts. Only ASCII whitespace separates the parts
+/// (`absl::ascii_isspace`), so a key behind a no-break space is an unknown one. Returns the field,
+/// the key, the value and whether a colon separated them.
 fn record(line: &str) -> Option<(Field, &str, &str, bool)> {
-    let line = line.split('#').next().unwrap_or_default().trim();
+    record_trimmed(line, |c| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r'))
+}
+
+/// `record` with the parts of the line trimmed of the characters `is_space` accepts.
+fn record_trimmed(line: &str, is_space: impl Fn(char) -> bool + Copy) -> Option<(Field, &str, &str, bool)> {
+    let line = line.split('#').next().unwrap_or_default().trim_matches(is_space);
     let (key, value, has_colon) = match line.split_once(':') {
-        Some((key, value)) => (key.trim(), value.trim(), true),
+        Some((key, value)) => (key.trim_matches(is_space), value.trim_matches(is_space), true),
         None => {
             let mut words = line.split_ascii_whitespace();
             match (words.next(), words.next(), words.next()) {
@@ -1079,6 +1089,36 @@ User-agent d\nDisallow: /4\nAllowed: /4/open\nDisallow /5 extra\nsite-map: https
             robots.raw(),
             "User-Agent: *\nContent-Signal: search=yes, ai-train=no\ncontent-usage: train-ai=n\nAllow: /\n"
         );
+    }
+
+    #[test]
+    fn only_ascii_whitespace_separates_the_parts_of_a_line() {
+        // Google's parser strips ASCII whitespace only: a rule behind a no-break space (or another
+        // Unicode space) is an unknown line, so the Googlebot group is still open for the
+        // user-agent lines that follow.
+        for space in ["\u{a0}", "\u{2003}", "\u{85}"] {
+            let robots = AiRobots::parse(&format!("User-agent: Googlebot\n{space}Disallow: /private\n"));
+            assert!(robots.is_allowed("Googlebot", "/private"), "{space:?}");
+            assert!(robots.ends_with_ruleless_group(), "{space:?}");
+            let merged = AiRobots::parse(&format!("{}\nUser-agent: GPTBot\nDisallow: /\n", robots.raw()));
+            assert!(
+                !merged.is_allowed("Googlebot", "/"),
+                "{space:?}: the groups merge, as for Google"
+            );
+        }
+        // The ASCII whitespace Google strips (absl::ascii_isspace), also inside the value.
+        let robots = AiRobots::parse("User-agent: Googlebot\n\t Disallow: /private \x0b\x0c\nDisallow: /a\u{a0}\n");
+        assert!(!robots.is_allowed("Googlebot", "/private"));
+        assert!(
+            robots.is_allowed("Googlebot", "/a"),
+            "the no-break space is part of the pattern"
+        );
+        assert!(!robots.is_allowed("Googlebot", "/a%C2%A0"));
+        assert!(!robots.ends_with_ruleless_group());
+        // A user-agent line that a parser trimming Unicode whitespace reads opens a group there.
+        let robots = AiRobots::parse("User-agent: *\nDisallow: /x\n\u{a0}User-agent: Foo\n");
+        assert!(robots.ends_with_ruleless_group());
+        assert!(!robots.has_named_group("Foo"), "an unknown line for Google");
     }
 
     #[test]

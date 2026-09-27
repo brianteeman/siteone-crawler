@@ -1301,6 +1301,10 @@ mod tests {
 
         let ruleless = "User-agent: *\nDisallow: /admin\n\nUser-agent: Example\n";
         assert!(refuse(ok(ruleless), &snippet).contains("group without rules"));
+        // For Google a rule behind a no-break space is no rule: appended groups would merge into
+        // the Googlebot group and block Googlebot.
+        let nbsp = "User-agent: Googlebot\n\u{a0}Disallow: /private\n";
+        assert!(refuse(ok(nbsp), &snippet).contains("group without rules"));
 
         // A snippet that would also change `*` fails the policy-equivalence check.
         let why = refuse(
