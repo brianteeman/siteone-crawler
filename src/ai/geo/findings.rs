@@ -201,6 +201,7 @@ pub const TITLE_KEYS: &[&str] = &[
     "access_rate_limited",
     "access_server_error",
     "access_failed",
+    "access_client_error",
     "access_redirect_chain",
     "access_redirect_loop",
     "access_suspected_challenge",

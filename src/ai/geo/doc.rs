@@ -4203,13 +4203,16 @@ mod tests {
             "interrupted",
             "url_limit",
             "queue_limit",
+            "url_length_limit",
             "limited_scope",
             "failed_urls",
+            "robots_skipped",
             "no_pages",
             "too_many_urls",
         ] {
             all_keys.push(format!("sitemap_withheld.{why}"));
         }
+        all_keys.push("kind.client_error".to_string());
         all_keys.extend(
             [
                 "label.sitemap_proposed",
