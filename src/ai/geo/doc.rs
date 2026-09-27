@@ -2269,6 +2269,10 @@ const EN: &[(&str, &str)] = &[
         "the crawl skipped links longer than --max-url-length",
     ),
     (
+        "sitemap_withheld.basename_limit",
+        "the crawl skipped links whose file name had already answered too many errors (--max-non200-responses-per-basename), so live pages behind them may be missing",
+    ),
+    (
         "sitemap_withheld.single_page",
         "only one page was crawled (--single-page)",
     ),
@@ -3113,6 +3117,10 @@ const CS: &[(&str, &str)] = &[
     (
         "sitemap_withheld.url_length_limit",
         "procházení vynechalo odkazy delší než --max-url-length",
+    ),
+    (
+        "sitemap_withheld.basename_limit",
+        "procházení vynechalo odkazy, jejichž název souboru už vrátil příliš mnoho chyb (--max-non200-responses-per-basename), takže funkční stránky za nimi mohou chybět",
     ),
     (
         "sitemap_withheld.single_page",
@@ -4242,6 +4250,7 @@ mod tests {
             "url_limit",
             "queue_limit",
             "url_length_limit",
+            "basename_limit",
             "limited_scope",
             "failed_urls",
             "robots_skipped",

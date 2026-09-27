@@ -25,6 +25,9 @@ static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 static QUEUE_FULL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Set when a link to a page was not queued because it is longer than `--max-url-length`.
 static URL_TOO_LONG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set when a link to a page of the site was not queued because its basename already answered
+/// more non-200 responses than `--max-non200-responses-per-basename` allows.
+static BASENAME_SKIPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Asks the running crawl to wind down, as Ctrl+C would.
 pub fn request_stop() {
@@ -242,6 +245,7 @@ impl Crawler {
     pub async fn run(&mut self) -> CrawlerResult<()> {
         QUEUE_FULL.store(false, Ordering::SeqCst);
         URL_TOO_LONG.store(false, Ordering::SeqCst);
+        BASENAME_SKIPPED.store(false, Ordering::SeqCst);
         // Add initial URL to queue
         self.add_url_to_queue(&self.initial_parsed_url.clone(), None, UrlSource::InitUrl as i32);
 
@@ -409,6 +413,12 @@ impl Crawler {
     /// Whether a link to a page was dropped for being longer than `--max-url-length`.
     pub fn dropped_urls_over_max_length(&self) -> bool {
         URL_TOO_LONG.load(Ordering::SeqCst)
+    }
+
+    /// Whether a link to a page of the site was dropped by the non-200 basename protection
+    /// (`--max-non200-responses-per-basename`) before it was queued.
+    pub fn dropped_urls_for_basename(&self) -> bool {
+        BASENAME_SKIPPED.load(Ordering::SeqCst)
     }
 
     /// Take the next URL from the queue (breadth-first order)
@@ -1140,6 +1150,15 @@ impl Crawler {
                 && let Some(count) = non200_basenames.get(basename)
                 && *count >= options.max_non200_responses_per_basename
             {
+                // A page of the site that was never fetched may be live: the crawl did not cover it.
+                let is_page = parsed_url_for_queue
+                    .extension
+                    .as_deref()
+                    .is_none_or(|extension| HTML_PAGES_EXTENSIONS.contains(&extension.to_lowercase().as_str()));
+                let url_key = Self::compute_url_key(&parsed_url_for_queue);
+                if is_url_on_same_host && is_page && !visited.contains_key(&url_key) && !queue.contains_key(&url_key) {
+                    BASENAME_SKIPPED.store(true, Ordering::SeqCst);
+                }
                 continue;
             }
 

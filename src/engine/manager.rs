@@ -324,6 +324,8 @@ impl Manager {
                 crate::ai::geo::discovery::CrawlEnd::QueueLimit
             } else if crawler.dropped_urls_over_max_length() {
                 crate::ai::geo::discovery::CrawlEnd::UrlLengthLimit
+            } else if crawler.dropped_urls_for_basename() {
+                crate::ai::geo::discovery::CrawlEnd::BasenameLimit
             } else {
                 crate::ai::geo::discovery::CrawlEnd::Complete
             };

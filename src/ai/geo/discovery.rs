@@ -164,6 +164,9 @@ pub enum CrawlEnd {
     QueueLimit,
     /// Dropped links to pages longer than `--max-url-length`.
     UrlLengthLimit,
+    /// Dropped links to pages whose basename answered too many errors
+    /// (`--max-non200-responses-per-basename`).
+    BasenameLimit,
 }
 
 /// How much of the site the crawl covered: a sitemap is proposed only for a crawl of all of it.
@@ -613,10 +616,12 @@ pub fn discovery(status: &Status, key: &[KeyPage], declared: &[String], now: Dat
 /// Bingbot, each once, with a `lastmod` only from a plausible `Last-Modified`. The error names why
 /// there is none: `sitemap_exists` (declared in robots.txt or crawled), `robots_unknown`
 /// (robots.txt, which may declare one, was not read), `robots_not_utf8`, `single_page`,
-/// `interrupted`, `url_limit`, `queue_limit`, `url_length_limit`, `limited_scope` (`--max-depth`,
-/// `--include-regex`, `--ignore-regex`), `failed_urls` (a linked URL of the site failed, was
-/// refused or redirects nowhere, so pages behind it may be missing), `robots_skipped` (robots.txt
-/// kept the crawler from pages Googlebot or Bingbot may crawl), `no_pages` or `too_many_urls`.
+/// `interrupted`, `url_limit`, `queue_limit`, `url_length_limit`, `basename_limit` (a link of the
+/// site was dropped or skipped by `--max-non200-responses-per-basename`), `limited_scope`
+/// (`--max-depth`, `--include-regex`, `--ignore-regex`), `failed_urls` (a linked URL of the site
+/// failed, was refused or redirects nowhere, so pages behind it may be missing), `robots_skipped`
+/// (robots.txt kept the crawler from pages Googlebot or Bingbot may crawl), `no_pages` or
+/// `too_many_urls`.
 pub fn sitemap_proposal(
     status: &Status,
     discovery: &Discovery,
@@ -647,6 +652,7 @@ pub fn sitemap_proposal(
         CrawlEnd::UrlLimit => return Err("url_limit"),
         CrawlEnd::QueueLimit => return Err("queue_limit"),
         CrawlEnd::UrlLengthLimit => return Err("url_length_limit"),
+        CrawlEnd::BasenameLimit => return Err("basename_limit"),
     }
     if scope.max_depth > 0 || scope.url_filters {
         return Err("limited_scope");
@@ -656,6 +662,16 @@ pub fn sitemap_proposal(
         .map_err(|_| "no_pages")?;
     let visited = status.get_visited_urls();
     let by_url = visits_by_url(&visited);
+    // A link of the site queued before its basename answered too many errors is skipped when its
+    // turn comes (-6, never fetched): a live page may be behind it.
+    let skipped = visited.iter().any(|visit| {
+        !visit.is_external
+            && visit.status_code == -6
+            && matches!(visit.source_attr, SOURCE_A_HREF | SOURCE_SITEMAP | SOURCE_REDIRECT)
+    });
+    if skipped {
+        return Err("basename_limit");
+    }
     // A link (or a sitemap or redirect entry) of the site that failed, was refused or redirects
     // nowhere hides what is behind it; a page that does not exist (404, 410) or needs a login
     // (401, which engines do not have either) hides nothing public.
@@ -1663,11 +1679,12 @@ mod tests {
             change(&mut scope);
             scope
         };
-        let cases: [(CrawlScope, &str); 7] = [
+        let cases: [(CrawlScope, &str); 8] = [
             (scope(|scope| scope.single_page = true), "single_page"),
             (scope(|scope| scope.end = CrawlEnd::UrlLimit), "url_limit"),
             (scope(|scope| scope.end = CrawlEnd::QueueLimit), "queue_limit"),
             (scope(|scope| scope.end = CrawlEnd::UrlLengthLimit), "url_length_limit"),
+            (scope(|scope| scope.end = CrawlEnd::BasenameLimit), "basename_limit"),
             (scope(|scope| scope.end = CrawlEnd::Interrupted), "interrupted"),
             (scope(|scope| scope.max_depth = 2), "limited_scope"),
             (scope(|scope| scope.url_filters = true), "limited_scope"),
@@ -1705,6 +1722,53 @@ mod tests {
             sitemap_proposal(&empty, &none, "https://example.com/", &rules, &complete_scope(), now()).map(|_| ()),
             Err("no_pages")
         );
+    }
+
+    #[test]
+    fn no_sitemap_is_proposed_when_a_link_was_skipped_for_its_basename() {
+        let rules = robots("User-agent: *\nDisallow:\n");
+        let propose = |status: &Status| {
+            sitemap_proposal(
+                status,
+                &Discovery::default(),
+                "https://example.com/",
+                &rules,
+                &complete_scope(),
+                now(),
+            )
+            .map(|proposal| proposal.urls.len())
+        };
+        // Queued before its basename answered too many errors, skipped when its turn came (-6):
+        // a live page may be behind it.
+        let mut status = site_without_sitemap();
+        add(
+            &mut status,
+            page(
+                "skipped",
+                "home",
+                SOURCE_A_HREF,
+                "https://example.com/catalog/product",
+                -6,
+                None,
+            ),
+            None,
+        );
+        assert_eq!(propose(&status), Err("basename_limit"));
+        // A skipped image hides no page.
+        let mut status = site_without_sitemap();
+        add(
+            &mut status,
+            page(
+                "img",
+                "home",
+                SOURCE_IMG_SRC,
+                "https://example.com/img/product.png",
+                -6,
+                None,
+            ),
+            None,
+        );
+        assert_eq!(propose(&status), Ok(5));
     }
 
     #[test]

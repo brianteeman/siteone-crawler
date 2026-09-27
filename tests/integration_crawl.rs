@@ -8452,3 +8452,129 @@ fn ai_geo_links_the_fact_consistency_report_of_the_same_run() {
         "{row}"
     );
 }
+
+/// A link the crawler skips because its basename already answered too many errors
+/// (`--max-non200-responses-per-basename`) may lead to live pages: the GEO kit then proposes no
+/// sitemap, whether the link was dropped when found or skipped when its turn came.
+#[test]
+fn ai_geo_proposes_no_sitemap_after_links_skipped_for_their_basename() {
+    let page = |body: &str| {
+        format!(
+            "<!DOCTYPE html><html lang=\"en\"><head><title>Acme</title></head><body><main>{body}</main></body></html>"
+        )
+    };
+    let html = |path: &'static str, status: Option<&str>, body: String| {
+        let mut headers = vec![("Content-Type", "text/html; charset=utf-8".to_string())];
+        if let Some(status) = status {
+            headers.push(("Status", status.to_string()));
+        }
+        Route {
+            path,
+            headers,
+            body: body.into_bytes(),
+        }
+    };
+    let site = |home: &str| {
+        RecordingServer::start(vec![
+            Route {
+                path: "/robots.txt",
+                headers: vec![("Content-Type", "text/plain".to_string())],
+                body: b"User-agent: *\nAllow: /\n".to_vec(),
+            },
+            html("/", None, page(home)),
+            html("/old/product", Some("404 Not Found"), page("<h1>Not found</h1>")),
+            html("/older/product", Some("404 Not Found"), page("<h1>Not found</h1>")),
+            html("/step", None, page("<h1>Browse</h1><a href=\"/step2\">Next</a>")),
+            html(
+                "/step2",
+                None,
+                page("<h1>Browse more</h1><a href=\"/catalog/product\">Current product</a>"),
+            ),
+            html(
+                "/catalog/product",
+                None,
+                page("<h1>Current product</h1><a href=\"/catalog/child\">More</a>"),
+            ),
+            html("/catalog/child", None, page("<h1>Product child</h1>")),
+            Route {
+                path: "/go",
+                headers: vec![
+                    ("Status", "302 Found".to_string()),
+                    ("Location", "/catalog/product".to_string()),
+                ],
+                body: Vec::new(),
+            },
+        ])
+    };
+    let crawl = |server: &RecordingServer, name: &str, extra: &[&str]| {
+        let tmp = TempDir::new(name);
+        let reports = tmp.path.join("reports");
+        let report_dir = format!("--ai-report-dir={}", reports.display());
+        let mut args = vec![
+            "--ai-provider=openai",
+            "--ai-model=gpt-test",
+            "--ai-api-key-env=SITEONE_GEO_TEST_KEY_THAT_IS_NOT_SET",
+            "--ai-geo",
+            "--workers=1",
+            report_dir.as_str(),
+        ];
+        args.extend_from_slice(extra);
+        let output = crawl_geo(server, &args);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let kit = geo_outputs(&reports)
+            .into_iter()
+            .find(|name| name.starts_with("ai-geo-kit."))
+            .expect("the kit");
+        let kit = reports.join(kit);
+        let readme = std::fs::read_to_string(kit.join("README.md")).expect("README.md");
+        (tmp, kit, readme)
+    };
+    let requested = |server: &RecordingServer, path: &str| {
+        server
+            .requests()
+            .iter()
+            .any(|head| head.starts_with(&format!("GET {path} ")))
+    };
+    let withheld = "sitemap.proposed.xml was not generated: the crawl skipped links whose file name had already \
+                    answered too many errors (--max-non200-responses-per-basename)";
+
+    // /old/product answers 404 before /step2 links the live /catalog/product: the link is dropped
+    // when found.
+    let chain = "<h1>Catalog</h1><a href=\"/old/product\">Discontinued item</a><a href=\"/step\">Browse</a>";
+    let dropped = site(chain);
+    let (_tmp, kit, readme) = crawl(
+        &dropped,
+        "ai-geo-basename-dropped",
+        &["--max-non200-responses-per-basename=1"],
+    );
+    assert!(!requested(&dropped, "/catalog/product"), "{:?}", dropped.requests());
+    assert!(!kit.join("sitemap").exists(), "no proposal after a dropped link");
+    assert!(readme.contains(withheld), "{readme}");
+
+    // A redirect queues /catalog/product while both 404s of its basename wait in the queue before
+    // it: it is skipped when its turn comes (stored as -6).
+    let queued = site(
+        "<h1>Catalog</h1><a href=\"/old/product\">Old</a><a href=\"/older/product\">Older</a>\
+         <a href=\"/go\">Current product</a>",
+    );
+    let (_tmp, kit, readme) = crawl(
+        &queued,
+        "ai-geo-basename-skipped",
+        &["--max-non200-responses-per-basename=1"],
+    );
+    assert!(!requested(&queued, "/catalog/product"), "{:?}", queued.requests());
+    assert!(!kit.join("sitemap").exists(), "no proposal after a skipped link");
+    assert!(readme.contains(withheld), "{readme}");
+
+    // With the default limit every link is followed and the sitemap is proposed.
+    let complete = site(chain);
+    let (_tmp, kit, _) = crawl(&complete, "ai-geo-basename-complete", &[]);
+    assert!(requested(&complete, "/catalog/child"));
+    let xml = std::fs::read_to_string(kit.join("sitemap/sitemap.proposed.xml")).expect("the proposed sitemap");
+    assert!(xml.contains("/catalog/child</loc>"), "{xml}");
+}
