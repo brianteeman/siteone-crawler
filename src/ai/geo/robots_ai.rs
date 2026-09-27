@@ -443,18 +443,55 @@ pub fn evaluate(robots: Option<&AiRobots>, agent: &AiAgent, paths: &[String]) ->
     }
 }
 
+/// Why two robots.txt files do not give every crawler the same answers (`policy_equivalent`); its
+/// `Display` is the English text, the kit README localizes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyChange {
+    /// The files have more rules (this many) than the check can match in time.
+    TooManyRules(usize),
+    /// The answer for `token` on `path` would change (from allowed when `was_allowed`).
+    Changed {
+        token: String,
+        path: String,
+        was_allowed: bool,
+    },
+}
+
+impl std::fmt::Display for PolicyChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PolicyChange::TooManyRules(rules) => write!(
+                f,
+                "robots.txt has too many rules ({rules}) to check that the proposal changes nothing else"
+            ),
+            PolicyChange::Changed {
+                token,
+                path,
+                was_allowed,
+            } => {
+                let verdict = |allowed: bool| if allowed { "allowed" } else { "blocked" };
+                write!(
+                    f,
+                    "User-agent {token}: {path} would change from {} to {}",
+                    verdict(*was_allowed),
+                    verdict(!*was_allowed)
+                )
+            }
+        }
+    }
+}
+
 /// Checks that `after` gives every crawler the same allow/deny answers as `before` (`None` = no
 /// robots.txt). Checked are `tokens`, `*` and every agent named in `before` (with the fallback of
 /// a table agent applied), on `paths`, `/` and one literal path per rule pattern of either file.
-/// `Err` describes the first answer that would change, or says that the files have too many rules
-/// to check them all (`MAX_EQUIVALENCE_MATCHES`): the check fails closed rather than run for
-/// minutes.
+/// `Err` names the first answer that would change, or says that the files have too many rules to
+/// check them all (`MAX_EQUIVALENCE_MATCHES`): the check fails closed rather than run for minutes.
 pub fn policy_equivalent(
     before: Option<&AiRobots>,
     after: &AiRobots,
     tokens: &[String],
     paths: &[String],
-) -> Result<(), String> {
+) -> Result<(), PolicyChange> {
     let mut all_tokens: Vec<String> = vec!["*".to_string()];
     all_tokens.extend(before.map(AiRobots::named_tokens).unwrap_or_default());
     all_tokens.extend(tokens.iter().cloned());
@@ -478,24 +515,18 @@ pub fn policy_equivalent(
         .map(|group| group.rules.len())
         .sum();
     if all_tokens.len().saturating_mul(all_paths.len()).saturating_mul(rules) > MAX_EQUIVALENCE_MATCHES {
-        return Err(format!(
-            "robots.txt has too many rules ({}) to check that the proposal changes nothing else",
-            rules
-        ));
+        return Err(PolicyChange::TooManyRules(rules));
     }
     for token in &all_tokens {
         for path in &all_paths {
             let was = allowed_with_fallback(before, token, path);
             let is = allowed_with_fallback(Some(after), token, path);
             if was != is {
-                let verdict = |allowed: bool| if allowed { "allowed" } else { "blocked" };
-                return Err(format!(
-                    "User-agent {}: {} would change from {} to {}",
-                    token,
-                    path,
-                    verdict(was),
-                    verdict(is)
-                ));
+                return Err(PolicyChange::Changed {
+                    token: token.clone(),
+                    path: path.clone(),
+                    was_allowed: was,
+                });
             }
         }
     }
@@ -786,7 +817,9 @@ Disallow: /example/page/disallowed.gif\n",
         let started = std::time::Instant::now();
         let result = policy_equivalent(Some(&before), &after, &table_tokens_except(&["GPTBot"]), &[]);
         assert!(
-            result.as_ref().is_err_and(|why| why.contains("too many rules")),
+            result
+                .as_ref()
+                .is_err_and(|why| why.to_string().contains("too many rules")),
             "{result:?}"
         );
         assert!(
@@ -1142,7 +1175,10 @@ User-agent d\nDisallow: /4\nAllowed: /4/open\nDisallow /5 extra\nsite-map: https
         let after = AiRobots::parse(&format!("{}User-agent: GPTBot\nDisallow: /\n", before.raw()));
         // `Example` is named in the file, so it is checked without being listed.
         let result = policy_equivalent(Some(&before), &after, &[], &[]);
-        assert!(result.as_ref().is_err_and(|why| why.contains("Example")), "{result:?}");
+        assert!(
+            result.as_ref().is_err_and(|why| why.to_string().contains("Example")),
+            "{result:?}"
+        );
     }
 
     #[test]
@@ -1152,7 +1188,9 @@ User-agent d\nDisallow: /4\nAllowed: /4/open\nDisallow /5 extra\nsite-map: https
         let after = AiRobots::parse(&format!("{}\nUser-agent: *\nAllow: /secret/*.pdf$\n", before.raw()));
         let result = policy_equivalent(Some(&before), &after, &[], &[]);
         assert!(
-            result.as_ref().is_err_and(|why| why.contains("/secret/.pdf")),
+            result
+                .as_ref()
+                .is_err_and(|why| why.to_string().contains("/secret/.pdf")),
             "{result:?}"
         );
     }
@@ -1188,7 +1226,10 @@ User-agent d\nDisallow: /4\nAllowed: /4/open\nDisallow /5 extra\nsite-map: https
         );
         let changed = AiRobots::parse(&format!("{}\nUser-agent: Applebot\nDisallow: /a/\n", before.raw()));
         let result = policy_equivalent(Some(&before), &changed, &["Applebot".to_string()], &paths(&["/g/1"]));
-        assert!(result.as_ref().is_err_and(|why| why.contains("Applebot")), "{result:?}");
+        assert!(
+            result.as_ref().is_err_and(|why| why.to_string().contains("Applebot")),
+            "{result:?}"
+        );
     }
 
     #[test]

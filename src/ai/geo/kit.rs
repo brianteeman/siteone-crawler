@@ -21,7 +21,7 @@ use crate::ai::geo::analyze::{Answered, PageAnalysis, PageType, block_ref, is_qu
 use crate::ai::geo::discovery::{CrawlEnd, SitemapProposal};
 use crate::ai::geo::findings::ORGANIZATION_TYPES;
 use crate::ai::geo::jsonld::{self, ExistingMarkup};
-use crate::ai::geo::robots_ai::{AgentAccess, AiRobots, policy_equivalent};
+use crate::ai::geo::robots_ai::{AgentAccess, AiRobots, PolicyChange, policy_equivalent};
 use crate::ai::report::locale::ReportLocale;
 use crate::result::status::RobotsFetchState;
 
@@ -202,30 +202,24 @@ pub fn proposed_robots(
     snippet: &str,
     key_paths: &[String],
     sitemaps: &[String],
-) -> Result<String, String> {
+) -> Result<String, Withheld> {
     let added = AiRobots::parse(snippet).named_tokens();
     if added.is_empty() {
-        return Err("nothing to add: every AI-training crawler already has its own group".to_string());
+        return Err(Withheld::NothingToAdd);
     }
     let (before, proposed) = match state {
         RobotsFetchState::Ok {
             content, valid_utf8, ..
         } => {
             if !valid_utf8 {
-                return Err("robots.txt is not valid UTF-8, so it cannot be reproduced byte for byte".to_string());
+                return Err(Withheld::NotUtf8);
             }
             if content.trim_start_matches('\u{feff}').trim_start().starts_with('<') {
-                return Err("robots.txt answered with an HTML page instead of robots.txt rules".to_string());
+                return Err(Withheld::HtmlPage);
             }
             let before = robots.cloned().unwrap_or_else(|| AiRobots::parse(content));
             if before.ends_with_ruleless_group() {
-                return Err(
-                    "robots.txt ends with a group without rules (User-agent lines after the last Allow or \
-                     Disallow line; a Crawl-delay line is no such rule, nor is a rule line that starts with a \
-                     no-break space or another non-ASCII space, which Google does not read), so appended groups \
-                     would merge into it"
-                        .to_string(),
-                );
+                return Err(Withheld::RulelessGroup);
             }
             let mut proposed = content.clone();
             if !proposed.ends_with('\n') {
@@ -248,16 +242,10 @@ pub fn proposed_robots(
             }
             (None, proposed)
         }
-        RobotsFetchState::NotFound { status } => {
-            return Err(format!(
-                "robots.txt answered HTTP {status}: a file may exist but be hidden from the crawler"
-            ));
-        }
-        RobotsFetchState::Unavailable { status_or_error } => {
-            return Err(format!("robots.txt could not be read ({status_or_error})"));
-        }
-        RobotsFetchState::Skipped => return Err("robots.txt was not fetched (--ignore-robots-txt)".to_string()),
-        RobotsFetchState::NotAttempted => return Err("robots.txt was not fetched".to_string()),
+        RobotsFetchState::NotFound { status } => return Err(Withheld::HiddenStatus(*status)),
+        RobotsFetchState::Unavailable { status_or_error } => return Err(Withheld::Unreadable(status_or_error.clone())),
+        RobotsFetchState::Skipped => return Err(Withheld::Ignored),
+        RobotsFetchState::NotAttempted => return Err(Withheld::NotFetched),
     };
     let after = AiRobots::parse(&proposed);
     // Each added group must be read (within the first 500 KiB) and deny `/`; a `/` that `*`
@@ -266,18 +254,118 @@ pub fn proposed_robots(
         .iter()
         .find(|token| !after.has_named_group(token) || after.is_allowed(token, "/"))
     {
-        return Err(format!(
-            "the added group for {token} would not take effect (engines read only the first 500 KiB of robots.txt)"
-        ));
+        return Err(Withheld::NotRead(token.clone()));
     }
     let others: Vec<String> = AI_AGENTS
         .iter()
         .map(|agent| agent.token.to_string())
         .filter(|token| !added.iter().any(|added| added.eq_ignore_ascii_case(token)))
         .collect();
-    policy_equivalent(before.as_ref(), &after, &others, key_paths)
-        .map_err(|why| format!("appending would change the rules of other crawlers: {why}"))?;
+    policy_equivalent(before.as_ref(), &after, &others, key_paths).map_err(Withheld::OtherCrawlers)?;
     Ok(proposed)
+}
+
+/// Why the kit proposes no robots.txt (`proposed_robots`): `text` in the README's language, the
+/// English text as `Display`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Withheld {
+    /// Every AI-training crawler already has its own group.
+    NothingToAdd,
+    NotUtf8,
+    /// robots.txt answered with an HTML page.
+    HtmlPage,
+    /// The file ends with User-agent lines without a rule (`AiRobots::ends_with_ruleless_group`).
+    RulelessGroup,
+    /// robots.txt answered this 4xx status other than 404 and 410.
+    HiddenStatus(i32),
+    /// robots.txt could not be read (the status or the error).
+    Unreadable(String),
+    /// `--ignore-robots-txt`.
+    Ignored,
+    NotFetched,
+    /// The added group for this crawler lies beyond what engines read.
+    NotRead(String),
+    /// Appending would change what other crawlers may crawl.
+    OtherCrawlers(PolicyChange),
+}
+
+impl Withheld {
+    /// The reason in the language of `locale` (English or Czech).
+    pub fn text(&self, locale: &ReportLocale) -> String {
+        if !locale.is_czech() {
+            return self.to_string();
+        }
+        match self {
+            Withheld::NothingToAdd => {
+                "není co přidat: každý crawler sbírající data pro trénování AI už má vlastní skupinu".to_string()
+            }
+            Withheld::NotUtf8 => "robots.txt není platné UTF-8, takže ho nelze zopakovat bajt po bajtu".to_string(),
+            Withheld::HtmlPage => "robots.txt vrátil HTML stránku místo pravidel robots.txt".to_string(),
+            Withheld::RulelessGroup => "robots.txt končí skupinou bez pravidel (řádky User-agent za posledním řádkem \
+                Allow nebo Disallow; řádek Crawl-delay takovým pravidlem není, stejně jako řádek pravidla, který \
+                začíná nezlomitelnou nebo jinou ne-ASCII mezerou a který Google nečte), takže připojené skupiny by \
+                s ní splynuly"
+                .to_string(),
+            Withheld::HiddenStatus(status) => {
+                format!("robots.txt vrátil HTTP {status}: soubor může existovat, jen je před crawlerem skrytý")
+            }
+            Withheld::Unreadable(why) => format!("robots.txt se nepodařilo načíst ({why})"),
+            Withheld::Ignored => "robots.txt nebyl stažen (--ignore-robots-txt)".to_string(),
+            Withheld::NotFetched => "robots.txt nebyl stažen".to_string(),
+            Withheld::NotRead(token) => format!(
+                "přidaná skupina pro {token} by se neuplatnila (vyhledávače čtou jen prvních 500 KiB souboru robots.txt)"
+            ),
+            Withheld::OtherCrawlers(PolicyChange::TooManyRules(rules)) => {
+                format!("robots.txt má příliš mnoho pravidel ({rules}) na ověření, že připojení nic jiného nezmění")
+            }
+            Withheld::OtherCrawlers(PolicyChange::Changed {
+                token,
+                path,
+                was_allowed,
+            }) => {
+                let verdict = |allowed: bool| if allowed { "povoleno" } else { "zakázáno" };
+                format!(
+                    "připojení by změnilo pravidla jiných crawlerů: User-agent {token}: {path} by se změnilo z {} na {}",
+                    verdict(*was_allowed),
+                    verdict(!*was_allowed)
+                )
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for Withheld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Withheld::NothingToAdd => write!(f, "nothing to add: every AI-training crawler already has its own group"),
+            Withheld::NotUtf8 => write!(
+                f,
+                "robots.txt is not valid UTF-8, so it cannot be reproduced byte for byte"
+            ),
+            Withheld::HtmlPage => write!(f, "robots.txt answered with an HTML page instead of robots.txt rules"),
+            Withheld::RulelessGroup => write!(
+                f,
+                "robots.txt ends with a group without rules (User-agent lines after the last Allow or \
+                 Disallow line; a Crawl-delay line is no such rule, nor is a rule line that starts with a \
+                 no-break space or another non-ASCII space, which Google does not read), so appended groups \
+                 would merge into it"
+            ),
+            Withheld::HiddenStatus(status) => write!(
+                f,
+                "robots.txt answered HTTP {status}: a file may exist but be hidden from the crawler"
+            ),
+            Withheld::Unreadable(why) => write!(f, "robots.txt could not be read ({why})"),
+            Withheld::Ignored => write!(f, "robots.txt was not fetched (--ignore-robots-txt)"),
+            Withheld::NotFetched => write!(f, "robots.txt was not fetched"),
+            Withheld::NotRead(token) => write!(
+                f,
+                "the added group for {token} would not take effect (engines read only the first 500 KiB of robots.txt)"
+            ),
+            Withheld::OtherCrawlers(change) => {
+                write!(f, "appending would change the rules of other crawlers: {change}")
+            }
+        }
+    }
 }
 
 /// A file stem per page URL: `page-<slug>` from the URL path (decoded, lowercase ASCII, diacritics
@@ -1052,6 +1140,7 @@ pub fn build(
     let mut names: Vec<String> = vec![README_PATH.to_string()];
     names.extend(files.iter().map(|file| file.relative_path.clone()));
     let not_indexable = input.analyses.iter().filter(|analysis| !analysis.indexable).count();
+    let withheld = withheld.map(|why| why.text(input.locale));
     let mut text = readme(input.locale, &names, withheld.as_deref(), not_indexable, today);
     text.push_str(&sitemap_readme(input.locale, input.sitemap, input.sitemap_withheld));
     files.insert(0, KitFile::text(README_PATH, &text));
@@ -1272,7 +1361,8 @@ mod tests {
                 &paths(&["/"]),
                 &[],
             )
-            .expect_err("the file may exist but be hidden from the crawler");
+            .expect_err("the file may exist but be hidden from the crawler")
+            .to_string();
             assert!(why.contains(&status.to_string()), "{why}");
         }
     }
@@ -1303,7 +1393,9 @@ mod tests {
         let key = paths(&["/", "/sluzby"]);
         let refuse = |state: RobotsFetchState, snippet: &str| {
             let robots = robots_of(&state);
-            proposed_robots(&state, robots.as_ref(), snippet, &key, &[]).expect_err("withheld")
+            proposed_robots(&state, robots.as_ref(), snippet, &key, &[])
+                .expect_err("withheld")
+                .to_string()
         };
 
         let ruleless = "User-agent: *\nDisallow: /admin\n\nUser-agent: Example\n";
@@ -2391,11 +2483,68 @@ mod tests {
             &paths(&["/"]),
             &[],
         )
-        .expect_err("a trailing group without Allow or Disallow rules");
+        .expect_err("a trailing group without Allow or Disallow rules")
+        .to_string();
         assert!(
             reason.contains("Crawl-delay"),
             "the owner sees why a Crawl-delay group counts: {reason}"
         );
+    }
+
+    #[test]
+    fn a_czech_readme_says_in_czech_why_robots_proposed_txt_was_withheld() {
+        let titles = HashMap::new();
+        let readme = |language: &str, content: &str| -> String {
+            let state = ok(content);
+            let robots = robots_of(&state);
+            let agents = verdicts(robots.as_ref());
+            let locale = ReportLocale::new(language);
+            let input = KitInput {
+                locale: &locale,
+                site_name: "Example",
+                markup: &[],
+                possible_profiles: &[],
+                analyses: &[],
+                titles: &titles,
+                agents: &agents,
+                key_paths: &paths(&["/", "/private"]),
+                sitemaps: &[],
+                sitemap: None,
+                sitemap_withheld: None,
+            };
+            let files = build(&input, &state, robots.as_ref(), TODAY);
+            assert!(
+                !files.iter().any(|file| file.relative_path == PROPOSED_PATH),
+                "{language}: {content:?}"
+            );
+            String::from_utf8(files[0].bytes.clone()).unwrap()
+        };
+        let huge = format!("User-agent: *\nDisallow: /private\n#{}\n", "x".repeat(510 * 1024));
+        for (content, czech, english) in [
+            (
+                "User-agent: Googlebot\n\u{a0}Disallow: /private\n",
+                "robots.txt končí skupinou bez pravidel",
+                "robots.txt ends with a group without rules",
+            ),
+            (
+                "<!doctype html><html><body>Not found</body></html>",
+                "místo pravidel robots.txt",
+                "robots.txt answered with an HTML page instead of robots.txt rules",
+            ),
+            (
+                huge.as_str(),
+                "by se neuplatnila (vyhledávače čtou jen prvních 500 KiB souboru robots.txt)",
+                "would not take effect (engines read only the first 500 KiB of robots.txt)",
+            ),
+        ] {
+            let cs = readme("cs", content);
+            assert!(cs.contains("**robots.proposed.txt nebyl vytvořen: "), "{cs}");
+            assert!(cs.contains(czech), "{cs}");
+            assert!(!cs.contains(english), "no English reason in the Czech README: {cs}");
+            let en = readme("en", content);
+            assert!(en.contains("**robots.proposed.txt was not generated: "), "{en}");
+            assert!(en.contains(english), "{en}");
+        }
     }
 
     #[test]
