@@ -615,30 +615,57 @@ fn chrome_section_heading(link: ElementRef) -> Option<String> {
 
 /// Whether the text around a link credits someone else (`CREDIT_MARKERS`, compared as words
 /// without diacritics), once the site's own name is taken out of it ("Aster Design on Instagram"
-/// names the brand, not a designer).
+/// names the brand, not a designer; "Made by Aster" credits the brand itself).
 fn credits_someone_else(context: &str, site_name: &str) -> bool {
-    let words = |text: &str| -> Vec<String> {
-        text.split(|c: char| !c.is_alphanumeric())
-            .map(compact)
-            .filter(|word| !word.is_empty())
-            .collect()
-    };
-    let mut context = words(context);
-    let brand = words(site_name);
-    if !brand.is_empty() {
-        let mut at = 0;
-        while at + brand.len() <= context.len() {
-            if context[at..at + brand.len()] == brand[..] {
-                context.drain(at..at + brand.len());
-            } else {
-                at += 1;
+    // The words of a text without diacritics, each with the byte offset where it ends.
+    let words_of = |text: &str| -> Vec<(String, usize)> {
+        let mut words = Vec::new();
+        let mut start = None;
+        for (at, c) in text.char_indices().chain(std::iter::once((text.len(), ' '))) {
+            if c.is_alphanumeric() {
+                start.get_or_insert(at);
+            } else if let Some(from) = start.take() {
+                let word = compact(&text[from..at]);
+                if !word.is_empty() {
+                    words.push((word, at));
+                }
             }
         }
+        words
+    };
+    // The site's own name becomes one empty word: no marker matches it.
+    let mut words = words_of(context);
+    let brand: Vec<String> = words_of(site_name).into_iter().map(|(word, _)| word).collect();
+    if !brand.is_empty() {
+        let mut at = 0;
+        while at + brand.len() <= words.len() {
+            if words[at..at + brand.len()]
+                .iter()
+                .map(|(word, _)| word)
+                .eq(brand.iter())
+            {
+                let end = words[at + brand.len() - 1].1;
+                words.splice(at..at + brand.len(), [(String::new(), end)]);
+            }
+            at += 1;
+        }
     }
+    // The whole name of the site, not the start of another one ("Aster CMS").
+    let the_site = |at: usize| {
+        words.get(at).is_some_and(|(word, end)| {
+            word.is_empty()
+                && context[*end..]
+                    .trim_start()
+                    .chars()
+                    .next()
+                    .is_none_or(|next| !next.is_alphanumeric())
+        })
+    };
     CREDIT_MARKERS.iter().any(|marker| {
-        context
-            .windows(marker.len())
-            .any(|window| window.iter().zip(marker.iter()).all(|(word, known)| word == known))
+        words.windows(marker.len()).enumerate().any(|(at, window)| {
+            window.iter().zip(marker.iter()).all(|((word, _), known)| word == known)
+                && !(marker.last() == Some(&"by") && the_site(at + marker.len()))
+        })
     })
 }
 
@@ -1381,6 +1408,12 @@ mod tests {
             r#"<a href="https://www.instagram.com/asterdesign/">Aster Design on Instagram</a>"#,
         );
         assert_eq!(same_as, json!(["https://www.instagram.com/asterdesign/"]));
+        // "Made by" the brand itself credits no one else.
+        let (same_as, _) = profiles(
+            "Aster",
+            r#"<p>© 2026 Made by Aster · <a href="https://www.facebook.com/aster">Facebook</a></p>"#,
+        );
+        assert_eq!(same_as, json!(["https://www.facebook.com/aster"]));
         // A footer column headed "Partners" credits the accounts in it; the heading of another
         // column labels nothing in this one.
         let (same_as, possible) = profiles(
