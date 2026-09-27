@@ -1143,6 +1143,50 @@ How it works:
 - `--ai-report-language=<BCP-47>` sets the language of the model's prose; the fixed texts are built in for English and Czech (other languages use English). Values and evidence are always quoted as written.
 - `--ai-consistency` is its own pipeline (not an `--ai-actions` value): used alone it runs only the consistency check; combine it with explicit `--ai-actions=...`, `--ai-report`, `--ai-elaborate` or `--ai-profile` to run those too.
 
+#### AI search readiness (`--ai-geo`)
+
+`--ai-geo` tells you how well AI search and answer engines — Google AI Overviews and AI Mode, Bing Copilot, ChatGPT search, Perplexity and Claude — can reach, read, understand and quote your site. It ranks the fixes by the strength of the evidence behind them and writes a kit of files you can deploy. It never promises citations or rankings: the engines decide that.
+
+```bash
+./siteone-crawler --url=https://example.com/ \
+  --ai-geo --ai-report-language=en \
+  --ai-provider=openai-compatible --ai-endpoint=http://localhost:8000/v1 \
+  --ai-model=your-model
+```
+
+What it checks:
+
+- **Crawler policy.** The robots.txt of each origin, with how it was fetched (read, missing, unavailable or skipped), matched with the rules of RFC 9309 for each AI crawler: Googlebot, Google-Extended, Bingbot, OAI-SearchBot, ChatGPT-User, GPTBot, Claude-SearchBot, Claude-User, ClaudeBot, PerplexityBot, Perplexity-User, Applebot, Applebot-Extended, meta-externalagent and CCBot. Each comes with its purpose (search, user fetch, training, grounding), whether it honors robots.txt, and the deciding rule (`User-agent: OAI-SearchBot → Disallow: /`). A blocked search crawler is a problem; a blocked training crawler is information. When the homepage redirects to another origin (`www`, `https`), the robots.txt of that origin is fetched after the crawl (at most 10 origins, not in a dry run).
+- **Observed access** on the key pages — the homepage, the pages it links to and the pages listed in the sitemaps, at most 200, the same set whatever `--ai-max-pages` is: 401/403/429/5xx, timeouts, redirect chains and loops, suspected bot challenges and soft 404s, slow responses. It is what SiteOne Crawler's user agent saw; your CDN/WAF may treat AI crawlers differently. With `--browser` the rendering time does not count.
+- **Indexing & snippet controls** per engine, from the robots meta tags and every `X-Robots-Tag` header: `noindex`, `nosnippet`, `max-snippet`, `noarchive`/`nocache` (which restrict Bing Copilot), an expired `unavailable_after`, `data-nosnippet`, and a canonical URL elsewhere.
+- **Rendering.** Key pages whose HTML has almost no text of its own and shows an app shell: the crawlers of OpenAI, Anthropic and Perplexity do not run JavaScript. With `--browser`, the text of the HTML as fetched, recorded while rendering, is compared with the rendered page.
+- **Answer extractability & entity clarity** (the model, one call per page for the first `--ai-max-pages` pages): the main topic, whether the page states early what it offers, the questions a visitor would ask and whether the page answers them, passages that rely on "it" or "we", and improvements that fit the page type. The model answers with block ids only; the crawler checks every id and quotes its own copy of the text.
+- **Structured data**: existing JSON-LD (parse errors, key values the page does not show), Microdata and RDFa.
+- **Discovery & freshness**: declared and crawled sitemaps (key pages missing from them, non-indexable URLs listed, suspicious `lastmod`), `Last-Modified` coverage and hreflang targets.
+- **Manual checks**, which the website does not show: the Search generative AI setting and the generative-AI performance report in Google Search Console, the AI Performance report in Bing Webmaster Tools, and the "block AI bots" settings and bot verification of your CDN/WAF.
+
+**Evidence strength.** Every finding shows its evidence, the engines it concerns and a dated source. **Strong** is documented behavior of the engines, **Moderate** is engine guidance that was not measured, **Weak** is vendor claims, observational studies or no evidence (JSON-LD and llms.txt, for example). A category whose checks did not run reads "Not assessed", never "OK".
+
+**Outputs.** In `--ai-report-dir` (default `tmp/`), without overwriting anything: the report `ai-geo.<host>.<run-id>.md`, `.json` (schema `siteone-crawler/ai-geo/2`) and a self-contained `.html`, and the kit directory `ai-geo-kit.<host>.<run-id>/`:
+
+| File | What it is |
+|---|---|
+| `README.md` | What each file does, how to install and verify it, and the evidence behind it (English or Czech). |
+| `robots/block-ai-training.snippet.txt` | Optional robots.txt groups that stop the AI-training crawlers without a group of their own (`Disallow: /`, never `Allow`). Google-Extended is only commented out, because it also stops Gemini grounding. |
+| `robots/robots.proposed.txt` | Your robots.txt with the block appended — only when the file was read, does not end with a group without rules, and every other crawler keeps exactly its current rules. Otherwise the README says why and how to paste the block by hand. |
+| `jsonld/` | JSON-LD built by the crawler from the visible page content, never from model text: WebSite, Organization (logo, contacts and brand profiles from the site header and footer), BreadcrumbList, FAQPage (at least two visible questions with their answers) and Article/BlogPosting (headline, verified author and date), for indexable pages only. Each `.html` is a ready-to-paste `<script type="application/ld+json">`; `_manifest.json` lists the page, the evidence and notes such as "merge with the existing markup". |
+| `drafts/entity-drafts.md` | Not deployable: Product, Service, Event, LocalBusiness and Person drafts with the page text of every value, for review. |
+| `leads.md` | Editorial drafts of answer-first opening sentences, only for pages that do not state their answer early, with their excerpts; and the visitor questions a page does not answer. |
+| `llms.txt` | An [llms.txt](https://llmstxt.org/) index of the analyzed pages (optional; evidence weak). |
+| `sitemap/sitemap.proposed.xml`, `sitemap/coverage.json` | Only when the site has no sitemap (none declared in its robots.txt, which was read, and none crawled) and the crawl covered all of it (not stopped by `--max-visited-urls` or interrupted; no `--single-page`, `--max-depth` or URL filters): its canonical, indexable HTML pages that robots.txt leaves open to Googlebot and Bingbot, with `lastmod` only from a plausible `Last-Modified`. `coverage.json` states the crawl scope and the pages left out. |
+
+**Deploying the kit.** Review every file first. Paste the robots block after a line with an `Allow` or `Disallow` rule — never right after `User-agent` lines without rules, which would take its rules too — or use the proposed robots.txt, then check it in the robots.txt report of Search Console. Put each JSON-LD `.html` into the page the manifest names, keep every value identical to the visible text, and validate it with the Rich Results Test and the Schema Markup Validator. Rewrite the lead drafts in your own words. Save a proposed sitemap as `/sitemap.xml`, declare it in robots.txt and submit it in Search Console and Bing Webmaster Tools.
+
+**Cost.** One call per analyzed page, at most `--ai-max-pages` (default `100`) with the homepage always included, and no site-level call. A page takes about 2–8 K input and 0.5–1.6 K output tokens; a page cut at the output limit is asked again once with fewer blocks. `--ai-dry-run` prints the calls and a token (and cost) estimate without any API call. The deterministic checks run even without a usable AI configuration; the per-page categories then read "Not assessed".
+
+- `--ai-geo` is its own pipeline (not an `--ai-actions` value): used alone it runs only the readiness check; combine it with explicit `--ai-actions=...`, `--ai-report`, `--ai-elaborate`, `--ai-profile` or `--ai-consistency` to run those too. With `--ai-consistency`, the "Entity clarity" card links the fact-consistency report of the same run.
+- `--ai-report-language` sets the language of the model's prose; the fixed texts are built in for English and Czech. The lead drafts stay in the page's language, and `llms.txt` leaves out topics written in another language than the page.
+
 #### AI executive summary (`summary` action)
 
 `--ai-actions=summary` runs **after** the deterministic analysis and produces a visually styled box at the top of the HTML report's **Summary** tab, below the Website Quality Score. It works by evaluating five areas in parallel — security, accessibility, SEO, performance, infrastructure — each grounded in compact *aggregated* crawl data (never raw per-URL lists), then synthesizing one cross-area, prioritized list of up to 15 actionable recommendations (fewer for a clean site — never padded) with severity, impact, and evidence.

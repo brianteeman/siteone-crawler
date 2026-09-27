@@ -46,3 +46,15 @@ prints recall, false positives and missed cases.
   `src/ai/geo/prompts.rs`, which appends the output language. The page itself is sent in the user
   message as numbered blocks inside `<page_data>`; the model answers with block ids, which the
   crawler verifies (`src/ai/geo/analyze.rs`). Hand-written, not generated.
+
+The output language is named (`Czech ('cs')`, falling back to the bare code for an unknown one):
+with a bare code, a local model wrote most questions and improvements in the page's language. The
+lead draft stays in the page's language. The prompt's rules are enforced by the crawler, not trusted:
+every block id, quote, lead number, FAQ pair and byline is checked, a lead is kept only for a page
+that does not state its offer early, and the kit builds FAQPage markup only from at least two real
+questions (ending with a question mark) on an indexable page.
+
+After changing the prompt, check it live on a small site, e.g.
+`--ai-geo --ai-max-pages=5 --ai-report-language=cs`, and read the per-page section of the report
+and `leads.md` / `drafts/entity-drafts.md` in the kit; `ai_geo_end_to_end` in
+`tests/integration_crawl.rs` covers the verification with a mock model.
