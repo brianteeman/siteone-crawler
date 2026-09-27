@@ -784,7 +784,8 @@ fn looks_like_sitemap(url: &str) -> bool {
 
 /// The head of a stored HTML page, parsed alone: the robots meta tags, the canonical link and the
 /// hreflang alternates belong there, and parsing only the head keeps the checks of large sitemaps
-/// cheap. `None` without a stored body.
+/// cheap. The whole page when a robots meta tag may also sit in its body, where engines read it
+/// too (as `controls::sources` does for the snippet controls). `None` without a stored body.
 fn page_head(status: &Status, visit: &VisitedUrl) -> Option<Html> {
     let body = status.get_url_body_text(&visit.uq_id)?;
     let end = body
@@ -792,6 +793,14 @@ fn page_head(status: &Status, visit: &VisitedUrl) -> Option<Html> {
         .windows(6)
         .position(|window| window.eq_ignore_ascii_case(b"</head"))
         .unwrap_or(body.len());
+    let rest = body.get(end..).unwrap_or_default().to_ascii_lowercase();
+    let robots_meta_in_body = rest.contains("<meta")
+        && ["robots", "googlebot", "bingbot"]
+            .iter()
+            .any(|name| rest.contains(name));
+    if robots_meta_in_body {
+        return Some(Html::parse_document(&body));
+    }
     Some(Html::parse_document(body.get(..end).unwrap_or(&body)))
 }
 
@@ -1439,8 +1448,24 @@ mod tests {
         let mut status = new_status();
         let html =
             |extra_head: &str| format!("<html><head>{extra_head}</head><body><main><p>Text</p></main></body></html>");
-        let pages: [(&str, &str, i32, String); 7] = [
+        let pages: [(&str, &str, i32, String); 9] = [
             ("home", "https://example.com/", 200, html("")),
+            // A robots meta tag in the body counts as well (as in `controls::sources`).
+            (
+                "body-noindex",
+                "https://example.com/body-noindex",
+                200,
+                r#"<html><head></head><body><main><meta name="robots" content="noindex"><p>Text</p></main></body></html>"#
+                    .to_string(),
+            ),
+            // Another meta tag and a mention of robots in the body do not.
+            (
+                "robots-text",
+                "https://example.com/robots-text",
+                200,
+                r#"<html><head></head><body><main><meta itemprop="name" content="x"><p>We build robots.</p></main></body></html>"#
+                    .to_string(),
+            ),
             ("zeta", "https://example.com/zeta", 200, html("")),
             ("deep", "https://example.com/a/b?x=1&y=2", 200, html("")),
             (
@@ -1521,6 +1546,10 @@ mod tests {
                     lastmod: None,
                 },
                 ProposedUrl {
+                    url: "https://example.com/robots-text".to_string(),
+                    lastmod: None,
+                },
+                ProposedUrl {
                     url: "https://example.com/zeta".to_string(),
                     lastmod: Some("2026-09-01T10:00:00+00:00".to_string()),
                 },
@@ -1537,7 +1566,7 @@ mod tests {
                 proposal.left_out.blocked,
                 proposal.left_out.other_origin,
             ),
-            (1, 1, 1, 1)
+            (2, 1, 1, 1)
         );
         assert_eq!(proposal.scope, complete_scope());
 
@@ -1551,7 +1580,7 @@ mod tests {
             now(),
         )
         .unwrap();
-        assert_eq!(proposal.urls.len(), 4);
+        assert_eq!(proposal.urls.len(), 5);
         assert_eq!(proposal.left_out.blocked, 0);
     }
 
@@ -1644,7 +1673,7 @@ mod tests {
             page("img", "home", SOURCE_IMG_SRC, "https://example.com/a.png", 503, None),
             None,
         );
-        assert_eq!(propose(&status), Ok(4));
+        assert_eq!(propose(&status), Ok(5));
         // A link that failed may hide the pages behind it.
         for (uq_id, code) in [("down", 503), ("busy", 429), ("slow", -2)] {
             let mut status = site_without_sitemap();
