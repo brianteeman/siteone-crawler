@@ -778,6 +778,17 @@ impl CoreOptions {
             }
         }
 
+        // --ai-geo alone reports its deterministic checks without a model: a missing endpoint or
+        // model only leaves its per-page analysis "not assessed" (`geo::run`).
+        let geo_only = core.ai_geo
+            && core.ai_actions.is_empty()
+            && core.ai_report.is_none()
+            && !core.ai_elaborate
+            && !core.ai_profile
+            && !core.ai_consistency
+            && !core.ai_list_models
+            && !core.ai_check;
+
         if core.ai_enabled {
             let provider = crate::ai::provider::Provider::parse(&core.ai_provider).ok_or_else(|| {
                 CrawlerError::Config(format!(
@@ -785,7 +796,7 @@ impl CoreOptions {
                     core.ai_provider
                 ))
             })?;
-            if provider == crate::ai::provider::Provider::OpenAiCompatible && core.ai_endpoint.is_none() {
+            if provider == crate::ai::provider::Provider::OpenAiCompatible && core.ai_endpoint.is_none() && !geo_only {
                 return Err(CrawlerError::Config(
                     "--ai-provider=openai-compatible requires --ai-endpoint=URL.".to_string(),
                 ));
@@ -802,7 +813,10 @@ impl CoreOptions {
                 ));
             }
             // Listing the models is how a model is chosen, so it needs none.
-            if !core.ai_list_models && core.ai_model.as_deref().map(|s| s.trim().is_empty()).unwrap_or(true) {
+            if !core.ai_list_models
+                && !geo_only
+                && core.ai_model.as_deref().map(|s| s.trim().is_empty()).unwrap_or(true)
+            {
                 return Err(CrawlerError::Config(
                     "AI is enabled but --ai-model is missing.".to_string(),
                 ));
@@ -5004,6 +5018,32 @@ mod tests {
         let core = parse_argv(&argv(&["--ai-geo", "--ai-consistency"])).expect("should parse");
         assert!(core.ai_geo && core.ai_consistency, "both pipelines run");
         assert!(core.ai_actions.is_empty());
+    }
+
+    #[test]
+    fn ai_geo_alone_needs_no_model_for_its_deterministic_checks() {
+        let argv = |extra: &[&str]| -> Vec<String> {
+            ["bin", "--url=https://example.com", "--config-file=/dev/null"]
+                .iter()
+                .chain(extra)
+                .map(|arg| arg.to_string())
+                .collect()
+        };
+        let core = parse_argv(&argv(&["--ai-geo"])).expect("GEO alone reports without a model");
+        assert!(core.ai_geo && core.ai_enabled && core.ai_model.is_none());
+        let core = parse_argv(&argv(&["--ai-geo", "--ai-provider=openai"])).expect("a hosted provider too");
+        assert!(core.ai_model.is_none());
+        // Another AI feature, or a wrong value, still needs a complete configuration.
+        for extra in [
+            &["--ai-geo", "--ai-actions=seo"][..],
+            &["--ai-geo", "--ai-consistency"],
+            &["--ai-geo", "--ai-report=ia"],
+            &["--ai-geo", "--ai-provider=unknown"],
+            &["--ai-geo", "--ai-endpoint=http://localhost:8000/v1?key=x"],
+            &["--ai-consistency"],
+        ] {
+            assert!(parse_argv(&argv(extra)).is_err(), "{extra:?} parsed");
+        }
     }
 
     #[test]

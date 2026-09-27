@@ -528,7 +528,7 @@ pub async fn run(
         ..AnalysisRun::default()
     };
     let mut provider = options.ai_provider.clone();
-    match build_config(options) {
+    match analysis_config(options) {
         Err(error) => {
             let msg = format!(
                 "AI search readiness: the per-page analysis was skipped ({error}); the deterministic checks still ran."
@@ -668,6 +668,22 @@ pub async fn run(
         st.add_info_to_summary("ai-geo", &format!("AI search readiness: {}", doc.summary));
         st.set_ai_geo_doc(doc);
     }
+}
+
+/// The AI configuration of the per-page analysis. `--ai-geo` alone may run without a model or an
+/// endpoint (the options allow it, for the deterministic checks), which `build_config` does not
+/// require; `Err` says what is missing.
+fn analysis_config(options: &CoreOptions) -> Result<crate::ai::config::AiConfig, String> {
+    if options.ai_model.as_deref().is_none_or(|model| model.trim().is_empty()) {
+        return Err("no --ai-model was given".to_string());
+    }
+    if crate::ai::provider::Provider::parse(&options.ai_provider)
+        == Some(crate::ai::provider::Provider::OpenAiCompatible)
+        && options.ai_endpoint.is_none()
+    {
+        return Err("--ai-provider=openai-compatible needs --ai-endpoint=URL".to_string());
+    }
+    build_config(options)
 }
 
 /// Print the plan of a dry run: the calls, an input-token estimate (the final requests at 2.5

@@ -7643,6 +7643,46 @@ fn ai_geo_without_a_model_still_reports_policy_and_access() {
     assert_eq!(artifacts, 4);
 }
 
+/// `--ai-geo` alone, without any provider, endpoint, model or key, still writes the deterministic
+/// report and kit; the per-page categories read "Not assessed" and no request is sent.
+#[test]
+fn ai_geo_without_any_ai_configuration_still_reports() {
+    let tmp = TempDir::new("ai-geo-no-configuration");
+    let server = geo_site();
+    let reports = tmp.path.join("reports");
+    let report_dir = format!("--ai-report-dir={}", reports.display());
+    let output = crawl_geo(&server, &["--ai-geo", report_dir.as_str()]);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    for line in [
+        "  Crawler policy: Problem",
+        "  Observed access: Problem",
+        "  Answer extractability: Not assessed (AI not available)",
+        "  Entity clarity: Not assessed (AI not available)",
+    ] {
+        assert!(
+            stderr.lines().any(|l| l == line),
+            "no line {line:?} in stderr:\n{stderr}"
+        );
+    }
+    assert!(stderr.contains("no --ai-model"), "the reason: {stderr}");
+    let names = geo_outputs(&reports);
+    assert_eq!(names.len(), 4, "{names:?}");
+    let json_name = names
+        .iter()
+        .find(|name| name.ends_with(".json"))
+        .expect("the JSON report");
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(reports.join(json_name)).expect("the report")).expect("JSON");
+    assert!(
+        json["meta"]["analysisUnavailable"]
+            .as_str()
+            .is_some_and(|why| why.contains("no --ai-model")),
+        "{}",
+        json["meta"]
+    );
+}
+
 /// An answer cut at the output limit is asked again unchanged (the client's retry), then once
 /// with a 30 % smaller block selection; the verification uses what that smaller request showed.
 #[test]
