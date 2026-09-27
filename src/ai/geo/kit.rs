@@ -529,12 +529,14 @@ fn section_name(page_type: PageType) -> &'static str {
     }
 }
 
-/// An llms.txt (llmstxt.org) of the analyzed pages: the site name, the homepage's own meta
-/// description, and one section per page type in the order the types first occur, each listing
-/// its pages in rank order as `- [title](url): meta description`. The file goes onto the site, so
-/// it holds only the site's own text: never a model-written summary, which the crawler cannot
-/// verify.
+/// An llms.txt (llmstxt.org) of the analyzed pages that engines may index
+/// (`PageAnalysis::indexable`, as for the JSON-LD and the proposed sitemap): the site name, the
+/// homepage's own meta description, and one section per page type in the order the types first
+/// occur, each listing its pages in rank order as `- [title](url): meta description`. The file
+/// goes onto the site, so it holds only the site's own text: never a model-written summary, which
+/// the crawler cannot verify.
 pub fn llms_txt(site_name: &str, analyses: &[PageAnalysis], titles: &HashMap<String, String>) -> String {
+    let analyses: Vec<&PageAnalysis> = analyses.iter().filter(|analysis| analysis.indexable).collect();
     let topic_of = |analysis: &PageAnalysis| analysis.description.trim().to_string();
     let mut out = format!("# {}\n\n", md_escape(site_name));
     let homepage = analyses
@@ -545,11 +547,14 @@ pub fn llms_txt(site_name: &str, analyses: &[PageAnalysis], titles: &HashMap<Str
                 .iter()
                 .find(|analysis| analysis.page_type == PageType::Homepage)
         });
-    if let Some(topic) = homepage.map(topic_of).filter(|topic| !topic.is_empty()) {
+    if let Some(topic) = homepage
+        .map(|analysis| topic_of(analysis))
+        .filter(|topic| !topic.is_empty())
+    {
         out.push_str(&format!("> {}\n\n", md_escape(&topic)));
     }
     let mut sections: Vec<(PageType, Vec<String>)> = Vec::new();
-    for analysis in analyses {
+    for analysis in &analyses {
         let title = titles
             .get(&analysis.url)
             .filter(|title| !title.trim().is_empty())
@@ -705,9 +710,16 @@ pub fn entity_drafts_md(locale: &ReportLocale, analyses: &[PageAnalysis]) -> Str
 }
 
 /// The kit's README: what each file of `files` does and how to install it, with the strength of
-/// the evidence behind it, why a proposed robots.txt was withheld, the manual checks and how to
-/// verify the deployment.
-pub fn readme(locale: &ReportLocale, files: &[String], withheld: Option<&str>, today: &str) -> String {
+/// the evidence behind it, why a proposed robots.txt was withheld, how many analyzed pages the
+/// llms.txt leaves out as not indexable (`not_indexable`), the manual checks and how to verify the
+/// deployment.
+pub fn readme(
+    locale: &ReportLocale,
+    files: &[String],
+    withheld: Option<&str>,
+    not_indexable: usize,
+    today: &str,
+) -> String {
     let cs = locale.is_czech();
     let has = |path: &str| files.iter().any(|file| file == path);
     let has_jsonld = files.iter().any(|file| file.starts_with("jsonld/"));
@@ -845,6 +857,19 @@ pub fn readme(locale: &ReportLocale, files: &[String], withheld: Option<&str>, t
              site (/llms.txt) (evidence: weak — it is rarely requested and no major AI provider has committed \
              to using it).\n\n"
         });
+        if not_indexable > 0 {
+            out.push_str(&if cs {
+                format!(
+                    "Analyzované stránky s noindex nebo s kanonickou URL jinde v něm nejsou, stejně jako v JSON-LD \
+                     a v navržené sitemapě (počet: {not_indexable}).\n\n"
+                )
+            } else {
+                format!(
+                    "Analyzed pages with noindex or a canonical URL elsewhere are left out, as in the JSON-LD and \
+                     the proposed sitemap ({not_indexable}).\n\n"
+                )
+            });
+        }
     }
     out.push_str(if cs {
         "## Ruční kontroly (z webu nejsou vidět)\n\n\
@@ -1014,7 +1039,7 @@ pub fn build(
     if !leads.is_empty() {
         files.push(KitFile::text(LEADS_PATH, &leads));
     }
-    if !input.analyses.is_empty() {
+    if input.analyses.iter().any(|analysis| analysis.indexable) {
         files.push(KitFile::text(
             LLMS_TXT_PATH,
             &llms_txt(input.site_name, input.analyses, input.titles),
@@ -1026,7 +1051,8 @@ pub fn build(
     }
     let mut names: Vec<String> = vec![README_PATH.to_string()];
     names.extend(files.iter().map(|file| file.relative_path.clone()));
-    let mut text = readme(input.locale, &names, withheld.as_deref(), today);
+    let not_indexable = input.analyses.iter().filter(|analysis| !analysis.indexable).count();
+    let mut text = readme(input.locale, &names, withheld.as_deref(), not_indexable, today);
     text.push_str(&sitemap_readme(input.locale, input.sitemap, input.sitemap_withheld));
     files.insert(0, KitFile::text(README_PATH, &text));
     files
@@ -1817,6 +1843,7 @@ mod tests {
             &ReportLocale::new("en"),
             &files,
             Some("robots.txt ends with a group without rules"),
+            0,
             TODAY,
         );
         assert!(en.contains("robots.proposed.txt was not generated: robots.txt ends with a group without rules"));
@@ -1837,7 +1864,7 @@ mod tests {
             assert!(en.contains(part), "{part}");
         }
         assert!(!en.contains("drafts/entity-drafts.md"), "only files the kit has");
-        let cs = readme(&ReportLocale::new("cs"), &files, None, TODAY);
+        let cs = readme(&ReportLocale::new("cs"), &files, None, 0, TODAY);
         assert!(cs.contains("Sada pro připravenost na AI vyhledávání"));
         assert!(!cs.contains("nebyl vytvořen"));
         for text in [&en, &cs] {
@@ -2234,6 +2261,66 @@ mod tests {
     }
 
     #[test]
+    fn llms_txt_lists_only_pages_that_engines_may_index() {
+        let page = |title: &str| {
+            format!(
+                "<html lang=\"en\"><head><title>{title}</title></head><body><main><h1>{title}</h1></main></body></html>"
+            )
+        };
+        let home = analysis_of("https://example.com/", &page("Acme Tools"), |_| String::new());
+        let mut hidden = analysis_of("https://example.com/private", &page("Private page"), |_| String::new());
+        hidden.indexable = false;
+        let text = llms_txt("Acme Tools", &[home.clone(), hidden.clone()], &HashMap::new());
+        assert!(text.contains("(https://example.com/)"), "{text}");
+        assert!(
+            !text.contains("/private"),
+            "noindex or a canonical URL elsewhere: {text}"
+        );
+
+        // The README counts the pages left out; a kit without an indexable page has no llms.txt.
+        let state = ok("User-agent: *\nDisallow:\n");
+        let robots = robots_of(&state);
+        let agents = verdicts(robots.as_ref());
+        let titles = HashMap::new();
+        for (language, note) in [
+            (
+                "en",
+                "Analyzed pages with noindex or a canonical URL elsewhere are left out, as in the JSON-LD and the proposed sitemap (1).",
+            ),
+            (
+                "cs",
+                "Analyzované stránky s noindex nebo s kanonickou URL jinde v něm nejsou, stejně jako v JSON-LD a v navržené sitemapě (počet: 1).",
+            ),
+        ] {
+            let locale = ReportLocale::new(language);
+            let kit = |analyses: &[PageAnalysis]| {
+                let input = KitInput {
+                    locale: &locale,
+                    site_name: "Acme Tools",
+                    markup: &[],
+                    possible_profiles: &[],
+                    analyses,
+                    titles: &titles,
+                    agents: &agents,
+                    key_paths: &paths(&["/"]),
+                    sitemaps: &[],
+                    sitemap: None,
+                    sitemap_withheld: None,
+                };
+                build(&input, &state, robots.as_ref(), TODAY)
+            };
+            let files = kit(&[home.clone(), hidden.clone()]);
+            let readme = String::from_utf8(files[0].bytes.clone()).unwrap();
+            assert!(readme.contains(note), "{language}: {readme}");
+            let files = kit(std::slice::from_ref(&hidden));
+            assert!(
+                !files.iter().any(|file| file.relative_path == LLMS_TXT_PATH),
+                "{language}: no page to list"
+            );
+        }
+    }
+
+    #[test]
     fn llms_txt_leaves_out_topics_written_in_any_language() {
         let english =
             "<html lang=\"en-GB\"><head><title>Pricing</title></head><body><main><h1>Pricing</h1></main></body></html>";
@@ -2269,6 +2356,7 @@ mod tests {
             &ReportLocale::new("en"),
             &files,
             Some("robots.txt ends with a group without rules"),
+            0,
             TODAY,
         );
         assert!(
@@ -2288,6 +2376,7 @@ mod tests {
             &ReportLocale::new("cs"),
             &files,
             Some("robots.txt ends with a group without rules"),
+            0,
             TODAY,
         );
         assert!(

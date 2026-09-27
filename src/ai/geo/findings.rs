@@ -1537,6 +1537,7 @@ mod tests {
             h1: None,
             coverage: Coverage::default(),
             rejected: Rejected::default(),
+            indexable: true,
         }
     }
 

@@ -469,6 +469,10 @@ pub struct PageAnalysis {
     pub h1: Option<Block>,
     pub coverage: Coverage,
     pub rejected: Rejected,
+    /// No `noindex` for Google or Bing and no canonical URL elsewhere: set by the pipeline from the
+    /// page's controls (`true` from `verify_analysis`). Only such pages get kit markup or a line
+    /// in the llms.txt.
+    pub indexable: bool,
 }
 
 impl PageAnalysis {
@@ -1244,6 +1248,7 @@ pub fn verify_analysis(raw: RawAnalysis, page: &AnalyzedPage, blocks: &[Block], 
         h1: coverage.h1.and_then(|id| blocks.get(id)).cloned(),
         coverage: coverage.clone(),
         rejected,
+        indexable: true,
     }
 }
 

@@ -561,11 +561,10 @@ pub async fn run(
             let answers = analyze_all(&client, &sem, &chosen, &budgets, locale.code(), temperature).await;
             for (page, answer) in chosen.iter().zip(answers) {
                 match answer {
-                    Ok((raw, coverage)) => {
-                        analysis
-                            .pages
-                            .push(verify_analysis(raw, &page.page, &page.blocks, &coverage))
-                    }
+                    Ok((raw, coverage)) => analysis.pages.push(analyze::PageAnalysis {
+                        indexable: page.indexable,
+                        ..verify_analysis(raw, &page.page, &page.blocks, &coverage)
+                    }),
                     Err(error) => analysis.failed.push((page.page.url.clone(), error)),
                 }
             }
