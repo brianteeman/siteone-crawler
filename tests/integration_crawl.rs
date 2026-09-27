@@ -8024,3 +8024,74 @@ fn ai_geo_proposes_a_sitemap_only_after_a_complete_crawl() {
         "{readme}"
     );
 }
+
+/// With `--ai-consistency` too, the GEO report links the fact-consistency report of the same run
+/// from its "Entity clarity" card (the consistency report is exported first).
+#[test]
+fn ai_geo_links_the_fact_consistency_report_of_the_same_run() {
+    let tmp = TempDir::new("ai-geo-consistency");
+    let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/consistency");
+    let server = LocalServer::start(&corpus);
+    // The GEO page analyses carry `<is_homepage>`, the consistency extractions do not.
+    let analysis = serde_json::json!({
+        "page_type": "other", "main_topic": "A page of Example", "states_offer_early": "not_applicable",
+        "questions": [], "vague_references": [], "improvements": [], "lead": "", "lead_blocks": [],
+        "faq_pairs": [], "byline": {"author": "", "date": ""}, "entity_drafts": []
+    });
+    let mut routes = vec![MockRoute {
+        envelope: "<is_homepage>",
+        marker: None,
+        response: chat_response(200, chat_answer(&analysis.to_string())),
+    }];
+    routes.extend(consistency_corpus_routes());
+    let mock = MockLlm::start_routed(routes, Vec::new());
+    let reports = tmp.path.join("reports");
+    let output = run_crawler(&[
+        "--config-file=/dev/null",
+        &format!("--url={}", server.url()),
+        LOCAL_ANALYZERS,
+        "--http-cache-dir=",
+        "--no-color",
+        "--ai-provider=openai-compatible",
+        &format!("--ai-endpoint={}", mock.url()),
+        "--ai-model=m",
+        "--ai-cache-dir=",
+        "--ai-consistency",
+        "--ai-geo",
+        &format!("--ai-report-dir={}", reports.display()),
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    let names: Vec<String> = std::fs::read_dir(&reports)
+        .expect("the report dir")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    let consistency_html = names
+        .iter()
+        .find(|name| name.starts_with("ai-consistency.") && name.ends_with(".html"))
+        .unwrap_or_else(|| panic!("the consistency report in {names:?}\n{stderr}"));
+    let geo_json = names
+        .iter()
+        .find(|name| name.starts_with("ai-geo.") && name.ends_with(".json"))
+        .unwrap_or_else(|| panic!("the GEO report in {names:?}\n{stderr}"));
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(reports.join(geo_json)).expect("the report")).expect("JSON");
+    assert_eq!(
+        json["consistency"]["file"],
+        consistency_html.as_str(),
+        "{}",
+        json["consistency"]
+    );
+    assert_eq!(json["consistency"]["possibleInconsistencies"], 1);
+    let md = std::fs::read_to_string(reports.join(geo_json.replace(".json", ".md"))).expect("the Markdown report");
+    let row = md
+        .lines()
+        .find(|line| line.contains("Entity clarity") && line.contains('|'))
+        .expect("the Entity clarity card");
+    assert!(
+        row.contains("Fact consistency: 1 possible inconsistency(ies) — see")
+            && row.contains(&format!("]({consistency_html})")),
+        "{row}"
+    );
+}

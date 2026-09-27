@@ -684,6 +684,8 @@ impl Manager {
             .lock()
             .ok()
             .is_some_and(|st| st.get_ai_consistency_doc().is_some());
+        // The file name of the exported consistency HTML report, which the GEO report links.
+        let mut consistency_html: Option<String> = None;
         if has_consistency_doc {
             let run_id = format!(
                 "{}-{}",
@@ -691,6 +693,7 @@ impl Manager {
                 std::process::id()
             );
             let paths = AiConsistencyExporter::paths(&options.ai_report_dir, &options.get_initial_host(false), &run_id);
+            let html_name = paths[2].file_name().map(|name| name.to_string_lossy().into_owned());
             let mut consistency_exporter = AiConsistencyExporter::new(paths);
             let export_result = match (status.lock(), output.lock()) {
                 (Ok(st), Ok(out)) => consistency_exporter.export(&st, &**out),
@@ -698,11 +701,14 @@ impl Manager {
                     "Cannot lock crawler state for AI-consistency export".to_string(),
                 )),
             };
-            if let Err(error) = export_result {
-                let msg = format!("AI-consistency export failed: {}", error);
-                crate::events::emit_ai_issue("AI consistency export failed", &msg);
-                if let Ok(st) = status.lock() {
-                    st.add_critical_to_summary(consistency_exporter.get_name(), &msg);
+            match export_result {
+                Ok(()) => consistency_html = html_name,
+                Err(error) => {
+                    let msg = format!("AI-consistency export failed: {}", error);
+                    crate::events::emit_ai_issue("AI consistency export failed", &msg);
+                    if let Ok(st) = status.lock() {
+                        st.add_critical_to_summary(consistency_exporter.get_name(), &msg);
+                    }
                 }
             }
         }
@@ -711,6 +717,19 @@ impl Manager {
         // together, when the `--ai-geo` pipeline produced a document.
         let has_geo_doc = status.lock().ok().is_some_and(|st| st.get_ai_geo_doc().is_some());
         if has_geo_doc {
+            // Link the fact-consistency report of this run from the "Entity clarity" card.
+            if let Some(file) = consistency_html
+                && let Ok(st) = status.lock()
+                && let (Some(mut geo), Some(consistency)) = (st.get_ai_geo_doc(), st.get_ai_consistency_doc())
+            {
+                geo.consistency = Some(crate::ai::geo::doc::ConsistencyLink {
+                    file,
+                    possible_inconsistencies: consistency.findings.len(),
+                    complete: consistency.completeness.state
+                        == crate::ai::consistency::doc::CompletenessState::Complete,
+                });
+                st.set_ai_geo_doc(geo);
+            }
             let run_id = format!(
                 "{}-{}",
                 chrono::Local::now().format("%Y-%m-%d.%H-%M-%S.%3f"),

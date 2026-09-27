@@ -69,11 +69,15 @@ pub struct ManualCheck {
     pub url: &'static str,
 }
 
-/// The fact-consistency report of the same run.
+/// The fact-consistency report of the same run (`--ai-consistency`), linked from the "Entity
+/// clarity" card.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsistencyLink {
+    /// The file name of its HTML report, in the same directory as this report.
     pub file: String,
     pub possible_inconsistencies: usize,
+    /// Whether it covered its whole scope.
+    pub complete: bool,
 }
 
 /// The AI search readiness report.
@@ -747,13 +751,30 @@ impl GeoDoc {
             .categories
             .iter()
             .map(|(id, state)| {
+                let mut coverage = line(self.coverage_text(locale, *id, state));
+                if *id == CategoryId::EntityClarity
+                    && let Some(link_to) = &self.consistency
+                {
+                    coverage.push(t(format!(
+                        " · {} ",
+                        fill(
+                            text(locale, "label.consistency_link"),
+                            &[link_to.possible_inconsistencies.to_string()],
+                            0
+                        )
+                    )));
+                    coverage.push(link(link_to.file.clone(), link_to.file.clone()));
+                    if !link_to.complete {
+                        coverage.push(t(format!(" {}", text(locale, "label.consistency_partial"))));
+                    }
+                }
                 vec![
                     line(text(locale, &format!("cat.{}", id.key()))),
                     vec![Inline::Status(
                         state.status,
                         status_label(locale, state.status).to_string(),
                     )],
-                    line(self.coverage_text(locale, *id, state)),
+                    coverage,
                 ]
             })
             .collect();
@@ -1912,6 +1933,7 @@ impl GeoDoc {
             "consistency": self.consistency.as_ref().map(|link| json!({
                 "file": link.file,
                 "possibleInconsistencies": link.possible_inconsistencies,
+                "complete": link.complete,
             })),
             "failedPages": self.failed_pages.iter()
                 .map(|(url, error)| json!({"url": url, "error": error})).collect::<Vec<_>>(),
@@ -2207,6 +2229,11 @@ const EN: &[(&str, &str)] = &[
         "The site has no sitemap and the crawl covered all of it: the kit proposes one with its {0} canonical, indexable page(s) (sitemap/sitemap.proposed.xml).",
     ),
     ("label.sitemap_withheld", "No sitemap is proposed: {0}."),
+    (
+        "label.consistency_link",
+        "Fact consistency: {0} possible inconsistency(ies) — see",
+    ),
+    ("label.consistency_partial", "(the check is partial)"),
     (
         "sitemap_withheld.robots_unknown",
         "robots.txt, which may declare a sitemap, could not be read",
@@ -3011,6 +3038,11 @@ const CS: &[(&str, &str)] = &[
         "Web nemá sitemapu a procházení pokrylo celý web: sada navrhuje sitemapu s jeho kanonickými indexovatelnými stránkami ({0}) v sitemap/sitemap.proposed.xml.",
     ),
     ("label.sitemap_withheld", "Sitemapa se nenavrhuje: {0}."),
+    (
+        "label.consistency_link",
+        "Konzistence faktů – možné nesoulady: {0} – viz",
+    ),
+    ("label.consistency_partial", "(kontrola je neúplná)"),
     (
         "sitemap_withheld.robots_unknown",
         "robots.txt, který může sitemapu uvádět, se nepodařilo přečíst",
@@ -4108,10 +4140,15 @@ mod tests {
         ] {
             all_keys.push(format!("sitemap_withheld.{why}"));
         }
-        all_keys.extend([
-            "label.sitemap_proposed".to_string(),
-            "label.sitemap_withheld".to_string(),
-        ]);
+        all_keys.extend(
+            [
+                "label.sitemap_proposed",
+                "label.sitemap_withheld",
+                "label.consistency_link",
+                "label.consistency_partial",
+            ]
+            .map(str::to_string),
+        );
         for language in ["en", "cs"] {
             let locale = ReportLocale::new(language);
             for key in &all_keys {
@@ -4213,6 +4250,61 @@ mod tests {
         let plain = sample("en", true);
         assert_eq!(plain.to_json()["render"]["mode"], "plain");
         assert!(plain.to_markdown(KIT_DIR).contains("without running JavaScript"));
+    }
+
+    #[test]
+    fn the_entity_clarity_card_links_the_fact_consistency_report() {
+        const FILE: &str = "ai-consistency.example.com.2026-09-27.10-00-00.000-1.html";
+        let entity_row = |out: &str, title: &str| {
+            out.lines()
+                .find(|line| line.contains(title) && line.contains('|'))
+                .map(str::to_string)
+                .unwrap_or_default()
+        };
+        for language in ["en", "cs"] {
+            let locale = ReportLocale::new(language);
+            let title = text(&locale, "cat.entity_clarity");
+            let mut doc = sample(language, true);
+            let md = doc.to_markdown(KIT_DIR);
+            let label = text(&locale, "label.consistency_link");
+            let head = label.split('{').next().unwrap_or(label).trim();
+            assert!(!md.contains(head), "{language}: no link without the consistency report");
+
+            doc.consistency = Some(ConsistencyLink {
+                file: FILE.to_string(),
+                possible_inconsistencies: 3,
+                complete: true,
+            });
+            let md = doc.to_markdown(KIT_DIR);
+            let row = entity_row(&md, title);
+            assert!(
+                row.contains(&fill(label, &["3".to_string()], 0).replace(" {file}", "")),
+                "{language}: {row}"
+            );
+            assert!(row.contains(&format!("]({FILE})")), "{language}: {row}");
+            assert!(
+                !row.contains(text(&locale, "label.consistency_partial")),
+                "{language}: {row}"
+            );
+            let html = doc.to_html(KIT_DIR);
+            assert!(html.contains(&format!("href=\"{FILE}\"")), "{language}");
+            let json = doc.to_json();
+            assert_eq!(json["consistency"]["file"], FILE);
+            assert_eq!(json["consistency"]["possibleInconsistencies"], 3);
+            assert_eq!(json["consistency"]["complete"], true);
+
+            // A partial check says so.
+            doc.consistency = Some(ConsistencyLink {
+                file: FILE.to_string(),
+                possible_inconsistencies: 0,
+                complete: false,
+            });
+            let row = entity_row(&doc.to_markdown(KIT_DIR), title);
+            assert!(
+                row.contains(text(&locale, "label.consistency_partial")),
+                "{language}: {row}"
+            );
+        }
     }
 
     #[test]
