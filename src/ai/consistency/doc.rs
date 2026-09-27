@@ -49,6 +49,8 @@ pub struct ConsistencyDoc {
     pub not_judged: Vec<NotJudgedGroup>,
     /// Facts stated with one exact value in several places.
     pub consistent: Vec<ConsistentFact>,
+    /// Every fact key the grouping made, with what became of it.
+    pub keys: Vec<KeyOut>,
     pub sources: Vec<SourceOut>,
     /// Every kept fact occurrence.
     pub occurrences: Vec<OccurrenceOut>,
@@ -75,7 +77,8 @@ pub struct Meta {
     pub pages_analyzed: usize,
     /// Selected pages without a stored HTML body.
     pub pages_missing_body: usize,
-    /// Analyzed pages whose input was reduced (blocks left out or cut).
+    /// Selected pages whose input was reduced (blocks left out or cut; all of them for a page
+    /// whose content fit no extraction request, which is then not analyzed).
     pub pages_reduced: usize,
     pub chrome_lines_analyzed: usize,
     pub chrome_lines_excluded: usize,
@@ -99,6 +102,8 @@ pub struct Meta {
     pub reviews_capped: usize,
     pub reviews_failed: usize,
     pub reviews_skipped_budget: usize,
+    /// Reviewed groups with values that no result judged, even when asked again.
+    pub reviews_partial: usize,
     pub grouping_incomplete: bool,
     pub items_not_cross_compared: usize,
     pub llm_calls: usize,
@@ -153,6 +158,8 @@ pub struct CompletenessReason {
 #[serde(rename_all = "camelCase")]
 pub struct Finding {
     pub id: String,
+    /// The fact key (`keys`) the values belong to.
+    pub key_id: usize,
     pub priority: Priority,
     pub confidence: Confidence,
     pub attribute_key: AttributeKey,
@@ -216,6 +223,7 @@ pub struct PageFinding {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExplainedGroup {
+    pub key_id: usize,
     pub key: String,
     pub attribute_key: AttributeKey,
     pub disposition: &'static str,
@@ -226,10 +234,12 @@ pub struct ExplainedGroup {
 }
 
 /// A difference that could not be judged: `insufficient_context`, or not reviewed
-/// (`not_reviewed_cap`, `not_reviewed_call_failed`, `not_reviewed_output_budget`).
+/// (`not_reviewed_cap`, `not_reviewed_call_failed`, `not_reviewed_output_budget`, and
+/// `not_reviewed_left_out` for the values of a reviewed group that no result judged).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NotJudgedGroup {
+    pub key_id: usize,
     pub key: String,
     pub attribute_key: AttributeKey,
     pub status: &'static str,
@@ -255,11 +265,28 @@ pub struct SourceOut {
     pub failed: bool,
 }
 
+/// One fact key of the grouping: the facts found to be the same property of the same subject.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyOut {
+    pub id: usize,
+    pub attribute_key: AttributeKey,
+    pub name: String,
+    /// Other names of its facts.
+    pub aliases: Vec<String>,
+    pub occurrence_ids: Vec<usize>,
+    /// `candidate` (compared: see `findings`, `explained`, `notJudged`), `consistent`, `one_place`
+    /// (all in one place: nothing to compare) or `one_uncertain_value` (see `judge::key_outcome`).
+    pub outcome: &'static str,
+}
+
 /// One kept fact occurrence with its block reference.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OccurrenceOut {
     pub id: usize,
+    /// The fact key (`keys`) it was grouped into.
+    pub key_id: Option<usize>,
     pub source: usize,
     pub region: SourceKind,
     pub block_ref: String,
@@ -381,6 +408,11 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "status_not_reviewed_output_budget",
         "Not reviewed: --ai-max-tokens is too low for a review",
         "Neposouzeno: --ai-max-tokens je na posouzení příliš nízké",
+    ),
+    (
+        "status_not_reviewed_left_out",
+        "Not reviewed: the review left these values out",
+        "Neposouzeno: posouzení tyto hodnoty vynechalo",
     ),
     (
         "show_items",
@@ -557,8 +589,8 @@ const TEXTS: &[(&str, &str, &str)] = &[
     ),
     (
         "reason_pages_reduced",
-        "{n} page was too long: some of its blocks were not inspected|{n} pages were too long: some of their blocks were not inspected",
-        "{n} stránka byla příliš dlouhá: část jejích bloků nebyla prověřena|{n} stránky byly příliš dlouhé: část jejich bloků nebyla prověřena|{n} stránek bylo příliš dlouhých: část jejich bloků nebyla prověřena",
+        "{n} page was too long: some or all of its blocks were not inspected|{n} pages were too long: some or all of their blocks were not inspected",
+        "{n} stránka byla příliš dlouhá: některé nebo všechny její bloky nebyly prověřeny|{n} stránky byly příliš dlouhé: některé nebo všechny jejich bloky nebyly prověřeny|{n} stránek bylo příliš dlouhých: některé nebo všechny jejich bloky nebyly prověřeny",
     ),
     (
         "reason_chrome_lines_excluded",
@@ -584,6 +616,11 @@ const TEXTS: &[(&str, &str, &str)] = &[
         "reason_not_reviewed_call_failed",
         "{n} difference could not be reviewed (the review call failed)|{n} differences could not be reviewed (the review call failed)",
         "{n} rozdíl se nepodařilo posoudit (dotaz selhal)|{n} rozdíly se nepodařilo posoudit (dotaz selhal)|{n} rozdílů se nepodařilo posoudit (dotaz selhal)",
+    ),
+    (
+        "reason_not_reviewed_left_out",
+        "{n} difference was reviewed only in part: the review left some of its values out|{n} differences were reviewed only in part: the review left some of their values out",
+        "{n} rozdíl byl posouzen jen zčásti: posouzení vynechalo některé jeho hodnoty|{n} rozdíly byly posouzeny jen zčásti: posouzení vynechalo některé jejich hodnoty|{n} rozdílů bylo posouzeno jen zčásti: posouzení vynechalo některé jejich hodnoty",
     ),
     (
         "reason_not_reviewed_output_budget",
@@ -729,8 +766,9 @@ pub fn summary(locale: &ReportLocale, meta: &Meta, counts: &Counts, completeness
 /// half of the `sources` failed; `Complete` when every selected source was extracted, grouping
 /// finished and every candidate was reviewed; `Partial` otherwise. The reasons, in a fixed
 /// order: too few sources with facts, failed sources, pages without HTML, reduced pages,
-/// excluded header/footer lines, incomplete grouping, and reviews capped, failed or skipped. A
-/// not-reviewed count in `counts` beyond the capped and skipped ones counts as failed.
+/// excluded header/footer lines, incomplete grouping, and reviews capped, failed, skipped or
+/// left partly undone. A not-reviewed count in `counts` beyond the capped, skipped and partly
+/// undone ones counts as failed.
 pub fn completeness(meta: &Meta, counts: &Counts, failed_sources: usize, sources: usize) -> Completeness {
     let reason = |code: &'static str, count: usize| CompletenessReason { code, count };
     let mut reasons = Vec::new();
@@ -742,7 +780,7 @@ pub fn completeness(meta: &Meta, counts: &Counts, failed_sources: usize, sources
     let failed_reviews = meta.reviews_failed.max(
         counts
             .not_reviewed
-            .saturating_sub(meta.reviews_capped + meta.reviews_skipped_budget),
+            .saturating_sub(meta.reviews_capped + meta.reviews_skipped_budget + meta.reviews_partial),
     );
     let counted = [
         ("failed_sources", failed_sources),
@@ -753,6 +791,7 @@ pub fn completeness(meta: &Meta, counts: &Counts, failed_sources: usize, sources
         ("not_reviewed_cap", meta.reviews_capped),
         ("not_reviewed_call_failed", failed_reviews),
         ("not_reviewed_output_budget", meta.reviews_skipped_budget),
+        ("not_reviewed_left_out", meta.reviews_partial),
     ];
     for (code, count) in counted {
         if count > 0 {
@@ -1219,17 +1258,27 @@ impl ConsistencyDoc {
                 md(&value.text),
                 count_text(locale, "on_pages", value.urls.len())
             ));
-            for occurrence in value.occurrences.iter().take(OCCURRENCES_SHOWN) {
-                out.push_str(&format!("  - {}\n", md(&occurrence_line(locale, occurrence))));
+            let md_occurrence = |out: &mut String, indent: &str, occurrence: &OccurrenceRef| {
+                out.push_str(&format!("{indent}- {}\n", md(&occurrence_line(locale, occurrence))));
                 if !occurrence.evidence.is_empty() {
-                    out.push_str(&format!("    > {}\n", md(&occurrence.evidence)));
+                    out.push_str(&format!("{indent}  > {}\n", md(&occurrence.evidence)));
                 }
+            };
+            for occurrence in value.occurrences.iter().take(OCCURRENCES_SHOWN) {
+                md_occurrence(out, "  ", occurrence);
             }
-            if value.occurrences.len() > OCCURRENCES_SHOWN {
+            // The rest collapsed, with their conditions and evidence too.
+            if let Some(rest) = value.occurrences.get(OCCURRENCES_SHOWN..)
+                && !rest.is_empty()
+            {
                 out.push_str(&format!(
-                    "  - {}\n",
-                    count_text(locale, "more_occurrences", value.occurrences.len() - OCCURRENCES_SHOWN)
+                    "  - <details><summary>{}</summary>\n\n",
+                    count_text(locale, "more_occurrences", rest.len())
                 ));
+                for occurrence in rest {
+                    md_occurrence(out, "    ", occurrence);
+                }
+                out.push_str("\n    </details>\n");
             }
             if !value.urls.is_empty() {
                 let shown: Vec<String> = value.urls.iter().take(URLS_SHOWN).map(|u| md_url(u)).collect();
@@ -1823,6 +1872,7 @@ mod tests {
     fn finding(key: &str, priority: Priority, confidence: Confidence, attribute_key: AttributeKey) -> Finding {
         Finding {
             id: String::new(),
+            key_id: 0,
             priority,
             confidence,
             attribute_key,
@@ -1885,6 +1935,7 @@ mod tests {
             reviews_capped: 0,
             reviews_failed: 0,
             reviews_skipped_budget: 0,
+            reviews_partial: 0,
             grouping_incomplete: false,
             items_not_cross_compared: 0,
             llm_calls: 14,
@@ -1925,6 +1976,7 @@ mod tests {
             caution: text(locale, "caution").to_string(),
             by_page: by_page(&findings),
             explained: vec![ExplainedGroup {
+                key_id: 1,
                 key: "Doprava zdarma – hranice".to_string(),
                 attribute_key: AttributeKey::FreeShippingThreshold,
                 disposition: "explainable",
@@ -1934,6 +1986,7 @@ mod tests {
                 values: vec![value("1 500 Kč", Vec::new()), value("60 €", Vec::new())],
             }],
             not_judged: vec![NotJudgedGroup {
+                key_id: 2,
                 key: "Pobočka – otevírací doba".to_string(),
                 attribute_key: AttributeKey::OpeningHours,
                 status: "insufficient_context",
@@ -1949,6 +2002,7 @@ mod tests {
                 pages: 10,
                 occurrence_ids: vec![5, 6, 7],
             }],
+            keys: Vec::new(),
             sources: Vec::new(),
             occurrences: Vec::new(),
             failed_sources: Vec::new(),
@@ -1969,6 +2023,44 @@ mod tests {
             ),
             finding("Hypotéka – RPSN", Priority::High, Confidence::Likely, AttributeKey::Apr),
         ]
+    }
+
+    #[test]
+    fn every_occurrence_keeps_its_evidence_and_conditions_in_markdown_and_html() {
+        let mut f = finding(
+            "Tarif – cena",
+            Priority::Medium,
+            Confidence::Possible,
+            AttributeKey::Price,
+        );
+        f.values[0].occurrences = (0..5)
+            .map(|i| {
+                let mut o = occurrence(
+                    i,
+                    SourceKind::Page,
+                    &format!("/p{i}"),
+                    &format!("EVIDENCE{i}: Cena 100 Kč"),
+                    &[&format!("https://example.com/p{i}")],
+                );
+                o.qualifiers = if i == 3 {
+                    "CONDITION3 special offer".to_string()
+                } else {
+                    "standard".to_string()
+                };
+                o
+            })
+            .collect();
+        let doc = sample(&en(), vec![f]);
+        let (md, html) = (doc.to_markdown(), doc.to_html());
+        for i in 0..5 {
+            assert!(md.contains(&format!("EVIDENCE{i}")), "Markdown lost occurrence {i}");
+            assert!(
+                md.contains(&format!("/p{i}")),
+                "Markdown lost the path of occurrence {i}"
+            );
+            assert!(html.contains(&format!("EVIDENCE{i}")), "HTML lost occurrence {i}");
+        }
+        assert!(md.contains("CONDITION3") && html.contains("CONDITION3"));
     }
 
     #[test]

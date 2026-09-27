@@ -196,6 +196,118 @@ pub fn extend_over_operator(text: &str, span: (usize, usize)) -> (usize, usize) 
     extended
 }
 
+/// The span of a number value in `text`, widened so that the value keeps the meaning the page
+/// gives it: over a sign joined to it (`-5 %`, `−5 %`), over the other end of a range it is one
+/// end of (`10 %` or `5` of `5–10 %` → `5–10 %`, `20 EUR` of `10 EUR – 20 EUR`), and then over an
+/// operator before it (`extend_over_operator`). A dash is a sign only when it touches the number
+/// and follows no letter or digit (`COVID-19` has no `-19`, `Sleva – 5 %` no `-5 %`); a dash
+/// between two numbers is a range unless the two ends name different units (`290 Kč – 10 GB` is
+/// no range). A span that is not a range of `text` is returned as it is.
+pub fn extend_number_span(text: &str, span: (usize, usize)) -> (usize, usize) {
+    let (Some(before), Some(value), Some(after)) = (text.get(..span.0), text.get(span.0..span.1), text.get(span.1..))
+    else {
+        return span;
+    };
+    let (mut start, mut end) = span;
+    let value_unit = unit_suffix(value).map(|(_, unit)| unit);
+
+    // Left: the lower end of a range, or a sign.
+    let left = before.trim_end_matches(char::is_whitespace);
+    if let Some(dash) = left.chars().next_back().filter(|&c| is_dash(c)) {
+        let pre = left.get(..left.len() - dash.len_utf8()).unwrap_or_default();
+        let low = pre.trim_end_matches(char::is_whitespace);
+        let (body, low_unit) = match unit_suffix(low) {
+            Some((at, unit)) => (low.get(..at).unwrap_or_default().trim_end(), Some(unit)),
+            None => (low, None),
+        };
+        let low_start = numeral_spans(body).find(|r| r.end == body.len()).map(|r| r.start);
+        match low_start {
+            Some(at) if units_agree(value_unit, low_unit) => {
+                start = at
+                    - body
+                        .get(..at)
+                        .and_then(|head| head.chars().next_back())
+                        .filter(|c| matches!(c, '€' | '$' | '£'))
+                        .map_or(0, char::len_utf8);
+            }
+            Some(_) => {}
+            None if left.len() == before.len()
+                && value.starts_with(|c: char| c.is_ascii_digit())
+                && !pre.chars().next_back().is_some_and(char::is_alphanumeric) =>
+            {
+                start = pre.len();
+            }
+            None => {}
+        }
+    }
+
+    // Right: the upper end of a range.
+    let right = after.trim_start_matches(char::is_whitespace);
+    if let Some(dash) = right.chars().next().filter(|&c| is_dash(c)) {
+        let rest = right.get(dash.len_utf8()..).unwrap_or_default().trim_start();
+        let rest = rest.strip_prefix(['€', '$', '£']).unwrap_or(rest);
+        if rest.starts_with(|c: char| c.is_ascii_digit()) {
+            let high_end = text.len() - rest.len() + scan_numeral(rest, 0);
+            let tail = text.get(high_end..).unwrap_or_default();
+            let spaced = tail.trim_start_matches(char::is_whitespace);
+            let high_unit = unit_prefix(spaced);
+            let agree = match (value_unit, high_unit) {
+                (Some(a), Some((_, b))) => a == b,
+                (Some(_), None) => false,
+                (None, _) => true,
+            };
+            if agree {
+                end = high_end + high_unit.map_or(0, |(len, _)| tail.len() - spaced.len() + len);
+            }
+        }
+    }
+    extend_over_operator(text, (start, end))
+}
+
+fn is_dash(c: char) -> bool {
+    matches!(c, '-' | '–' | '—' | '−')
+}
+
+/// The two ends of a range agree on their units unless both name one and they differ.
+fn units_agree(a: Option<&str>, b: Option<&str>) -> bool {
+    a.zip(b).is_none_or(|(a, b)| a == b)
+}
+
+/// A currency or `%` (`UNITS`) that `s` ends with, as a whole word: where it starts, and its
+/// canonical unit. The longest one wins.
+fn unit_suffix(s: &str) -> Option<(usize, &'static str)> {
+    UNITS
+        .iter()
+        .filter_map(|(word, unit)| {
+            let chars = word.chars().count();
+            let (at, _) = s.char_indices().rev().nth(chars.checked_sub(1)?)?;
+            let tail = s.get(at..)?;
+            let joined = s
+                .get(..at)
+                .and_then(|head| head.chars().next_back())
+                .is_some_and(char::is_alphabetic);
+            (tail.to_lowercase() == *word && !(word.starts_with(char::is_alphabetic) && joined))
+                .then_some((at, *unit, chars))
+        })
+        .max_by_key(|(_, _, chars)| *chars)
+        .map(|(at, unit, _)| (at, unit))
+}
+
+/// A currency or `%` (`UNITS`) that `s` starts with, as a whole word: its length in bytes, and
+/// its canonical unit.
+fn unit_prefix(s: &str) -> Option<(usize, &'static str)> {
+    UNITS.iter().find_map(|(word, unit)| {
+        let chars = word.chars().count();
+        let len = s.char_indices().nth(chars).map_or(s.len(), |(at, _)| at);
+        let head = s.get(..len)?;
+        let runs_on = s.get(len..).is_some_and(|rest| rest.starts_with(char::is_alphabetic));
+        (head.chars().count() == chars
+            && head.to_lowercase() == *word
+            && !(word.ends_with(char::is_alphabetic) && runs_on))
+            .then_some((len, *unit))
+    })
+}
+
 /// Locate a value the model quoted from a block: `value` as a whole token of `block` (see
 /// `find_token_bounded`, checked against the block's text, not the quote's edges) inside an
 /// occurrence of `quote` in `block`, both compared after `normalize_for_match`. Returns the
@@ -423,21 +535,23 @@ pub enum ValueKey {
 /// The comparison key of `value` as written, read per `hint`:
 /// - Contact: an e-mail → `mail:<lowercase>`; a phone → `tel:+<international digits>` (a national
 ///   number only with a known `site_country`, see `site_country`, else
-///   `Uncertain("tel-national:<digits>")`); a contact with neither → as Text.
+///   `Uncertain("tel-national:<digits>")`), plus `;ext=N` for an extension written after it, and
+///   unresolved with other digits beside it (see `phone_key`); a contact with neither → as Text.
 /// - Number: see `parse_number`.
 /// - Date: `date:YYYY-MM-DD` when the whole value is a date (`D. M. YYYY`, `D.M.YYYY`,
 ///   `YYYY-MM-DD`, English month names, Czech genitive month names).
 /// - Text: `text:` + the value lowercased with whitespace collapsed; digits, operators and
 ///   punctuation are kept, so `<18` ≠ `>18`.
 ///
-/// `llm_normalized` (the model's machine-readable form of the value) is a hint only: it is used
-/// when the value itself does not parse as a Number or Date, and only when its digits occur in
-/// order in the value (for a Number: are exactly the digits of one number written in the value).
-/// It never overrides the verbatim reading, and it never resolves an `Uncertain` one.
+/// A Number or Date value that does not parse as a whole (`cena 1 290 Kč`, `2026/12/31`) is
+/// `Uncertain`. `llm_normalized` (the model's machine-readable form of the value) is never used
+/// for the key: its digits prove neither the unit, nor a bound, nor the date the value states
+/// (`price: 10 EUR` is no `10 USD`, `minimum price: 10 EUR` no `10 EUR`, `2026-01-01 to
+/// 2026-12-31` no `2026-01-31`), so it can neither override nor replace the verbatim reading.
 pub fn value_key(
     hint: ValueHint,
     value: &str,
-    llm_normalized: &str,
+    _llm_normalized: &str,
     lang: &str,
     site_country: Option<&str>,
 ) -> ValueKey {
@@ -450,29 +564,8 @@ pub fn value_key(
     if let Some(key) = verbatim {
         return key;
     }
-    if hint_fits(hint, llm_normalized, value) {
-        let from_hint = match hint {
-            ValueHint::Number => parse_number(llm_normalized, "en"),
-            _ => parse_date(llm_normalized).map(date_key),
-        };
-        if let Some(key @ ValueKey::Exact(_)) = from_hint {
-            return key;
-        }
-    }
     let prefix = if hint == ValueHint::Number { "num" } else { "date" };
     ValueKey::Uncertain(format!("{prefix}?:{}", collapse_lower(value)))
-}
-
-fn hint_fits(hint: ValueHint, llm_normalized: &str, value: &str) -> bool {
-    let wanted = digit_string(llm_normalized);
-    if wanted.is_empty() {
-        return false;
-    }
-    if hint == ValueHint::Number {
-        return numerals(value).any(|token| digit_string(token) == wanted);
-    }
-    let mut have = digit_string(value).into_bytes().into_iter();
-    wanted.bytes().all(|digit| have.any(|d| d == digit))
 }
 
 fn text_key(value: &str) -> ValueKey {
@@ -503,14 +596,38 @@ fn email_key(value: &str) -> ValueKey {
     }
 }
 
+/// A phone extension right after the number (`ext. 12`, `x12`, `kl. 12`, `linka 12`, …).
+static PHONE_EXTENSION: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)^[\s,;(]*(?:ext\.?|extension|x|kl\.?|klapka|linka|l\.|#)\s*(\d{1,6})\)?").expect("extension regex")
+});
+
+/// The key of a phone number: its international digits (see `value_key`), with `;ext=N` for an
+/// extension written after it. Other digits beside the number — a second number, opening hours —
+/// leave it unresolved (`tel?:`); a label number of at most 2 digits before it (`Tel. 1:`) is
+/// not part of it.
 fn phone_key(value: &str, site_country: Option<&str>) -> ValueKey {
     let cleaned = unify_spaces(value).replace("(0)", " ");
     // The run with the most digits: "Tel. 1: +420 …" must not stop at the "1".
-    let run = PHONE_RUN
+    let Some(found) = PHONE_RUN
         .find_iter(&cleaned)
-        .map(|m| m.as_str())
-        .max_by_key(|run| digit_string(run).len())
-        .unwrap_or_default();
+        .max_by_key(|m| digit_string(m.as_str()).len())
+    else {
+        return ValueKey::Uncertain(format!("tel?:{}", collapse_lower(value)));
+    };
+    let run = found.as_str();
+    let after = cleaned.get(found.end()..).unwrap_or_default();
+    let (extension, rest) = match PHONE_EXTENSION.captures(after) {
+        Some(caps) => (
+            caps.get(1).map(|m| format!(";ext={}", m.as_str())),
+            after.get(caps.get(0).map_or(0, |m| m.end())..).unwrap_or_default(),
+        ),
+        None => (None, after),
+    };
+    let label = cleaned.get(..found.start()).unwrap_or_default();
+    if rest.contains(|c: char| c.is_ascii_digit()) || digit_string(label).len() > 2 {
+        return ValueKey::Uncertain(format!("tel?:{}", collapse_lower(value)));
+    }
+    let extension = extension.unwrap_or_default();
     let digits = digit_string(run);
     if run.starts_with('+') || digits.starts_with("00") {
         let mut digits = if run.starts_with('+') {
@@ -530,9 +647,9 @@ fn phone_key(value: &str, site_country: Option<&str>) -> ValueKey {
         {
             digits.remove(country.dial.len());
         }
-        return ValueKey::Exact(format!("tel:+{digits}"));
+        return ValueKey::Exact(format!("tel:+{digits}{extension}"));
     }
-    let national = || ValueKey::Uncertain(format!("tel-national:{digits}"));
+    let national = || ValueKey::Uncertain(format!("tel-national:{digits}{extension}"));
     let Some(country) = site_country.and_then(country_by_code) else {
         return national();
     };
@@ -542,7 +659,7 @@ fn phone_key(value: &str, site_country: Option<&str>) -> ValueKey {
     if (country.trunk.is_empty() && number.starts_with('0')) || !country.national.contains(&number.len()) {
         return national();
     }
-    ValueKey::Exact(format!("tel:+{}{number}", country.dial))
+    ValueKey::Exact(format!("tel:+{}{number}{extension}", country.dial))
 }
 
 /// Dialling rules of the countries `site_country` can return: the country calling code, the
@@ -911,20 +1028,30 @@ pub fn parse_number(value: &str, lang: &str) -> Option<ValueKey> {
 /// `parse_number`). An ambiguous number (`1.290` without a language) yields both readings;
 /// a malformed one (`25.9.2026`) yields its digit groups. Signs are not read.
 pub fn numbers_in(text: &str, lang: &str) -> Vec<f64> {
+    number_strings_in(text, lang)
+        .iter()
+        .filter_map(|number| number.parse::<f64>().ok())
+        .collect()
+}
+
+/// `numbers_in` as canonical decimal strings (`1 290,50` → `1290.5` with `cs`, `0800` → `800`):
+/// exact, so two long numbers (a phone number, an identifier) that differ in their last digits
+/// never compare equal, as they may as `f64`.
+pub fn number_strings_in(text: &str, lang: &str) -> Vec<String> {
     let decimal = decimal_separator(lang);
     let mut out = Vec::new();
     for token in numerals(text) {
         match parse_numeral(token, decimal) {
-            Numeral::Value(value) => out.extend(value.parse::<f64>().ok()),
+            Numeral::Value(value) => out.push(value),
             Numeral::Ambiguous(decimal_reading, thousands_reading) => {
-                out.extend(decimal_reading.parse::<f64>().ok());
-                out.extend(thousands_reading.parse::<f64>().ok());
+                out.push(decimal_reading);
+                out.push(thousands_reading);
             }
             Numeral::Invalid => out.extend(
                 token
                     .split(|c: char| !c.is_ascii_digit())
                     .filter(|run| !run.is_empty())
-                    .filter_map(|run| run.parse::<f64>().ok()),
+                    .map(|run| canonical(run, "")),
             ),
         }
     }
@@ -941,13 +1068,18 @@ enum Numeral {
 
 /// The numerals of `text` (digits with their thousands and decimal separators), in order.
 fn numerals(text: &str) -> impl Iterator<Item = &str> {
+    numeral_spans(text).filter_map(|span| text.get(span))
+}
+
+/// The byte ranges of the numerals of `text`, in order.
+fn numeral_spans(text: &str) -> impl Iterator<Item = Range<usize>> + '_ {
     let mut next = 0;
     text.char_indices().filter_map(move |(at, ch)| {
         if at < next || !ch.is_ascii_digit() {
             return None;
         }
         next = scan_numeral(text, at);
-        text.get(at..next)
+        Some(at..next)
     })
 }
 
@@ -1452,6 +1584,43 @@ mod tests {
     }
 
     #[test]
+    fn a_sign_and_the_other_end_of_a_range_are_part_of_a_number() {
+        let extended = |text: &str, value: &str| {
+            let start = text.rfind(value).expect("value");
+            let (a, b) = extend_number_span(text, (start, start + value.len()));
+            text[a..b].to_string()
+        };
+        // A sign joined to the number.
+        assert_eq!(extended("Annual return -5 %", "5 %"), "-5 %");
+        assert_eq!(extended("Annual return −5 %", "5 %"), "−5 %");
+        assert_eq!(extended("(-5 %)", "5 %"), "-5 %");
+        // The other end of a range, with or without spaces and units.
+        assert_eq!(extended("Interest 5–10 %", "10 %"), "5–10 %");
+        assert_eq!(extended("Interest 1 290 - 1 490 Kč", "1 490 Kč"), "1 290 - 1 490 Kč");
+        assert_eq!(extended("Price 10 EUR – 20 EUR", "20 EUR"), "10 EUR – 20 EUR");
+        assert_eq!(extended("Interest 5–10 % p.a.", "5"), "5–10 %");
+        assert_eq!(extended("Doručení 1–2 dny", "1"), "1–2");
+        // An operator before the range still belongs to it.
+        assert_eq!(extended("Úrok od 5–10 %", "10 %"), "od 5–10 %");
+        // Not a sign or a range: a dash between words, a separating dash, a hyphenated word.
+        assert_eq!(extended("Sleva – 5 %", "5 %"), "5 %");
+        assert_eq!(extended("COVID-19", "19"), "19");
+        assert_eq!(extended("Wi-Fi 6", "6"), "6");
+        assert_eq!(extended("Cena 290 Kč", "290 Kč"), "290 Kč");
+        // The extended values read with their meaning.
+        assert_eq!(
+            parse_number(&extended("Annual return -5 %", "5 %"), "en"),
+            Some(ValueKey::Exact("num:-5:%:".to_string()))
+        );
+        assert_eq!(
+            parse_number(&extended("Interest 5–10 %", "10 %"), "en"),
+            Some(ValueKey::Exact("range:5-10:%:".to_string()))
+        );
+        // An out-of-range span is returned as it is.
+        assert_eq!(extend_number_span("abc", (2, 9)), (2, 9));
+    }
+
+    #[test]
     fn a_snippet_reports_where_the_value_is() {
         let block = format!(
             "Basic 290 Kč. {} Premium 290 Kč měsíčně. {}",
@@ -1542,6 +1711,49 @@ mod tests {
             key(ValueHint::Contact, "+49 (0)30 1234567", "", None),
             key(ValueHint::Contact, "+49 30 1234567", "", None),
             "the trunk (0) after a country code is dropped"
+        );
+    }
+
+    #[test]
+    fn a_phone_extension_is_part_of_the_number() {
+        let ext12 = key(ValueHint::Contact, "+420 800 123 456 ext. 12", "en", None);
+        assert_eq!(ext12, ValueKey::Exact("tel:+420800123456;ext=12".to_string()));
+        assert_ne!(
+            ext12,
+            key(ValueHint::Contact, "+420 800 123 456 ext. 34", "en", None),
+            "another extension is another destination"
+        );
+        assert_ne!(ext12, key(ValueHint::Contact, "+420 800 123 456", "en", None));
+        for written in [
+            "+420 800 123 456, kl. 12",
+            "+420 800 123 456 (ext. 12)",
+            "+420 800 123 456 x12",
+            "+420 800 123 456 klapka 12",
+        ] {
+            assert_eq!(key(ValueHint::Contact, written, "cs", None), ext12, "{written}");
+        }
+        assert_eq!(
+            key(ValueHint::Contact, "800 123 456 linka 12", "cs", Some("CZ")),
+            ext12,
+            "a national number with its extension"
+        );
+        // Other digits after the number: another number or unknown digits — unresolved.
+        assert!(!exact(&key(
+            ValueHint::Contact,
+            "+420 800 123 456 / +420 800 123 457",
+            "cs",
+            None
+        )));
+        assert!(!exact(&key(
+            ValueHint::Contact,
+            "+420 800 123 456 nebo 800 123 457",
+            "cs",
+            None
+        )));
+        // A label number before the phone number is not part of it.
+        assert_eq!(
+            key(ValueHint::Contact, "Tel. 1: +420 800 123 456", "cs", None),
+            ValueKey::Exact("tel:+420800123456".to_string())
         );
     }
 
@@ -1716,16 +1928,21 @@ mod tests {
         );
         // An ambiguous value is not resolved by the hint either.
         assert!(!exact(&value_key(ValueHint::Number, "5,000 %", "5 %", "", None)));
-        // When the value does not parse, a hint whose digits are those of the value is used...
-        assert_eq!(
-            value_key(ValueHint::Number, "cena 1 290 Kč", "1290 CZK", "cs", None),
-            ValueKey::Exact("num:1290:CZK:".to_string())
-        );
-        assert_eq!(
-            value_key(ValueHint::Date, "2026/12/31", "2026-12-31", "", None),
-            ValueKey::Exact("date:2026-12-31".to_string())
-        );
-        // ...and one with other digits is not.
+        // A value that does not parse stays uncertain whatever the hint says: the words around the
+        // number may change its meaning, and the digits of a hint prove neither its unit nor its
+        // bound nor its date.
+        let promoted: Vec<ValueKey> = [
+            (ValueHint::Number, "cena 1 290 Kč", "1290 CZK"),
+            (ValueHint::Number, "price: 10 EUR", "10 USD"),
+            (ValueHint::Number, "minimum price: 10 EUR", "10 EUR"),
+            (ValueHint::Date, "2026/12/31", "2026-12-31"),
+            (ValueHint::Date, "2026-01-01 to 2026-12-31", "2026-01-31"),
+        ]
+        .into_iter()
+        .map(|(hint, value, normalized)| value_key(hint, value, normalized, "en", None))
+        .filter(exact)
+        .collect();
+        assert_eq!(promoted, Vec::<ValueKey>::new(), "a hint made these exact");
         assert!(!exact(&value_key(
             ValueHint::Number,
             "cena 1 290 Kč",
@@ -1806,6 +2023,19 @@ mod tests {
             "{ambiguous:?}"
         );
         assert!(numbers_in("no numbers here", "en").is_empty());
+    }
+
+    #[test]
+    fn number_strings_are_exact_and_canonical() {
+        assert_eq!(number_strings_in("1 290,50 Kč a 4,59 %", "cs"), ["1290.5", "4.59"]);
+        assert_eq!(number_strings_in("0800 a 25.9.2026", "cs"), ["800", "25", "9", "2026"]);
+        assert_eq!(number_strings_in("1.290 Kč", ""), ["1.29", "1290"]);
+        // Long numbers keep every digit.
+        assert_ne!(
+            number_strings_in("+420800123456", ""),
+            number_strings_in("+420800123499", "")
+        );
+        assert_eq!(number_strings_in("12345678901234567891", ""), ["12345678901234567891"]);
     }
 
     #[test]

@@ -47,14 +47,15 @@ use crate::result::status::Status;
 use crate::utils;
 
 use self::doc::{
-    ConsistencyDoc, Counts, ExplainedGroup, FailedSource, Finding, FindingValue, Meta, NotJudgedGroup, OccurrenceOut,
-    OccurrenceRef, SCHEMA, SourceOut,
+    ConsistencyDoc, Counts, ExplainedGroup, FailedSource, Finding, FindingValue, KeyOut, Meta, NotJudgedGroup,
+    OccurrenceOut, OccurrenceRef, SCHEMA, SourceOut,
 };
 use self::extract::{CAT_EXTRACT, build_extract_request, parse_facts, verify_facts};
 use self::judge::{
     CAT_REVIEW, Candidate, CandidateValue, ReviewResult, ValidatedResult, allocate, build_review_request, cohorts,
-    groups_message, pack_batches, parse_reviews, render_group_within, review_call_max_tokens, review_groups_per_call,
-    split_keys, validate_with_date,
+    covered_values, groups_message, key_outcome, pack_batches, parse_reviews, render_group_within,
+    review_call_max_tokens, review_groups_per_call, split_keys, uncovered_values, validate_with_date,
+    with_values_first,
 };
 use self::keys::{
     CAT_GROUP, GroupOutcome, LabelItem, build_group_request, group_key, label_items, max_items_by_output, parse_groups,
@@ -116,6 +117,103 @@ fn report_error(status: &Arc<Mutex<Status>>, msg: &str) {
     crate::events::emit_ai_issue(CONSISTENCY_FAILED, msg);
     if let Ok(st) = status.lock() {
         st.add_critical_to_summary("ai-consistency-error", msg);
+    }
+}
+
+/// The sources of the pages to extract, and the pages that have content blocks of which none fits
+/// the extraction budget (e.g. next to a very long URL): those are not sent, but reported (as
+/// reduced pages with all their blocks omitted), never silently dropped. A page without content
+/// blocks is neither.
+fn page_sources(
+    pages: &[Page],
+    pages_blocks: &[(usize, Vec<Block>)],
+    budget: usize,
+) -> (Vec<AnalysisSource>, Vec<AnalysisSource>) {
+    pages
+        .iter()
+        .zip(pages_blocks)
+        .map(|(page, (_, blocks))| page_source(page, blocks, budget))
+        .filter(|source| !source.blocks.is_empty() || source.omitted_blocks > 0)
+        .partition(|source| !source.blocks.is_empty())
+}
+
+/// The audit record of a page none of whose blocks fit the extraction budget.
+fn unfit_source_out(source: &AnalysisSource) -> SourceOut {
+    SourceOut {
+        id: source.id,
+        kind: source.kind,
+        url: source.url.clone(),
+        path: source.path.clone(),
+        blocks: source.blocks.len(),
+        omitted_blocks: source.omitted_blocks,
+        truncated_blocks: source.truncated_blocks,
+        facts: 0,
+        ungrounded: 0,
+        failed: false,
+    }
+}
+
+/// The pages analyzed (content sent and extracted) and the pages reduced (blocks left out or cut,
+/// all of them for a page over the budget) among the page sources of `outs`.
+fn page_counts(outs: &[SourceOut]) -> (usize, usize) {
+    let pages = || outs.iter().filter(|s| s.kind == SourceKind::Page && !s.failed);
+    (
+        pages().filter(|s| s.blocks > 0).count(),
+        pages()
+            .filter(|s| s.omitted_blocks > 0 || s.truncated_blocks > 0)
+            .count(),
+    )
+}
+
+/// The country whose dialling rules read the national phone numbers of `source` (see
+/// `grounding::site_country`): for a page, by its own host and language (`langs[page]`; none: the
+/// site's) — a language without a region takes the site's country only when it is the site's
+/// language (`site_lang`); for header/footer lines, the country all their pages share, else none.
+/// `host` is the crawl's host, for a page URL that does not parse.
+fn source_country(
+    source: &AnalysisSource,
+    pages: &[Page],
+    langs: &[String],
+    site_lang: &str,
+    host: &str,
+) -> Option<&'static str> {
+    let page_country = |index: usize| {
+        let page_host = pages
+            .get(index)
+            .and_then(|p| url::Url::parse(&p.url).ok())
+            .and_then(|url| url.host_str().map(str::to_string))
+            .unwrap_or_else(|| host.to_string());
+        let lang = langs
+            .get(index)
+            .map(String::as_str)
+            .filter(|lang| !lang.trim().is_empty())
+            .unwrap_or(site_lang);
+        let primary = |lang: &str| {
+            lang.trim()
+                .split(['-', '_'])
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+        };
+        site_country(&page_host, lang).or_else(|| {
+            if primary(lang) == primary(site_lang) {
+                site_country(&page_host, site_lang)
+            } else {
+                None
+            }
+        })
+    };
+    match source.kind {
+        SourceKind::Page => page_country(source.id),
+        SourceKind::Chrome => {
+            let mut countries = source
+                .blocks
+                .iter()
+                .flat_map(|b| b.pages.iter())
+                .map(|&page| page_country(page));
+            let first = countries.next()??;
+            countries.all(|c| c == Some(first)).then_some(first)
+        }
     }
 }
 
@@ -195,17 +293,11 @@ pub async fn run(options: &CoreOptions, status: &Arc<Mutex<Status>>, output: &Ar
         langs.push(lang);
     }
     // The language of the site (the first page with one, the homepage first) reads the numbers of
-    // the header/footer and of pages without a language; with the host, it names the country of
-    // national phone numbers.
+    // the header/footer and of pages without a language; each page names the country of its
+    // national phone numbers by its own host and language (`source_country`).
     let site_lang = langs.iter().find(|lang| !lang.is_empty()).cloned().unwrap_or_default();
-    let country = site_country(&host, &site_lang);
 
-    let mut sources: Vec<AnalysisSource> = pages
-        .iter()
-        .zip(&pages_blocks)
-        .map(|(page, (_, blocks))| page_source(page, blocks, budgets.extract_input_bytes))
-        .filter(|source| !source.blocks.is_empty())
-        .collect();
+    let (mut sources, unfit) = page_sources(&pages, &pages_blocks, budgets.extract_input_bytes);
     let lines = chrome_lines(&pages_blocks);
     drop(pages_blocks);
     let page_sources = sources.len();
@@ -276,6 +368,7 @@ pub async fn run(options: &CoreOptions, status: &Arc<Mutex<Status>>, output: &Ar
         let (facts, ungrounded) = match answer {
             Ok(raw) => {
                 facts_extracted += raw.len();
+                let country = source_country(source, &pages, &langs, &site_lang, &host);
                 let (kept, ungrounded) = verify_facts(raw, source, lang, country, &mut next_id);
                 let facts = kept.len();
                 occurrences.extend(kept);
@@ -305,6 +398,8 @@ pub async fn run(options: &CoreOptions, status: &Arc<Mutex<Status>>, output: &Ar
             failed: failed_sources.last().is_some_and(|f| f.id == source.id),
         });
     }
+    // Pages none of whose content fit the budget: nothing was sent, all their blocks are omitted.
+    source_outs.extend(unfit.iter().map(unfit_source_out));
     eprintln!(
         "{}",
         utils::get_color_text(
@@ -408,13 +503,7 @@ pub async fn run(options: &CoreOptions, status: &Arc<Mutex<Status>>, output: &Ar
     if per_call > 0 {
         failed_reviews = to_review.len() - reviewed;
     }
-    let pages_reduced = sources
-        .iter()
-        .zip(&source_outs)
-        .filter(|(s, out)| {
-            s.kind == SourceKind::Page && !out.failed && (s.omitted_blocks > 0 || s.truncated_blocks > 0)
-        })
-        .count();
+    let (pages_analyzed, pages_reduced) = page_counts(&source_outs);
     let chrome_lines_analyzed = sources
         .iter()
         .zip(&source_outs)
@@ -431,10 +520,7 @@ pub async fn run(options: &CoreOptions, status: &Arc<Mutex<Status>>, output: &Ar
         context_window: budget.context_tokens(),
         pages_eligible: eligible,
         pages_selected: selected,
-        pages_analyzed: source_outs
-            .iter()
-            .filter(|s| s.kind == SourceKind::Page && !s.failed)
-            .count(),
+        pages_analyzed,
         pages_missing_body: missing_body,
         pages_reduced,
         chrome_lines_analyzed,
@@ -447,13 +533,16 @@ pub async fn run(options: &CoreOptions, status: &Arc<Mutex<Status>>, output: &Ar
         keys: keys.len(),
         candidates: candidate_count,
         reviewed,
-        comparisons_done: to_review
+        comparisons_done: review_results
             .iter()
-            .zip(&review_results)
-            .filter(|(_, results)| !results.is_empty())
-            .map(|(c, _)| c.values.len().saturating_sub(1))
+            .map(|results| covered_values(results).len().saturating_sub(1))
             .sum(),
         reviews_capped: over_cap.len(),
+        reviews_partial: to_review
+            .iter()
+            .zip(&review_results)
+            .filter(|(c, results)| !uncovered_values(c, results).is_empty())
+            .count(),
         reviews_failed: failed_reviews,
         reviews_skipped_budget: if per_call == 0 { to_review.len() } else { 0 },
         grouping_incomplete,
@@ -475,6 +564,7 @@ pub async fn run(options: &CoreOptions, status: &Arc<Mutex<Status>>, output: &Ar
             not_reviewed_reason,
             over_cap: &over_cap,
             consistent,
+            keys: &keys,
             occurrences: &occurrences,
             pages: &pages,
             sources: source_outs,
@@ -849,8 +939,17 @@ async fn review_all(
         .map(|(i, c)| render_group_within(i + 1, c, occurrences, sources, pages, room))
         .collect();
     let batches = pack_batches(&rendered, budgets.review_batch_bytes, per_call);
-    let rendered = Arc::new(rendered);
-    let shared = Arc::new(groups.to_vec());
+    let context = Arc::new(ReviewContext {
+        groups: groups.to_vec(),
+        rendered,
+        occurrences: occurrences.to_vec(),
+        sources: sources.to_vec(),
+        pages: pages.to_vec(),
+        language: language.to_string(),
+        crawl_date: crawl_date.to_string(),
+        max_tokens: budgets.review_max_tokens,
+        room,
+    });
     progress::start(TASK_REVIEW, "Consistency: review", batches.len() as u64);
     let mut handles = Vec::with_capacity(batches.len());
     for range in batches {
@@ -858,15 +957,7 @@ async fn review_all(
         handles.push(tokio::spawn(progress::unit(
             TASK_REVIEW,
             subject,
-            review_batch(
-                client.clone(),
-                sem.clone(),
-                shared.clone(),
-                rendered.clone(),
-                range,
-                (language.to_string(), crawl_date.to_string()),
-                budgets.review_max_tokens,
-            ),
+            review_batch(client.clone(), sem.clone(), context.clone(), range),
         )));
     }
     let mut results: Vec<Vec<ValidatedResult>> = (0..groups.len()).map(|_| Vec::new()).collect();
@@ -881,35 +972,71 @@ async fn review_all(
     results
 }
 
+/// What every review batch shares: the groups under review with their renderings, what renders a
+/// group again (occurrences, sources, pages, the byte room of one group), the language of the
+/// prose, the crawl date and the output budget.
+struct ReviewContext {
+    groups: Vec<Candidate>,
+    rendered: Vec<String>,
+    occurrences: Vec<Occurrence>,
+    sources: Vec<AnalysisSource>,
+    pages: Vec<Page>,
+    language: String,
+    crawl_date: String,
+    max_tokens: u32,
+    room: usize,
+}
+
+/// One group of a review call: its index in the groups under review, the candidate as the call
+/// shows it, its rendering, and for each value id of that candidate (at index id − 1) the value's
+/// id in the group.
+#[derive(Clone)]
+struct Ask {
+    group: usize,
+    candidate: Candidate,
+    text: String,
+    ids: Vec<usize>,
+}
+
 /// One review batch. An answer cut at the output limit splits the batch in half and asks again
-/// for each half (at most `MAX_SPLIT_DEPTH` times); the groups a usable answer left out (live: a
-/// broken quote ended the JSON early) are asked for once more, in a call of their own. Each call
-/// asks for `review_call_max_tokens` of its groups. Returns the valid results with the index of
-/// their group in `groups`.
+/// for each half (at most `MAX_SPLIT_DEPTH` times). Once, a call asks again for what a usable
+/// answer left out: the groups it did not answer (live: a broken quote ended the JSON early), and
+/// the values of a group that none of its results judged — that group shown again with those
+/// values first. Each call asks for `review_call_max_tokens` of its groups. Returns the valid
+/// results with the index of their group in `groups`, their value ids those of the group.
 async fn review_batch(
     client: Arc<AiClient>,
     sem: Arc<Semaphore>,
-    groups: Arc<Vec<Candidate>>,
-    rendered: Arc<Vec<String>>,
+    ctx: Arc<ReviewContext>,
     range: Range<usize>,
-    (language, crawl_date): (String, String),
-    max_tokens: u32,
 ) -> Vec<(usize, ValidatedResult)> {
-    let mut out = Vec::new();
-    // The groups of a call (indexes into `groups`), its split depth, and whether it asks again
-    // for groups an answer left out.
-    let mut queue: Vec<(Vec<usize>, usize, bool)> = vec![(range.collect(), 0, false)];
-    while let Some((ids, depth, again)) = queue.pop() {
-        let batch: Vec<Candidate> = ids.iter().filter_map(|&i| groups.get(i).cloned()).collect();
-        let texts: Vec<String> = ids.iter().filter_map(|&i| rendered.get(i).cloned()).collect();
-        if ids.is_empty() || batch.len() != ids.len() || texts.len() != ids.len() {
+    let (groups, rendered) = (&ctx.groups, &ctx.rendered);
+    let mut out: Vec<(usize, ValidatedResult)> = Vec::new();
+    let asks: Vec<Ask> = range
+        .filter_map(|i| {
+            let candidate = groups.get(i)?.clone();
+            let ids = (1..=candidate.values.len()).collect();
+            Some(Ask {
+                group: i,
+                candidate,
+                text: rendered.get(i)?.clone(),
+                ids,
+            })
+        })
+        .collect();
+    // The groups of a call, its split depth, and whether it asks again for what an answer left out.
+    let mut queue: Vec<(Vec<Ask>, usize, bool)> = vec![(asks, 0, false)];
+    while let Some((asks, depth, again)) = queue.pop() {
+        if asks.is_empty() {
             continue;
         }
+        let batch: Vec<Candidate> = asks.iter().map(|a| a.candidate.clone()).collect();
+        let texts: Vec<String> = asks.iter().map(|a| a.text.clone()).collect();
         let req = build_review_request(
             &groups_message(&texts),
-            &language,
-            &crawl_date,
-            review_call_max_tokens(ids.len(), max_tokens),
+            &ctx.language,
+            &ctx.crawl_date,
+            review_call_max_tokens(asks.len(), ctx.max_tokens),
         );
         let answer = {
             let _permit = sem.clone().acquire_owned().await.ok();
@@ -919,28 +1046,64 @@ async fn review_batch(
         };
         match answer {
             Ok((results, _)) => {
-                let mut answered = vec![false; ids.len()];
                 for result in results {
-                    if let Some(valid) = validate_with_date(result, &batch, &texts, &crawl_date) {
-                        answered[valid.0] = true;
-                        out.push((ids[valid.0], valid));
+                    if let Some(mut valid) = validate_with_date(result, &batch, &texts, &ctx.crawl_date) {
+                        let ask = &asks[valid.0];
+                        valid.4.values = valid
+                            .4
+                            .values
+                            .iter()
+                            .filter_map(|&id| ask.ids.get(id - 1).copied())
+                            .collect();
+                        out.push((ask.group, valid));
                     }
                 }
-                let left_out: Vec<usize> = ids
-                    .iter()
-                    .zip(&answered)
-                    .filter(|(_, answered)| !**answered)
-                    .map(|(&id, _)| id)
-                    .collect();
-                // Asking for all of them again would repeat the same (cached) request.
-                if !again && !left_out.is_empty() && left_out.len() < ids.len() {
+                if again {
+                    continue;
+                }
+                // What the answers so far left out: whole groups, and values of answered groups.
+                let (mut left_out, mut partly) = (Vec::new(), false);
+                for ask in &asks {
+                    let results: Vec<ValidatedResult> = out
+                        .iter()
+                        .filter(|(group, _)| *group == ask.group)
+                        .map(|(_, result)| result.clone())
+                        .collect();
+                    let group = &groups[ask.group];
+                    if results.is_empty() {
+                        left_out.push(ask.clone());
+                        continue;
+                    }
+                    let missing = uncovered_values(group, &results);
+                    if !missing.is_empty() {
+                        let (candidate, ids) = with_values_first(group, &missing);
+                        let text = render_group_within(
+                            ask.group + 1,
+                            &candidate,
+                            &ctx.occurrences,
+                            &ctx.sources,
+                            &ctx.pages,
+                            ctx.room,
+                        );
+                        left_out.push(Ask {
+                            group: ask.group,
+                            candidate,
+                            text,
+                            ids,
+                        });
+                        partly = true;
+                    }
+                }
+                // Asking for all of the same groups again would repeat the same (cached) request.
+                if partly || (!left_out.is_empty() && left_out.len() < asks.len()) {
                     queue.push((left_out, depth, true));
                 }
             }
-            Err(error) if ids.len() > 1 && depth < MAX_SPLIT_DEPTH && error.to_string().contains(TRUNCATED) => {
-                let (first, second) = ids.split_at(ids.len() / 2);
-                queue.push((second.to_vec(), depth + 1, again));
-                queue.push((first.to_vec(), depth + 1, again));
+            Err(error) if asks.len() > 1 && depth < MAX_SPLIT_DEPTH && error.to_string().contains(TRUNCATED) => {
+                let mut first = asks;
+                let second = first.split_off(first.len() / 2);
+                queue.push((second, depth + 1, again));
+                queue.push((first, depth + 1, again));
             }
             Err(_) => {}
         }
@@ -965,6 +1128,7 @@ struct Assembly<'a> {
     not_reviewed_reason: &'static str,
     over_cap: &'a [Candidate],
     consistent: Vec<model::ConsistentFact>,
+    keys: &'a [model::FactKey],
     occurrences: &'a [Occurrence],
     pages: &'a [Page],
     sources: Vec<SourceOut>,
@@ -995,6 +1159,7 @@ fn assemble(locale: &ReportLocale, meta: Meta, a: Assembly) -> ConsistencyDoc {
         if results.is_empty() {
             counts.not_reviewed += 1;
             not_judged.push(NotJudgedGroup {
+                key_id: candidate.key_id,
                 key: candidate.name.clone(),
                 attribute_key: candidate.attribute_key,
                 status: a.not_reviewed_reason,
@@ -1046,6 +1211,7 @@ fn assemble(locale: &ReportLocale, meta: Meta, a: Assembly) -> ConsistencyDoc {
                     }
                     findings.push(Finding {
                         id: String::new(),
+                        key_id: candidate.key_id,
                         priority,
                         confidence: *confidence,
                         attribute_key: candidate.attribute_key,
@@ -1066,6 +1232,7 @@ fn assemble(locale: &ReportLocale, meta: Meta, a: Assembly) -> ConsistencyDoc {
                         counts.explained += 1;
                     }
                     explained.push(ExplainedGroup {
+                        key_id: candidate.key_id,
                         key: candidate.name.clone(),
                         attribute_key: candidate.attribute_key,
                         disposition: if not_comparable {
@@ -1082,6 +1249,7 @@ fn assemble(locale: &ReportLocale, meta: Meta, a: Assembly) -> ConsistencyDoc {
                 _ => {
                     counts.insufficient += 1;
                     not_judged.push(NotJudgedGroup {
+                        key_id: candidate.key_id,
                         key: candidate.name.clone(),
                         attribute_key: candidate.attribute_key,
                         status: "insufficient_context",
@@ -1091,10 +1259,24 @@ fn assemble(locale: &ReportLocale, meta: Meta, a: Assembly) -> ConsistencyDoc {
                 }
             }
         }
+        // Values no result judged, even when asked again.
+        let left_out = uncovered_values(candidate, results);
+        if !left_out.is_empty() {
+            counts.not_reviewed += 1;
+            not_judged.push(NotJudgedGroup {
+                key_id: candidate.key_id,
+                key: candidate.name.clone(),
+                attribute_key: candidate.attribute_key,
+                status: "not_reviewed_left_out",
+                reason: String::new(),
+                values: values_of(candidate, &left_out),
+            });
+        }
     }
     for candidate in a.over_cap {
         counts.not_reviewed += 1;
         not_judged.push(NotJudgedGroup {
+            key_id: candidate.key_id,
             key: candidate.name.clone(),
             attribute_key: candidate.attribute_key,
             status: "not_reviewed_cap",
@@ -1107,6 +1289,23 @@ fn assemble(locale: &ReportLocale, meta: Meta, a: Assembly) -> ConsistencyDoc {
         finding.id = format!("F{}", i + 1);
     }
     let completeness = doc::completeness(&meta, &counts, a.failed_sources.len(), meta.sources);
+    let key_of: HashMap<usize, usize> = a
+        .keys
+        .iter()
+        .flat_map(|k| k.occurrence_ids.iter().map(move |&o| (o, k.id)))
+        .collect();
+    let keys = a
+        .keys
+        .iter()
+        .map(|k| KeyOut {
+            id: k.id,
+            attribute_key: k.attribute_key,
+            name: k.name.clone(),
+            aliases: k.aliases.clone(),
+            occurrence_ids: k.occurrence_ids.clone(),
+            outcome: key_outcome(k, a.occurrences),
+        })
+        .collect();
     let occurrences = a
         .occurrences
         .iter()
@@ -1117,6 +1316,7 @@ fn assemble(locale: &ReportLocale, meta: Meta, a: Assembly) -> ConsistencyDoc {
             };
             OccurrenceOut {
                 id: o.id,
+                key_id: key_of.get(&o.id).copied(),
                 source: o.source,
                 region: o.region,
                 block_ref: o.block_ref.clone(),
@@ -1146,6 +1346,7 @@ fn assemble(locale: &ReportLocale, meta: Meta, a: Assembly) -> ConsistencyDoc {
         explained,
         not_judged,
         consistent: a.consistent,
+        keys,
         sources: a.sources,
         occurrences,
         failed_sources: a.failed_sources,
@@ -1378,6 +1579,7 @@ mod tests {
                     not_reviewed_reason: "not_reviewed_call_failed",
                     over_cap: &[],
                     consistent: Vec::new(),
+                    keys: &[],
                     occurrences: &occurrences,
                     pages: &pages,
                     sources: Vec::new(),
@@ -1648,5 +1850,232 @@ mod tests {
                 assert!(message.len() <= b.review_batch_bytes, "ctx {ctx}: {}", message.len());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod review_budget_tests {
+    use super::judge::{Candidate, CandidateValue, Origin, groups_message, render_group_within};
+    use super::model::{AnalysisSource, AttributeKey, Occurrence, Page, SourceKind};
+    use crate::ai::grounding::ValueKey;
+    use crate::ai::profile::budget::ContextBudget;
+
+    /// Six values, each stated once on its own page with the path `path(i)`, `field` for every
+    /// crawler text of the occurrence, and the value text `value(i)`.
+    fn case(
+        path: impl Fn(usize) -> String,
+        field: &str,
+        value: impl Fn(usize) -> String,
+    ) -> (Candidate, Vec<Occurrence>, Vec<AnalysisSource>, Vec<Page>) {
+        let pages: Vec<Page> = (0..6)
+            .map(|i| Page {
+                index: i,
+                url: format!("https://example.com{}", path(i)),
+                path: path(i),
+                title: String::new(),
+            })
+            .collect();
+        let sources: Vec<AnalysisSource> = pages
+            .iter()
+            .map(|p| AnalysisSource {
+                id: p.index,
+                kind: SourceKind::Page,
+                url: p.url.clone(),
+                path: p.path.clone(),
+                blocks: Vec::new(),
+                omitted_blocks: 0,
+                truncated_blocks: 0,
+            })
+            .collect();
+        let occ: Vec<Occurrence> = (0..6)
+            .map(|i| Occurrence {
+                id: i,
+                source: i,
+                region: SourceKind::Page,
+                block_ref: "B1".to_string(),
+                attribute_key: AttributeKey::Price,
+                subject: field.to_string(),
+                attribute: field.to_string(),
+                value: value(i),
+                value_key: ValueKey::Exact(format!("num:{i}")),
+                qualifiers: field.to_string(),
+                evidence: format!("{field} {} {field}", value(i)),
+                value_span: (field.len() + 1, field.len() + 1 + value(i).len()),
+                heading_path: vec![field.to_string(), field.to_string()],
+                pages: vec![i],
+            })
+            .collect();
+        let values = (0..6)
+            .map(|i| CandidateValue {
+                id: i + 1,
+                key: ValueKey::Exact(format!("num:{i}")),
+                text: value(i),
+                occurrence_ids: vec![i],
+                source_ids: vec![i],
+                origins: vec![Origin::Page(i)],
+                pages: vec![i],
+                qualified: true,
+            })
+            .collect();
+        let candidate = Candidate {
+            key_id: 0,
+            name: field.to_string(),
+            attribute_key: AttributeKey::Price,
+            values,
+            baseline: None,
+        };
+        (candidate, occ, sources, pages)
+    }
+
+    fn room(ctx: i64) -> usize {
+        ContextBudget::new(ctx, 2_000).scaled(40, 6) - groups_message(&[]).len() - 1
+    }
+
+    #[test]
+    fn long_page_paths_do_not_push_a_group_over_the_review_budget() {
+        // Review: six prices on paths of 1,760 characters at an 8K context sent 9,728 bytes for a
+        // 6,144-byte budget, and without any evidence.
+        let (candidate, occ, sources, pages) = case(
+            |i| format!("/section-{}-{i}", "abcdefghijklmnpqrstuvwxyz".repeat(70)),
+            "Tariff Mini: regular monthly price",
+            |i| format!("{} EUR", 100 * (i + 1)),
+        );
+        let room = room(8_192);
+        let group = render_group_within(1, &candidate, &occ, &sources, &pages, room);
+        assert!(group.len() <= room, "{} > {room}", group.len());
+        assert_eq!(group.matches("<evidence>").count(), 6, "the evidence is kept");
+    }
+
+    #[test]
+    fn the_leanest_group_fits_the_smallest_review_budget() {
+        // Every text as long as it can be and escaping to 4 bytes per character.
+        let hostile = "<".repeat(2_000);
+        let (candidate, occ, sources, pages) = case(
+            |i| format!("/{}{i}", "<".repeat(3_000)),
+            &hostile,
+            |i| format!("{hostile}{i}"),
+        );
+        for ctx in [8_192, 16_000, 32_000] {
+            let room = room(ctx);
+            let group = render_group_within(1, &candidate, &occ, &sources, &pages, room);
+            assert!(group.len() <= room, "ctx {ctx}: {} > {room}", group.len());
+            assert_eq!(group.matches("<value id=").count(), 6, "every value is shown");
+        }
+    }
+}
+
+#[cfg(test)]
+mod country_tests {
+    use super::model::{AnalysisSource, Page, SourceBlock, SourceKind};
+    use super::source_country;
+
+    fn page(index: usize, url: &str) -> Page {
+        Page {
+            index,
+            url: url.to_string(),
+            path: "/".to_string(),
+            title: String::new(),
+        }
+    }
+
+    fn source(kind: SourceKind, id: usize, pages: &[usize]) -> AnalysisSource {
+        AnalysisSource {
+            id,
+            kind,
+            url: String::new(),
+            path: String::new(),
+            blocks: vec![SourceBlock {
+                ref_id: "L1".to_string(),
+                text: "020 7946 0123".to_string(),
+                heading_path: Vec::new(),
+                pages: pages.to_vec(),
+            }],
+            omitted_blocks: 0,
+            truncated_blocks: 0,
+        }
+    }
+
+    #[test]
+    fn each_page_reads_national_numbers_by_its_own_country() {
+        let pages = vec![
+            page(0, "https://example.com/"),
+            page(1, "https://example.com/uk"),
+            page(2, "https://example.com/de"),
+            page(3, "https://example.com/de/kontakt"),
+            page(4, "https://example.com/en"),
+            page(5, "https://example.com/x"),
+            page(6, "https://example.cz/"),
+        ];
+        let langs: Vec<String> = ["de-DE", "en-GB", "de-DE", "de", "en", "", "en-GB"]
+            .map(str::to_string)
+            .to_vec();
+        let country = |kind: SourceKind, id: usize, on: &[usize]| {
+            source_country(&source(kind, id, on), &pages, &langs, "de-DE", "example.com")
+        };
+        assert_eq!(country(SourceKind::Page, 0, &[0]), Some("DE"));
+        assert_eq!(country(SourceKind::Page, 1, &[1]), Some("GB"), "the page's own region");
+        assert_eq!(country(SourceKind::Page, 3, &[3]), Some("DE"), "the site's language");
+        assert_eq!(country(SourceKind::Page, 4, &[4]), None, "another language, no region");
+        assert_eq!(
+            country(SourceKind::Page, 5, &[5]),
+            Some("DE"),
+            "no language: the site's"
+        );
+        assert_eq!(country(SourceKind::Page, 6, &[6]), Some("CZ"), "the page's own TLD");
+        // Header/footer lines: the country all their pages share, else none.
+        assert_eq!(country(SourceKind::Chrome, 9, &[0, 2, 3]), Some("DE"));
+        assert_eq!(country(SourceKind::Chrome, 9, &[0, 1, 2]), None);
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::model::{Page, SourceKind};
+    use super::{page_counts, page_sources, unfit_source_out};
+    use crate::ai::blocks::blocks_from_html;
+
+    #[test]
+    fn a_page_whose_content_fits_no_budget_is_reported_not_dropped() {
+        let pages = vec![
+            Page {
+                index: 0,
+                url: "https://example.com/".to_string(),
+                path: "/".to_string(),
+                title: "Service".to_string(),
+            },
+            Page {
+                index: 1,
+                url: format!("https://example.com/?q={}", "x".repeat(4_000)),
+                path: "/?q=…".to_string(),
+                title: "Service".to_string(),
+            },
+            Page {
+                index: 2,
+                url: "https://example.com/empty".to_string(),
+                path: "/empty".to_string(),
+                title: String::new(),
+            },
+        ];
+        let html = "<main><h1>Service</h1><p>Company ID 12345678</p></main>";
+        let pages_blocks = vec![
+            (0, blocks_from_html(html)),
+            (1, blocks_from_html(html)),
+            (2, blocks_from_html("<main></main>")),
+        ];
+        let (sources, unfit) = page_sources(&pages, &pages_blocks, 3_072);
+        assert_eq!(sources.iter().map(|s| s.id).collect::<Vec<_>>(), [0]);
+        assert_eq!(
+            unfit.iter().map(|s| s.id).collect::<Vec<_>>(),
+            [1],
+            "not the empty page"
+        );
+        assert_eq!(unfit[0].omitted_blocks, 2);
+
+        let mut outs: Vec<_> = Vec::new();
+        outs.extend(unfit.iter().map(unfit_source_out));
+        assert_eq!(outs[0].kind, SourceKind::Page);
+        assert_eq!((outs[0].blocks, outs[0].omitted_blocks, outs[0].failed), (0, 2, false));
+        // Analyzed: pages with content sent; reduced: pages with blocks not inspected.
+        assert_eq!(page_counts(&outs), (0, 1));
     }
 }

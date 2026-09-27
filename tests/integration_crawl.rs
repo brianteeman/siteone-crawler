@@ -6632,6 +6632,247 @@ fn ai_consistency_review_asks_again_for_the_groups_an_answer_left_out() {
     assert_eq!(json["counts"]["notReviewed"], 0);
 }
 
+/// Four pages with the monthly price of one tariff: an introductory 10 EUR (on two pages), a
+/// regular 20 EUR and a regular 30 EUR. The first review answer judges only values 1 and 2 (10 and
+/// 20 EUR); the call asked again for the value it left out (rendered first, as value 1) answers
+/// with `reask` (value ids of that call). Returns the review requests and the JSON report.
+fn consistency_left_out_value_case(name: &str, reask: [usize; 2]) -> (Vec<String>, serde_json::Value) {
+    let tmp = TempDir::new(name);
+    let site = tmp.path.join("site");
+    std::fs::create_dir_all(&site).expect("the site dir");
+    let page = |h1: &str, price: &str, condition: &str, link: &str| {
+        format!(
+            "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>{h1}</title></head><body><main>\
+             <h1>{h1}</h1><p>Tariff Mini: {price} per month, {condition}.</p>{link}</main></body></html>"
+        )
+    };
+    let links = "<p><a href=\"/b\">B</a> <a href=\"/c\">C</a> <a href=\"/d\">D</a></p>";
+    std::fs::write(site.join("index.html"), page("Alpha", "10 EUR", "introductory", links)).expect("index");
+    std::fs::write(site.join("b.html"), page("Beta", "20 EUR", "regular", "")).expect("b");
+    std::fs::write(site.join("c.html"), page("Gamma", "30 EUR", "regular", "")).expect("c");
+    std::fs::write(site.join("d.html"), page("Delta", "10 EUR", "introductory", "")).expect("d");
+    let server = LocalServer::start(&site);
+    let route = |envelope: &'static str, marker: Option<&'static str>, content: serde_json::Value| MockRoute {
+        envelope,
+        marker,
+        response: chat_response(200, chat_answer(&content.to_string())),
+    };
+    let facts = |price: &str, condition: &str| {
+        serde_json::json!({"facts": [
+            {"block": "B2", "attribute_key": "price", "subject": "Tariff Mini", "attribute": "monthly price",
+             "value": price, "qualifiers": condition, "quote": format!("Tariff Mini: {price} per month"),
+             "normalized": ""},
+        ]})
+    };
+    let review = |values: [usize; 2], confidence: &str, priority: &str| {
+        serde_json::json!({"results": [{
+            "group": 1, "values": values, "confidence": confidence, "priority": priority,
+            "title": "Monthly prices differ", "explanation": "The monthly prices differ.",
+            "benign_explanations": [], "check": "Verify the current monthly price."
+        }]})
+    };
+    let mock = MockLlm::start_routed(
+        vec![
+            route(
+                "<page_data>",
+                Some("<title>Alpha</title>"),
+                facts("10 EUR", "introductory"),
+            ),
+            route("<page_data>", Some("<title>Beta</title>"), facts("20 EUR", "regular")),
+            route("<page_data>", Some("<title>Gamma</title>"), facts("30 EUR", "regular")),
+            route(
+                "<page_data>",
+                Some("<title>Delta</title>"),
+                facts("10 EUR", "introductory"),
+            ),
+            // Asked again: the value left out comes first.
+            route(
+                "<groups>",
+                Some("<value id=\"1\">\n<text>30 EUR</text>"),
+                review(reask, "possibly_inconsistent", "medium"),
+            ),
+            route("<groups>", None, review([1, 2], "explainable", "none")),
+        ],
+        Vec::new(),
+    );
+    let report_dir = tmp.path.join("reports");
+    let output = run_crawler(&[
+        "--config-file=/dev/null",
+        &format!("--url={}", server.url()),
+        LOCAL_ANALYZERS,
+        "--http-cache-dir=",
+        "--no-color",
+        "--ai-provider=openai-compatible",
+        &format!("--ai-endpoint={}", mock.url()),
+        "--ai-model=m",
+        "--ai-cache-dir=",
+        "--ai-api-key=sk-test",
+        "--ai-consistency",
+        &format!("--ai-report-dir={}", report_dir.display()),
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    let reviews: Vec<String> = mock
+        .request_bodies()
+        .iter()
+        .filter(|body| body.contains("<groups>"))
+        .map(|body| {
+            let request: serde_json::Value = serde_json::from_str(body).expect("a JSON request");
+            request["messages"][1]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    let json_path = std::fs::read_dir(&report_dir)
+        .expect("the report dir")
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .find(|path| path.extension().is_some_and(|e| e == "json"))
+        .expect("the JSON report");
+    let json = serde_json::from_str(&std::fs::read_to_string(json_path).expect("the report")).expect("JSON");
+    (reviews, json)
+}
+
+fn value_texts(group: &serde_json::Value) -> Vec<String> {
+    let mut texts: Vec<String> = group["values"]
+        .as_array()
+        .expect("values")
+        .iter()
+        .map(|v| v["text"].as_str().unwrap_or_default().to_string())
+        .collect();
+    texts.sort();
+    texts
+}
+
+#[test]
+fn ai_consistency_review_asks_again_for_values_an_answer_left_out() {
+    // The call asked again judges the value left out (30 EUR, its value 1) against 20 EUR (3).
+    let (reviews, json) = consistency_left_out_value_case("ai-consistency-left-out-value", [1, 3]);
+    assert_eq!(reviews.len(), 2, "the batch, and one call for the value it left out");
+    assert!(
+        reviews[0].contains("<value id=\"3\">\n<text>30 EUR</text>"),
+        "{}",
+        reviews[0]
+    );
+    assert!(
+        reviews[1].contains("<value id=\"1\">\n<text>30 EUR</text>"),
+        "{}",
+        reviews[1]
+    );
+    assert_eq!(value_texts(&json["explained"][0]), ["10 EUR", "20 EUR"], "{json}");
+    assert_eq!(value_texts(&json["findings"][0]), ["20 EUR", "30 EUR"], "{json}");
+    assert_eq!(json["notJudged"].as_array().map(Vec::len), Some(0), "{json}");
+    assert_eq!(json["meta"]["comparisonsDone"], 2);
+    assert_eq!(json["completeness"]["state"], "complete", "{}", json["completeness"]);
+}
+
+#[test]
+fn ai_consistency_reports_a_value_the_review_left_out_twice() {
+    // Asked again, the review still judges only 10 and 20 EUR (its values 2 and 3).
+    let (reviews, json) = consistency_left_out_value_case("ai-consistency-left-out-twice", [2, 3]);
+    assert_eq!(reviews.len(), 2, "asked again once");
+    let not_judged = json["notJudged"].as_array().expect("notJudged");
+    assert_eq!(not_judged.len(), 1, "{json}");
+    assert_eq!(not_judged[0]["status"], "not_reviewed_left_out");
+    assert_eq!(value_texts(&not_judged[0]), ["30 EUR"]);
+    assert_eq!(json["meta"]["comparisonsDone"], 1, "only 10 against 20 EUR was judged");
+    assert_eq!(json["meta"]["reviewsPartial"], 1);
+    assert_eq!(json["completeness"]["state"], "partial", "{}", json["completeness"]);
+    assert_eq!(json["completeness"]["reasons"][0]["code"], "not_reviewed_left_out");
+    assert_eq!(json["counts"]["notReviewed"], 1);
+}
+
+#[test]
+fn ai_consistency_json_keeps_every_grouping_decision() {
+    // Three pages with two prices each; the grouping merges the two labels of the first page.
+    let tmp = TempDir::new("ai-consistency-keys");
+    let site = tmp.path.join("site");
+    std::fs::create_dir_all(&site).expect("the site dir");
+    let page = |h1: &str, link: &str| {
+        format!(
+            "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>{h1}</title></head><body><main>\
+             <h1>{h1}</h1><p>Price 100 CZK</p><p>Price 200 CZK</p>{link}</main></body></html>"
+        )
+    };
+    let links = "<p><a href=\"/b\">B</a> <a href=\"/c\">C</a></p>";
+    std::fs::write(site.join("index.html"), page("Alpha", links)).expect("index");
+    std::fs::write(site.join("b.html"), page("Beta", "")).expect("b");
+    std::fs::write(site.join("c.html"), page("Gamma", "")).expect("c");
+    let server = LocalServer::start(&site);
+    let route = |envelope: &'static str, marker: Option<&'static str>, content: serde_json::Value| MockRoute {
+        envelope,
+        marker,
+        response: chat_response(200, chat_answer(&content.to_string())),
+    };
+    let facts = |subject: &str| {
+        serde_json::json!({"facts": [
+            {"block": "B2", "attribute_key": "price", "subject": format!("{subject} first"), "attribute": "price",
+             "value": "100 CZK", "qualifiers": "", "quote": "Price 100 CZK", "normalized": ""},
+            {"block": "B3", "attribute_key": "price", "subject": format!("{subject} second"), "attribute": "price",
+             "value": "200 CZK", "qualifiers": "", "quote": "Price 200 CZK", "normalized": ""},
+        ]})
+    };
+    let mock = MockLlm::start_routed(
+        vec![
+            route("<page_data>", Some("<title>Alpha</title>"), facts("Alpha")),
+            route("<page_data>", Some("<title>Beta</title>"), facts("Beta")),
+            route("<page_data>", Some("<title>Gamma</title>"), facts("Gamma")),
+            route(
+                "<labels>",
+                None,
+                serde_json::json!({"groups": [{"ids": [1, 2], "name": "HIDDEN_ALPHA_MERGE"}]}),
+            ),
+        ],
+        Vec::new(),
+    );
+    let report_dir = tmp.path.join("reports");
+    let output = run_crawler(&[
+        "--config-file=/dev/null",
+        &format!("--url={}", server.url()),
+        LOCAL_ANALYZERS,
+        "--http-cache-dir=",
+        "--no-color",
+        "--ai-provider=openai-compatible",
+        &format!("--ai-endpoint={}", mock.url()),
+        "--ai-model=m",
+        "--ai-cache-dir=",
+        "--ai-api-key=sk-test",
+        "--ai-consistency",
+        &format!("--ai-report-dir={}", report_dir.display()),
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
+    let json_path = std::fs::read_dir(&report_dir)
+        .expect("the report dir")
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .find(|path| path.extension().is_some_and(|e| e == "json"))
+        .expect("the JSON report");
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(json_path).expect("the report")).expect("JSON");
+    let keys = json["keys"].as_array().unwrap_or_else(|| panic!("no keys in {json}"));
+    assert_eq!(keys.len(), json["meta"]["keys"].as_u64().unwrap_or_default() as usize);
+    assert_eq!(keys.len(), 5, "one merged key and four single ones: {json}");
+    let merged = keys
+        .iter()
+        .find(|k| k["name"] == "HIDDEN_ALPHA_MERGE")
+        .unwrap_or_else(|| panic!("the grouping decision is in the JSON: {json}"));
+    assert_eq!(merged["occurrenceIds"].as_array().map(Vec::len), Some(2));
+    assert_eq!(merged["outcome"], "one_place", "both values are on one page");
+    assert!(merged["aliases"].is_array());
+    assert!(keys.iter().all(|k| k["outcome"] == "one_place"), "{json}");
+    // Every occurrence names its key.
+    for occurrence in json["occurrences"].as_array().expect("occurrences") {
+        let key = occurrence["keyId"].as_u64().expect("keyId") as usize;
+        assert!(
+            keys[key]["occurrenceIds"]
+                .as_array()
+                .expect("ids")
+                .contains(&occurrence["id"]),
+            "{occurrence}"
+        );
+    }
+}
+
 // --- The evaluation corpus of `--ai-consistency` (tests/fixtures/consistency/expected.json) ---
 
 fn consistency_corpus_dir() -> std::path::PathBuf {

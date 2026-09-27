@@ -10,14 +10,14 @@
 // replaces prose that mentions a number absent from the group (or a word the report never uses).
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Range;
 
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::Value;
 
-use crate::ai::grounding::{ValueKey, find_token_bounded, numbers_in, snippet_of};
+use crate::ai::grounding::{ValueKey, find_token_bounded, number_strings_in, snippet_of};
 use crate::ai::normalize::json_list;
 use crate::ai::prompt::sanitize_for_prompt;
 use crate::ai::provider::{ChatMessage, ChatRequest};
@@ -219,38 +219,7 @@ pub fn split_keys(keys: &[FactKey], occ: &[Occurrence]) -> (Vec<Candidate>, Vec<
     let mut candidates = Vec::new();
     let mut consistent = Vec::new();
     for key in keys {
-        let mut members: Vec<&Occurrence> = key
-            .occurrence_ids
-            .iter()
-            .filter_map(|id| by_id.get(id).copied())
-            .collect();
-        members.sort_by_key(|o| o.id);
-        members.dedup_by_key(|o| o.id);
-        let mut buckets: Vec<(ValueKey, Vec<&Occurrence>)> = Vec::new();
-        let mut index: HashMap<&ValueKey, usize> = HashMap::new();
-        for o in &members {
-            match index.get(&o.value_key) {
-                Some(&at) => buckets[at].1.push(o),
-                None => {
-                    index.insert(&o.value_key, buckets.len());
-                    buckets.push((o.value_key.clone(), vec![o]));
-                }
-            }
-        }
-        let mut values: Vec<CandidateValue> = buckets
-            .into_iter()
-            .map(|(key, list)| candidate_value(key, &list))
-            .collect();
-        values.sort_by(|a, b| {
-            b.pages
-                .len()
-                .cmp(&a.pages.len())
-                .then_with(|| a.occurrence_ids.first().cmp(&b.occurrence_ids.first()))
-        });
-        for (i, value) in values.iter_mut().enumerate() {
-            value.id = i + 1;
-        }
-        let places = values.iter().flat_map(|v| &v.origins).collect::<BTreeSet<_>>().len();
+        let (values, places) = key_values(key, &by_id);
         if values.len() >= 2 && places >= 2 {
             candidates.push(Candidate {
                 key_id: key.id,
@@ -275,6 +244,59 @@ pub fn split_keys(keys: &[FactKey], occ: &[Occurrence]) -> (Vec<Candidate>, Vec<
         }
     }
     (candidates, consistent)
+}
+
+/// What `split_keys` makes of a key, for the audit trail: `candidate` (compared; its review
+/// result is a finding, an explained or a not-judged group), `consistent`, `one_place` (all its
+/// occurrences in one place: nothing to compare) or `one_uncertain_value` (one value the crawler
+/// could not pin down, in several places: never taken as consistent).
+pub fn key_outcome(key: &FactKey, occ: &[Occurrence]) -> &'static str {
+    let by_id: HashMap<usize, &Occurrence> = occ.iter().map(|o| (o.id, o)).collect();
+    let (values, places) = key_values(key, &by_id);
+    match (values.as_slice(), places) {
+        (_, 0 | 1) => "one_place",
+        ([_, _, ..], _) => "candidate",
+        ([single], _) if matches!(single.key, ValueKey::Exact(_)) => "consistent",
+        _ => "one_uncertain_value",
+    }
+}
+
+/// The distinct values of a key's occurrences (by comparison key; the most widespread first,
+/// numbered `1…`) and the number of places stating them.
+fn key_values(key: &FactKey, by_id: &HashMap<usize, &Occurrence>) -> (Vec<CandidateValue>, usize) {
+    let mut members: Vec<&Occurrence> = key
+        .occurrence_ids
+        .iter()
+        .filter_map(|id| by_id.get(id).copied())
+        .collect();
+    members.sort_by_key(|o| o.id);
+    members.dedup_by_key(|o| o.id);
+    let mut buckets: Vec<(ValueKey, Vec<&Occurrence>)> = Vec::new();
+    let mut index: HashMap<&ValueKey, usize> = HashMap::new();
+    for o in &members {
+        match index.get(&o.value_key) {
+            Some(&at) => buckets[at].1.push(o),
+            None => {
+                index.insert(&o.value_key, buckets.len());
+                buckets.push((o.value_key.clone(), vec![o]));
+            }
+        }
+    }
+    let mut values: Vec<CandidateValue> = buckets
+        .into_iter()
+        .map(|(key, list)| candidate_value(key, &list))
+        .collect();
+    values.sort_by(|a, b| {
+        b.pages
+            .len()
+            .cmp(&a.pages.len())
+            .then_with(|| a.occurrence_ids.first().cmp(&b.occurrence_ids.first()))
+    });
+    for (i, value) in values.iter_mut().enumerate() {
+        value.id = i + 1;
+    }
+    let places = values.iter().flat_map(|v| &v.origins).collect::<BTreeSet<_>>().len();
+    (values, places)
 }
 
 fn candidate_value(key: ValueKey, list: &[&Occurrence]) -> CandidateValue {
@@ -348,6 +370,45 @@ pub fn cohorts(c: Candidate) -> Vec<Candidate> {
         .collect()
 }
 
+/// The values (ids) of a group that its valid review results judge.
+pub fn covered_values(results: &[ValidatedResult]) -> BTreeSet<usize> {
+    results
+        .iter()
+        .flat_map(|result| result.4.values.iter().copied())
+        .collect()
+}
+
+/// The values (ids, ascending) of `c` that no valid review result judges: the review left them
+/// out. None when the group has no result at all (then the whole group is not reviewed).
+pub fn uncovered_values(c: &Candidate, results: &[ValidatedResult]) -> Vec<usize> {
+    if results.is_empty() {
+        return Vec::new();
+    }
+    let covered = covered_values(results);
+    (1..=c.values.len()).filter(|id| !covered.contains(id)).collect()
+}
+
+/// `c` with the values `first` (ids) moved to the front, renumbered `1…`, and for each new id
+/// (at index id − 1) the value's id in `c`: a group asked again for the values an answer left
+/// out shows them first, so the request differs from the one that left them out.
+pub fn with_values_first(c: &Candidate, first: &[usize]) -> (Candidate, Vec<usize>) {
+    let order: Vec<usize> = first
+        .iter()
+        .copied()
+        .filter(|id| (1..=c.values.len()).contains(id))
+        .chain((1..=c.values.len()).filter(|id| !first.contains(id)))
+        .collect();
+    let values = order
+        .iter()
+        .enumerate()
+        .map(|(i, &id)| CandidateValue {
+            id: i + 1,
+            ..c.values[id - 1].clone()
+        })
+        .collect();
+    (Candidate { values, ..c.clone() }, order)
+}
+
 /// Choose the groups to review, at most `MAX_REVIEWED_GROUPS`, fairly across the attribute
 /// buckets: the buckets (by attribute importance, then key) take turns, one group each per round,
 /// so a large bucket never starves a small one. Within a bucket, differences without stated
@@ -398,9 +459,14 @@ struct Detail {
     qualifier_chars: usize,
     path_chars: usize,
     value_chars: usize,
+    /// The page path in `<where>`.
+    where_chars: usize,
 }
 
-/// From the full rendering down to the leanest one `render_group_within` falls back to.
+/// From the full rendering down to the leanest one `render_group_within` falls back to. Every
+/// text is capped, so the leanest form of a group (at most `MAX_VALUES_PER_REVIEW` values, a name
+/// of at most 120 characters) stays below the smallest review budget (6 KB) even when every
+/// character escapes to 4 bytes.
 const DETAILS: [Detail; 5] = [
     Detail {
         occurrences: MAX_OCCURRENCES_SHOWN,
@@ -408,6 +474,7 @@ const DETAILS: [Detail; 5] = [
         qualifier_chars: 200,
         path_chars: 200,
         value_chars: usize::MAX,
+        where_chars: 200,
     },
     Detail {
         occurrences: 3,
@@ -415,6 +482,7 @@ const DETAILS: [Detail; 5] = [
         qualifier_chars: 200,
         path_chars: 120,
         value_chars: usize::MAX,
+        where_chars: 120,
     },
     Detail {
         occurrences: 2,
@@ -422,6 +490,7 @@ const DETAILS: [Detail; 5] = [
         qualifier_chars: 120,
         path_chars: 80,
         value_chars: usize::MAX,
+        where_chars: 80,
     },
     Detail {
         occurrences: 1,
@@ -429,13 +498,15 @@ const DETAILS: [Detail; 5] = [
         qualifier_chars: 80,
         path_chars: 60,
         value_chars: usize::MAX,
+        where_chars: 60,
     },
     Detail {
         occurrences: 1,
         evidence_chars: 0,
-        qualifier_chars: 60,
+        qualifier_chars: 40,
         path_chars: 0,
-        value_chars: 120,
+        value_chars: 80,
+        where_chars: 40,
     },
 ];
 
@@ -456,9 +527,10 @@ pub fn render_group(
 }
 
 /// `render_group` reduced until it fits `max_bytes`: fewer occurrence lines, shorter evidence,
-/// qualifiers and heading paths, and at last no evidence and paths and values cut to 120
-/// characters. Every value is always shown. When even the leanest form does not fit, it is
-/// returned anyway (a batch then holds only this group).
+/// qualifiers, heading paths and page paths, and at last no evidence and headings, and values cut
+/// to 80 characters. Every value is always shown. The leanest form fits every review budget of at
+/// least 6 KB (see `DETAILS`); below that, it is returned anyway (a batch then holds only this
+/// group).
 pub fn render_group_within(
     group_id: usize,
     c: &Candidate,
@@ -513,7 +585,7 @@ fn render_with(
             let lead = line.lead;
             out.push_str(&format!(
                 "<occurrence><where>{}</where><qualifiers>{}</qualifiers>",
-                sanitize_for_prompt(&where_text(line, sources, pages)),
+                sanitize_for_prompt(&where_text(line, sources, pages, detail.where_chars)),
                 sanitize_for_prompt(&cap(&lead.qualifiers, detail.qualifier_chars))
             ));
             if detail.path_chars > 0 {
@@ -600,9 +672,9 @@ fn merge_occurrences<'a>(members: &[&'a Occurrence]) -> Vec<Merged<'a>> {
     lines
 }
 
-/// `/path` of a page, or `header/footer line on N pages`, plus `and N more pages` for a merged
-/// line.
-fn where_text(line: &Merged, sources: &[AnalysisSource], pages: &[Page]) -> String {
+/// `/path` of a page (cut to `max_chars`), or `header/footer line on N pages`, plus `and N more
+/// pages` for a merged line.
+fn where_text(line: &Merged, sources: &[AnalysisSource], pages: &[Page], max_chars: usize) -> String {
     let lead = line.lead;
     let place = match lead.region {
         SourceKind::Chrome => format!(
@@ -616,6 +688,7 @@ fn where_text(line: &Merged, sources: &[AnalysisSource], pages: &[Page]) -> Stri
             .and_then(|&index| pages.iter().find(|p| p.index == index))
             .map(|p| p.path.clone())
             .or_else(|| sources.iter().find(|s| s.id == lead.source).map(|s| s.path.clone()))
+            .map(|path| cap(&path, max_chars))
             .unwrap_or_default(),
     };
     let more = line.pages.len().saturating_sub(lead.pages.len());
@@ -849,21 +922,22 @@ fn validate_prose(mut r: ReviewResult, name: &str, input: &str) -> (ReviewResult
         .filter(|b| !b.is_empty())
         .take(MAX_BENIGN)
         .collect();
-    // The numbers of the group, and each group of digits on its own ("+420" of "+420 800 123 456").
-    let mut allowed = numbers_in(input, "");
+    // The numbers of the group, and each group of digits on its own ("+420" of "+420 800 123 456"),
+    // compared exactly: a phone number or an identifier differing in its last digits is foreign.
+    let mut allowed: HashSet<String> = number_strings_in(input, "").into_iter().collect();
     allowed.extend(
         input
             .split(|c: char| !c.is_ascii_digit())
-            .filter_map(|digits| digits.parse::<f64>().ok()),
+            .filter(|digits| !digits.is_empty())
+            .flat_map(|digits| number_strings_in(digits, "")),
     );
-    let known = |n: f64| allowed.iter().any(|a| (a - n).abs() <= 1e-9 * a.abs().max(1.0));
     let prose: Vec<&String> = [&r.title, &r.explanation, &r.check]
         .into_iter()
         .chain(&r.benign)
         .collect();
     let foreign = prose
         .iter()
-        .any(|text| numbers_in(text, "").into_iter().any(|n| !known(n)));
+        .any(|text| number_strings_in(text, "").iter().any(|n| !allowed.contains(n)));
     let missing = r.title.is_empty() || r.explanation.is_empty() || r.check.is_empty();
     if missing || foreign || prose.iter().any(|text| has_forbidden_word(text)) {
         r.title = default_title(name);
@@ -1410,6 +1484,27 @@ mod tests {
     }
 
     #[test]
+    fn a_publication_date_explains_only_values_that_change_over_time() {
+        // Review (live): an article of 2025 saying 'founded in 2006' against 'founded in 2005'
+        // was 'explainable' only because the article predates the crawl.
+        let prompt = prompts::JUDGE;
+        let flat = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("that can change over time"),
+            "the rule names the values a date explains"
+        );
+        assert!(
+            flat.contains("A publication date alone never explains two different values of a fact that cannot change"),
+            "the rule names the exception"
+        );
+        let recap = flat.split("<rules_recap>").nth(1).expect("a recap");
+        assert!(
+            recap.contains("not a different founding year, date of a past event or identifier"),
+            "the recap keeps the exception: {recap}"
+        );
+    }
+
+    #[test]
     fn the_review_prompt_keeps_quotes_out_of_the_json_and_names_the_words_to_avoid() {
         let prompt = prompts::JUDGE;
         // A Czech „quote" closed with an ASCII quote ended the JSON string and the answer.
@@ -1467,6 +1562,61 @@ mod tests {
         assert!(replaced, "421 is in no value");
         let (_, replaced) = validate_prose(result("Linka 999 je jiná."), "Linka", input);
         assert!(replaced, "999 is in no value");
+    }
+
+    #[test]
+    fn a_long_number_in_the_prose_must_be_exactly_one_of_the_group() {
+        let input = "<group id=\"1\">\n<value id=\"1\">\n<text>+420800123456</text>\n</value>\n<value id=\"2\">\n<text>+420800123465</text>\n</value>\n<value id=\"3\">\n<text>123456789012</text>\n</value>\n<value id=\"4\">\n<text>12345678901234567890</text>\n</value>\n</group>";
+        let result = |title: &str| ReviewResult {
+            group: 1,
+            values: vec![1, 2],
+            confidence: "possibly_inconsistent".to_string(),
+            priority: "medium".to_string(),
+            title: title.to_string(),
+            explanation: "The listed numbers differ.".to_string(),
+            benign: Vec::new(),
+            check: "Verify the numbers on the contact pages.".to_string(),
+        };
+        for (title, foreign) in [
+            ("Customer line +420800123499 differs", true),
+            ("Company ID 123456789013 differs", true),
+            ("Account 12345678901234567891 differs", true),
+            ("Customer line +420800123465 differs", false),
+            ("Company ID 123456789012 differs", false),
+            ("Account 12345678901234567890 differs", false),
+        ] {
+            let (_, replaced) = validate_prose(result(title), "Linka", input);
+            assert_eq!(replaced, foreign, "{title}");
+        }
+    }
+
+    #[test]
+    fn a_group_asked_again_shows_the_values_left_out_first() {
+        let (batch, _) = batch();
+        let group = &batch[0];
+        assert_eq!(group.values.len(), 3);
+        let (again, ids) = with_values_first(group, &[3]);
+        assert_eq!(ids, vec![3, 1, 2], "value 1 of the call is value 3 of the group");
+        assert_eq!(again.values.iter().map(|v| v.id).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(again.values[0].text, group.values[2].text);
+        assert_eq!(again.values[1].key, group.values[0].key);
+
+        let judged = |values: &[usize]| {
+            let mut r = result(7, &[1, 2], "explainable", "none");
+            r.values = values.to_vec();
+            validate(r, &batch, &batch_rendered()).expect("valid")
+        };
+        assert_eq!(uncovered_values(group, &[judged(&[1, 2])]), vec![3]);
+        assert!(uncovered_values(group, &[judged(&[1, 2]), judged(&[1, 3])]).is_empty());
+        assert!(
+            uncovered_values(group, &[]).is_empty(),
+            "a group without results is not reviewed"
+        );
+        assert_eq!(covered_values(&[judged(&[1, 3])]).len(), 2);
+    }
+
+    fn batch_rendered() -> Vec<String> {
+        batch().1
     }
 
     /// Two reviewed groups: the phone case as group 7 (a third value from /reklamace again), and

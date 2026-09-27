@@ -10,7 +10,7 @@
 use serde_json::Value;
 
 use crate::ai::grounding::{
-    ValueHint, extend_over_operator, locate_quoted_value, normalize_label, snippet_with_span, value_key,
+    ValueHint, extend_number_span, locate_quoted_value, normalize_label, snippet_with_span, value_key,
 };
 use crate::ai::normalize::json_list;
 use crate::ai::provider::{ChatMessage, ChatRequest};
@@ -93,11 +93,12 @@ fn raw_fact(item: &Value) -> Option<RawFact> {
 /// one of the source's ids (case and surrounding spaces aside), its text must contain the `quote`,
 /// and the `value` must be a whole token inside that quote (`grounding::locate_quoted_value`). The
 /// occurrence takes the page's own spelling of the value — for a number, with an operator written
-/// right before it (`od 18 let`, `18+`, `grounding::extend_over_operator`), even when the model put
-/// that operator into the qualifiers — the crawler's text around it as evidence (with the value's
+/// right before it (`od 18 let`, `18+`), a sign joined to it (`-5 %`) and the other end of a range
+/// it is one end of (`5–10 %`, `grounding::extend_number_span`), even when the model put them into
+/// the qualifiers or left them out — the crawler's text around it as evidence (with the value's
 /// place in it), the block's heading path (or header/footer label) and page set, and the value's
-/// comparison key read with `lang` and `site_country` (the model's `normalized` form is only a
-/// hint). An unknown `attribute_key` becomes `Other`; `subject`, `attribute` and `qualifiers` get
+/// comparison key read with `lang` and `site_country` (never from the model's `normalized` form).
+/// An unknown `attribute_key` becomes `Other`; `subject`, `attribute` and `qualifiers` get
 /// their whitespace collapsed and are cut to 120, 120 and 200 characters. At most
 /// `MAX_FACTS_PER_SOURCE` facts are kept (the first grounded ones); a repeat of a kept fact (the
 /// same value span with the same key for the same subject) is skipped. Returns the occurrences
@@ -126,7 +127,7 @@ pub fn verify_facts(
             .and_then(|b| {
                 let mut span = locate_quoted_value(&b.text, &fact.quote, &fact.value)?;
                 if hint == ValueHint::Number {
-                    span = extend_over_operator(&b.text, span);
+                    span = extend_number_span(&b.text, span);
                 }
                 Some((b, span, b.text.get(span.0..span.1)?.to_string()))
             });
@@ -548,6 +549,50 @@ mod tests {
         assert_eq!(
             &kept[0].evidence[kept[0].value_span.0..kept[0].value_span.1],
             "od 18 let"
+        );
+    }
+
+    #[test]
+    fn a_sign_or_a_range_the_value_belongs_to_is_kept_in_the_value_and_its_key() {
+        let mut source = page_source();
+        source.blocks = vec![
+            block("B1", "Annual return -5 %", &[], &[2]),
+            block("B2", "Annual return −5 %", &[], &[2]),
+            block("B3", "Interest 5–10 %", &[], &[2]),
+            block("B4", "Interest 5 - 10 % p.a.", &[], &[2]),
+            block("B5", "Price 10 EUR – 20 EUR", &[], &[2]),
+            block("B6", "Annual return 5 %", &[], &[2]),
+        ];
+        let raw = vec![
+            fact("B1", "interest_rate", "5 %", "Annual return -5 %"),
+            fact("B2", "interest_rate", "5 %", "Annual return −5 %"),
+            fact("B3", "interest_rate", "10 %", "Interest 5–10 %"),
+            fact("B4", "interest_rate", "5", "Interest 5 - 10 %"),
+            fact("B5", "price", "20 EUR", "Price 10 EUR – 20 EUR"),
+        ];
+        let mut next_id = 0;
+        let (kept, ungrounded) = verify_facts(raw, &source, "en", None, &mut next_id);
+        assert_eq!(ungrounded, 0);
+        let values: Vec<&str> = kept.iter().map(|o| o.value.as_str()).collect();
+        assert_eq!(
+            values,
+            vec!["-5 %", "−5 %", "5–10 %", "5 - 10 %", "10 EUR – 20 EUR"],
+            "a sign and the other end of a range belong to the number"
+        );
+        let plain = value_key(ValueHint::Number, "5 %", "", "en", None);
+        assert_eq!(kept[0].value_key, ValueKey::Exact("num:-5:%:".to_string()));
+        assert_eq!(kept[0].value_key, kept[1].value_key, "ASCII and Unicode minus");
+        assert_ne!(kept[0].value_key, plain, "-5 % is not 5 %");
+        assert_eq!(kept[2].value_key, ValueKey::Exact("range:5-10:%:".to_string()));
+        assert_eq!(kept[3].value_key, kept[2].value_key);
+        assert_ne!(
+            kept[2].value_key,
+            value_key(ValueHint::Number, "10 %", "", "en", None),
+            "an end of a range is not the range"
+        );
+        assert_eq!(
+            &kept[4].evidence[kept[4].value_span.0..kept[4].value_span.1],
+            "10 EUR – 20 EUR"
         );
     }
 
