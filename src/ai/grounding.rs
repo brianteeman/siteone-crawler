@@ -205,9 +205,10 @@ pub fn extend_over_operator(text: &str, span: (usize, usize)) -> (usize, usize) 
 /// (`extend_over_operator`). A dash or a `+` is a sign only when it touches the number and follows
 /// no letter or digit (`COVID-19` has no `-19`, `A+10` no `+10`, `Sleva – 5 %` no `-5 %`); a dash,
 /// `to`, `až` or `do` between two numbers is a range unless the two ends name different units
-/// (`290 Kč – 10 GB` is no range), and a word is none before a date (`10 do 31. 12.`) or after a
-/// value that ends in another word (`5 osob do 31`). A span that is not a range of `text` is
-/// returned as it is.
+/// (`290 Kč – 10 GB` is no range) or a word follows a value that ends in another word (`5 osob do
+/// 31`). A date is no upper end (`od €10 do 31.12.` stays `od €10`, see `DayMonth`); an upper end
+/// that may be a date or a number (`od €10 do 31.12`) is taken with it, so that the value's key is
+/// uncertain. A span that is not a range of `text` is returned as it is.
 pub fn extend_number_span(text: &str, span: (usize, usize)) -> (usize, usize) {
     if text.get(span.0..span.1).is_none() {
         return span;
@@ -306,17 +307,18 @@ fn widen_right(text: &str, span: (usize, usize), value: &str, value_unit: Option
     let after = text.get(end..).unwrap_or_default();
     let right = after.trim_start_matches(char::is_whitespace);
     let spaced = right.len() < after.len();
-    let (rest, dash) = if let Some(dash) = right.chars().next().filter(|&c| is_dash(c)) {
-        (right.get(dash.len_utf8()..).unwrap_or_default(), true)
+    let (rest, word) = if let Some(dash) = right.chars().next().filter(|&c| is_dash(c)) {
+        (right.get(dash.len_utf8()..).unwrap_or_default(), None)
     } else if let Some((rest, word)) = spaced.then(|| word_connector_after(right)).flatten()
         && (value.ends_with(|c: char| c.is_ascii_digit()) || value_unit.is_some())
         && (word != "do" || after_od(text, start))
     {
-        (rest, false)
+        (rest, Some(word))
     } else {
         return end;
     };
     let rest = rest.trim_start();
+    let plain = rest;
     let rest = rest.strip_prefix(['€', '$', '£']).unwrap_or(rest);
     let rest = rest
         .strip_prefix(is_sign)
@@ -326,14 +328,9 @@ fn widen_right(text: &str, span: (usize, usize), value: &str, value_unit: Option
     if !rest.starts_with(|c: char| c.is_ascii_digit()) {
         return end;
     }
-    let high_end = text.len() - rest.len() + scan_numeral(rest, 0);
+    let high_start = text.len() - rest.len();
+    let high_end = high_start + scan_numeral(rest, 0);
     let tail = text.get(high_end..).unwrap_or_default();
-    let date = tail
-        .strip_prefix('.')
-        .is_some_and(|day| day.trim_start().starts_with(|c: char| c.is_ascii_digit()));
-    if !dash && date {
-        return end;
-    }
     let spaced_tail = tail.trim_start_matches(char::is_whitespace);
     let high_unit = unit_prefix(spaced_tail);
     let agree = match (value_unit, high_unit) {
@@ -344,7 +341,70 @@ fn widen_right(text: &str, span: (usize, usize), value: &str, value_unit: Option
     if !agree {
         return end;
     }
+    // Without a currency, a sign or a unit, the upper end may be a date.
+    if rest.len() == plain.len()
+        && high_unit.is_none()
+        && let Some((written, len)) = day_month(rest)
+    {
+        match date_after(word, written) {
+            Some(true) => return end,
+            Some(false) => return high_start + len,
+            None => {}
+        }
+    }
     high_end + high_unit.map_or(0, |(len, _)| tail.len() - spaced_tail.len() + len)
+}
+
+/// How a day and month (1–31, 1–12) at the start of a text is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DayMonth {
+    /// With a space after the day's point (`31. 12.`) or with a year (`31.12.2026`): a date.
+    Sure,
+    /// Compact, with the month's point (`31.12.`): a date in Czech, which writes no decimal
+    /// point; in English maybe a decimal number and a full stop.
+    Dotted,
+    /// Compact, without the month's point (`31.12`): a date, or a decimal number.
+    Bare,
+}
+
+static DAY_MONTH: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"^(\d{1,2})\.(\s*)(\d{1,2})(\.(?:\s*\d{4})?)?").expect("day and month regex"));
+
+/// The day and month that `s` starts with, how they are written and their length in bytes. A
+/// digit right after them (`31.123`, `31.12.5`) makes them none.
+fn day_month(s: &str) -> Option<(DayMonth, usize)> {
+    let caps = DAY_MONTH.captures(s)?;
+    let whole = caps.get(0)?;
+    let day: u32 = caps.get(1)?.as_str().parse().ok()?;
+    let month: u32 = caps.get(3)?.as_str().parse().ok()?;
+    let digit_after = s
+        .get(whole.end()..)
+        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()));
+    if !(1..=31).contains(&day) || !(1..=12).contains(&month) || digit_after {
+        return None;
+    }
+    let point = caps.get(4).map_or("", |m| m.as_str());
+    let spaced = caps.get(2).is_some_and(|m| !m.as_str().is_empty());
+    let written = if spaced || point.len() > 1 {
+        DayMonth::Sure
+    } else if point == "." {
+        DayMonth::Dotted
+    } else {
+        DayMonth::Bare
+    };
+    Some((written, whole.end()))
+}
+
+/// Whether a day and month written as `written` after a range connector (`word`, `None` for a
+/// dash) is a date: `Some(true)` a date, so no upper end; `Some(false)` unsure (`31.12` after
+/// `do`/`až`, `31.12.` after `to` or a dash); `None` a number (`31.12` after `to` or a dash).
+fn date_after(word: Option<&str>, written: DayMonth) -> Option<bool> {
+    let czech = matches!(word, Some("do" | "až"));
+    match written {
+        DayMonth::Sure => Some(true),
+        DayMonth::Dotted => Some(czech),
+        DayMonth::Bare => czech.then_some(false),
+    }
 }
 
 /// The text before a range connector that `left` ends with, and the connector's word (`None`
@@ -1107,6 +1167,10 @@ pub fn parse_number(value: &str, lang: &str) -> Option<ValueKey> {
     if !starts_with_digit(rest) {
         return None;
     }
+    // A day and month (`1.10.`, `31. 12.`, `31.12.2026`) is a date, not a number.
+    if matches!(day_month(rest), Some((DayMonth::Sure | DayMonth::Dotted, _))) {
+        return uncertain();
+    }
     let (low, after) = split_numeral(rest);
     rest = after.trim_start();
 
@@ -1116,9 +1180,22 @@ pub fn parse_number(value: &str, lang: &str) -> Option<ValueKey> {
             continue;
         };
         let mut after = after.trim_start();
+        let plain = after;
         let (currency, high_negative) = take_signed_currency(&mut after);
         if !starts_with_digit(after) || (currency.is_some() && unit.is_some() && currency != unit) {
             continue;
+        }
+        // Without a currency, a sign or a unit, the upper end may be a date: then the connector
+        // and the date stay words of the value; an unsure one makes the value uncertain.
+        if after.len() == plain.len()
+            && let Some((written, len)) = day_month(after)
+            && !unit_after(after.get(len..).unwrap_or_default())
+        {
+            match date_after((connector != "-").then(|| connector.trim_end()), written) {
+                Some(true) => break,
+                Some(false) => return uncertain(),
+                None => {}
+            }
         }
         if currency.is_some() {
             unit = currency;
@@ -1388,6 +1465,12 @@ fn decimal_separator(lang: &str) -> Option<char> {
 
 /// Take the first of `words` that `rest` starts with (a word must not run on into a letter) and
 /// return its canonical form; `rest` then continues after it, without leading spaces.
+/// `s` starts (after spaces) with a currency or `%` (`UNITS`).
+fn unit_after(s: &str) -> bool {
+    let mut rest = s.trim_start();
+    take_word(&mut rest, UNITS).is_some()
+}
+
 /// A currency written before a number and a sign joined to the number, in either order (`€-5`,
 /// `-€5`, `+5`), taken from the start of `rest`: the currency, and whether the sign is a minus.
 /// A sign is one only when a digit or a currency symbol follows it.
@@ -1908,6 +1991,85 @@ mod tests {
         let key = |value: &str| parse_number(value, "en");
         assert_ne!(key("10 EUR"), key("10 USD"));
         assert_eq!(key("€10"), key("10 EUR"));
+    }
+
+    #[test]
+    fn a_date_after_a_range_word_or_a_dash_is_no_upper_end() {
+        let extended = |text: &str, value: &str| {
+            let start = text.find(value).expect("value");
+            let (a, b) = extend_number_span(text, (start, start + value.len()));
+            text[a..b].to_string()
+        };
+        // After `do`/`až`, a day and month is a date, compact or spaced, with or without a year:
+        // the value keeps its starting-price operator.
+        assert_eq!(extended("Cena od €10 do 31.12.", "€10"), "od €10");
+        assert_eq!(extended("Cena od €10 do 31. 12.", "€10"), "od €10");
+        assert_eq!(extended("Cena od €10 do 31.12.2026", "€10"), "od €10");
+        assert_eq!(extended("Cena od €10 do 31. 12. 2026", "€10"), "od €10");
+        assert_eq!(extended("Cena od 10 do 31.12.", "10"), "od 10");
+        assert_eq!(extended("Sleva 5 až 1.10.", "5"), "5");
+        // After a dash or `to`, one with a space or a year.
+        assert_eq!(extended("Cena €10 – 31. 12.", "€10"), "€10");
+        assert_eq!(extended("Cena €10–31.12.2026", "€10"), "€10");
+        assert_eq!(extended("Price from €10 to 31. 12. 2026", "€10"), "from €10");
+        // A price before a range of dates stays the price.
+        assert_eq!(extended("Cena 290 Kč od 1.10. do 31.12.", "290 Kč"), "290 Kč");
+        // Real ranges: a unit after the upper end, a currency before it, no month, a full stop.
+        assert_eq!(extended("Cena 10–31.12 EUR", "10"), "10–31.12 EUR");
+        assert_eq!(extended("Cena od 10 do 31.12 Kč", "10"), "od 10 do 31.12 Kč");
+        assert_eq!(extended("Cena €10–31.12", "€10"), "€10–31.12");
+        assert_eq!(extended("Cena od €10 do €31.12.", "€10"), "od €10 do €31.12");
+        assert_eq!(extended("Cena od 10 do 12.50.", "10"), "od 10 do 12.50");
+        assert_eq!(extended("Úrok 5 až 10.", "5"), "5 až 10");
+        assert_eq!(extended("Úrok od 5 do 10 %.", "5"), "od 5 do 10 %");
+        assert_eq!(extended("Price 5 to 7.5 %.", "5"), "5 to 7.5 %");
+        // Unsure: `31.12` after `do` may be a number; `31.12.` after `to` or a dash may be a
+        // number and a full stop. The whole goes to the value, whose key is uncertain.
+        assert_eq!(extended("Cena od €10 do 31.12", "€10"), "od €10 do 31.12");
+        assert_eq!(extended("Price €10–31.12.", "€10"), "€10–31.12.");
+        assert_eq!(extended("Price from €10 to 31.12.", "€10"), "from €10 to 31.12.");
+        // The keys: the same price whatever the date looks like; never a range with a date; an
+        // unsure one uncertain.
+        let key = |value: &str| parse_number(value, "cs");
+        let uncertain = |value: &str| matches!(key(value), Some(ValueKey::Uncertain(_)));
+        assert_eq!(key("od €10"), Some(ValueKey::Exact("num:from 10:EUR:".to_string())));
+        assert_eq!(
+            key("€10–31.12"),
+            Some(ValueKey::Exact("range:10-31.12:EUR:".to_string()))
+        );
+        assert_eq!(key("10–31.12 EUR"), key("€10–31.12"));
+        assert_eq!(
+            key("od 10 do 31.12 Kč"),
+            Some(ValueKey::Exact("range:10-31.12:CZK:".to_string()))
+        );
+        assert_eq!(
+            key("od 10 do 12.50"),
+            Some(ValueKey::Exact("range:10-12.5::".to_string()))
+        );
+        for value in [
+            "od €10 do 31.12",
+            "€10–31.12.",
+            "from €10 to 31.12.",
+            "31. 12.",
+            "1.10.",
+            "31.12.2026",
+        ] {
+            assert!(uncertain(value), "{value}: {:?}", key(value));
+        }
+        // A date written after the whole value stays in its key, never as an upper end.
+        for value in [
+            "od €10 do 31.12.",
+            "od €10 do 31. 12.",
+            "od €10 do 31.12.2026",
+            "€10 – 31. 12.",
+        ] {
+            let read = key(value);
+            assert!(
+                matches!(&read, Some(ValueKey::Exact(k)) if k.starts_with("num:")),
+                "{value}: {read:?}"
+            );
+        }
+        assert_ne!(key("od 1.10. do 31.12."), key("od 1.1. do 31.12."));
     }
 
     #[test]

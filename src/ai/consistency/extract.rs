@@ -661,6 +661,31 @@ mod tests {
     }
 
     #[test]
+    fn a_price_until_a_date_is_one_price_however_the_date_is_written() {
+        let compact = ("Cena od €10 do 31.12.", "€10");
+        let spaced = ("Cena od €10 do 31. 12.", "€10");
+        // Compact and spaced dates after the same price: the same value.
+        let (occ, candidates, consistent) = one_key("cs", "price", &[compact, spaced, spaced]);
+        assert_eq!(
+            occ[0].value_key,
+            ValueKey::Exact("num:from 10:EUR:".to_string()),
+            "{:?}",
+            occ[0].value
+        );
+        assert_eq!((candidates, consistent), (0, 1));
+        // A real price interval €10–31.12 is another value.
+        let interval = ("Cena €10–31.12", "€10–31.12");
+        for page in [compact, spaced] {
+            let (_, candidates, consistent) = one_key("cs", "price", &[page, interval, interval]);
+            assert_eq!((candidates, consistent), (1, 0), "{}", page.0);
+        }
+        // Without a currency, the model's `10` and `od 10` of the same text are one value.
+        let text = "Cena od 10 do 31.12.";
+        let (_, candidates, consistent) = one_key("cs", "price", &[(text, "10"), (text, "od 10"), (text, "od 10")]);
+        assert_eq!((candidates, consistent), (0, 1));
+    }
+
+    #[test]
     fn the_same_value_for_two_subjects_is_kept_twice() {
         let mut source = page_source();
         source.blocks = vec![block("B1", "Zákaznická linka a reklamace: 800 123 456", &[], &[2])];
