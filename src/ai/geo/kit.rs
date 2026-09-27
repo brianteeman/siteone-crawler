@@ -260,7 +260,12 @@ pub fn proposed_robots(
         RobotsFetchState::NotAttempted => return Err("robots.txt was not fetched".to_string()),
     };
     let after = AiRobots::parse(&proposed);
-    if let Some(token) = added.iter().find(|token| after.is_allowed(token, "/")) {
+    // Each added group must be read (within the first 500 KiB) and deny `/`; a `/` that `*`
+    // already denies proves nothing about the group itself.
+    if let Some(token) = added
+        .iter()
+        .find(|token| !after.has_named_group(token) || after.is_allowed(token, "/"))
+    {
         return Err(format!(
             "the added group for {token} would not take effect (engines read only the first 500 KiB of robots.txt)"
         ));
@@ -1327,6 +1332,13 @@ mod tests {
 
         let huge = format!("User-agent: *\nDisallow: /admin\n#{}\n", "x".repeat(600 * 1024));
         assert!(refuse(ok(&huge), &snippet).contains("would not take effect"));
+        // `/` is denied before and after, but past 500 KiB the added groups are not read, so the
+        // training crawlers keep the `Allow: /public/` of `*`.
+        let huge_deny = format!(
+            "User-agent: *\nDisallow: /\nAllow: /public/\n#{}\n",
+            "x".repeat(510 * 1024)
+        );
+        assert!(refuse(ok(&huge_deny), &snippet).contains("would not take effect"));
 
         let everyone = "User-agent: GPTBot\nUser-agent: ClaudeBot\nUser-agent: Applebot-Extended\n\
                         User-agent: meta-externalagent\nUser-agent: CCBot\nDisallow: /\n";
