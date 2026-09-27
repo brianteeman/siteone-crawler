@@ -586,20 +586,33 @@ enum ClassMark {
 }
 
 fn class_mark(token: &str) -> Option<ClassMark> {
-    let token = token.to_lowercase();
-    if token == "fn" {
+    if token.eq_ignore_ascii_case("fn") {
         return Some(ClassMark::Name);
     }
-    let words: Vec<&str> = token.split(['-', '_']).filter(|word| !word.is_empty()).collect();
+    let words = class_words(token);
     let (last, before) = words.split_last()?;
-    if AUTHOR_WORDS.contains(last) {
+    if AUTHOR_WORDS.contains(&last.as_str()) {
         return Some(ClassMark::Author);
     }
     let joined = AUTHOR_WORDS
         .iter()
         .any(|author| NAME_WORDS.iter().any(|name| *last == format!("{author}{name}")));
-    let after_author = NAME_WORDS.contains(last) && before.last().is_some_and(|word| AUTHOR_WORDS.contains(word));
+    let after_author =
+        NAME_WORDS.contains(&last.as_str()) && before.last().is_some_and(|word| AUTHOR_WORDS.contains(&word.as_str()));
     (joined || after_author).then_some(ClassMark::Name)
+}
+
+/// The words of a class token, lowercase, split at `-` and `_`, without a BEM modifier (the part
+/// after `--`, which changes how the element looks, not what it holds): `c-byline__author--featured`
+/// → `c`, `byline`, `author`.
+fn class_words(token: &str) -> Vec<String> {
+    let token = token.to_lowercase();
+    let element = token.split("--").next().unwrap_or_default();
+    element
+        .split(['-', '_'])
+        .filter(|word| !word.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// An element marked as something other than a name: a `<time>`, an `itemprop` other than
@@ -613,11 +626,10 @@ fn marks_other(element: ElementRef) -> bool {
             .is_some_and(|prop| !prop.split_whitespace().any(|prop| prop.eq_ignore_ascii_case("name")))
         || el.attr("class").is_some_and(|class| {
             class.split_whitespace().any(|token| {
-                let lower = token.to_lowercase();
-                let words: Vec<&str> = lower.split(['-', '_']).filter(|word| !word.is_empty()).collect();
+                let words = class_words(token);
                 class_mark(token).is_none()
-                    && (words.iter().any(|word| AUTHOR_WORDS.contains(word))
-                        || words.last().is_some_and(|word| DETAIL_WORDS.contains(word)))
+                    && (words.iter().any(|word| AUTHOR_WORDS.contains(&word.as_str()))
+                        || words.last().is_some_and(|word| DETAIL_WORDS.contains(&word.as_str())))
             })
         })
 }
@@ -2415,6 +2427,22 @@ mod tests {
                 "<p class=\"vcard\"><span class=\"fn\">Jane Smith</span></p>",
                 "Jane Smith",
                 jane,
+            ),
+            // A BEM modifier (`--featured`) changes how the element looks, not what it holds.
+            (
+                "<p><span class=\"c-byline__author--featured\">Jane Smith</span></p>",
+                "Jane Smith",
+                jane,
+            ),
+            (
+                "<p><span class=\"author-name\">Jane Smith</span> <span class=\"author__role--primary\">Editor</span></p>",
+                "Jane Smith Editor",
+                jane,
+            ),
+            (
+                "<p class=\"author__title--large\">Editorial Director</p>",
+                "Editorial Director",
+                None,
             ),
             ("<p class=\"byline\">By Jane Smith</p>", "By Jane Smith", jane),
             // Several names in the cited block: the strongest provenance, then the first.
