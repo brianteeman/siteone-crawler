@@ -11,7 +11,7 @@ use crate::types::ContentTypeId;
 use crate::utils;
 
 /// 90th-percentile value of a slice (nearest-rank). Returns 0.0 for an empty slice.
-fn percentile(values: &mut [f64], p: usize) -> f64 {
+pub(crate) fn percentile(values: &mut [f64], p: usize) -> f64 {
     if values.is_empty() {
         return 0.0;
     }

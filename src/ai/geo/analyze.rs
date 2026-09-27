@@ -1043,11 +1043,13 @@ pub fn verify_analysis(raw: RawAnalysis, page: &AnalyzedPage, blocks: &[Block], 
     }
 }
 
-/// A lead is kept when it cites at least one shown block, has at most `MAX_LEAD_CHARS` characters
-/// and every number in it occurs in the cited blocks.
+/// A lead is drafted only for a page that does not state its offer early (the prompt asks for no
+/// lead otherwise, and a model may still write one). It is kept when it cites at least one shown
+/// block, has at most `MAX_LEAD_CHARS` characters and every number in it occurs in the cited
+/// blocks.
 fn verify_lead(raw: &RawAnalysis, shown: &Shown, lang: &str, rejected: &mut Rejected) -> Option<Lead> {
     let text = raw.lead.trim();
-    if text.is_empty() {
+    if text.is_empty() || raw.states_offer_early != OfferEarly::No {
         return None;
     }
     let (cited, _) = shown.resolve(&raw.lead_blocks, &mut rejected.block_ids);
@@ -1555,7 +1557,10 @@ mod tests {
             analyze(
                 &page,
                 &blocks,
-                &format!(r#""lead":"{text}","lead_blocks":[{}]"#, cited.join(",")),
+                &format!(
+                    r#""states_offer_early":false,"lead":"{text}","lead_blocks":[{}]"#,
+                    cited.join(",")
+                ),
             )
         };
 
@@ -1586,6 +1591,28 @@ mod tests {
         assert!(lead(&"a".repeat(351), &[&rate]).lead.is_none(), "over 350 characters");
         assert!(lead("", &[&rate]).lead.is_none());
         assert_eq!(lead("", &[&rate]).rejected.lead, 0, "no lead is not a rejected lead");
+    }
+
+    #[test]
+    fn a_lead_is_drafted_only_for_a_page_that_does_not_state_its_offer_early() {
+        let (page, blocks) = page_of(LOAN);
+        let rate = r(&blocks, "Hypotéka s úrokovou sazbou od 4,59 % ročně.");
+        let with = |offer: &str| {
+            analyze(
+                &page,
+                &blocks,
+                &format!(r#""states_offer_early":{offer},"lead":"Hypotéka od 4,59 % ročně.","lead_blocks":["{rate}"]"#),
+            )
+        };
+        assert!(with("false").lead.is_some());
+        for offer in ["true", "\"not_applicable\""] {
+            let analysis = with(offer);
+            assert!(
+                analysis.lead.is_none(),
+                "{offer}: the page states it already, or needs no lead"
+            );
+            assert_eq!(analysis.rejected.lead, 0, "{offer}: not a rejected (ungrounded) lead");
+        }
     }
 
     #[test]

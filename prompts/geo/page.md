@@ -14,8 +14,9 @@ for length; it is not a page defect.
 <input_format>
 The page is split into numbered blocks: "B12 [Heading > Subheading] text". "(collapsed)" marks a block
 that stays hidden until the visitor expands it (tab, accordion, details). "(site header/footer)" marks
-shared site chrome. <signals> lists crawler measurements. <coverage> says whether all blocks of the
-page are included.
+shared site chrome. A table row reads "Header: cell | Header: cell" (a header row "cell | cell"):
+the page shows it as a real table. <signals> lists crawler measurements. <coverage> says whether all
+blocks of the page are included.
 </input_format>
 
 <what_matters>
@@ -47,7 +48,10 @@ get markup, llms.txt as a ranking factor, hidden text, or claims that are not tr
 4. "vague_references": up to 3 ids of blocks whose text relies on "it", "we", "this product" or
    similar and would not be understood on its own.
 5. "improvements": up to 5 concrete improvements for THIS page, most valuable first — the problem, the
-   ids of the blocks concerned (if any), what to change, and a priority. Only what fits the page type.
+   ids of the blocks concerned (if any), what to change, and a priority. Only what fits the page type,
+   only about its visible content (not structured data, robots.txt or other technical settings, which
+   the crawler checks itself), and only what helps AI engines understand, quote or cite it:
+   no marketing, design or conversion advice.
 6. "lead": an optional draft of 1-3 sentences (max 350 characters) the owner could place at the top to
    state the main answer directly, using ONLY facts from the blocks listed in "lead_blocks". Use "" when
    the page already does this or "states_offer_early" is "not_applicable".

@@ -7506,7 +7506,8 @@ fn geo_routes() -> (Vec<MockRoute>, Vec<MockResponse>) {
             response: answer(serde_json::json!({
                 "page_type": "article",
                 "main_topic": "How to sharpen a garden spade",
-                "states_offer_early": true,
+                // The lead is drafted only for a page that does not state its answer early.
+                "states_offer_early": false,
                 "questions": [{"question": "Which file should I use?", "answered": "partly",
                                "blocks": [article("A sharp spade cuts roots easily. File the edge at a 45 degree angle.")]}],
                 "vague_references": [],
@@ -7694,6 +7695,12 @@ fn ai_geo_end_to_end() {
     assert!(
         readme.contains("robots.proposed.txt was not generated: robots.txt ends with a group without rules"),
         "{readme}"
+    );
+
+    // A noindex page gets no markup of its own, although it was analyzed.
+    assert!(
+        !kit.join("jsonld/page-hidden-breadcrumb.json").exists(),
+        "no breadcrumb for the noindex page"
     );
 
     // The FAQ markup from the page's blocks.

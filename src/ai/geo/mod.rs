@@ -112,6 +112,8 @@ struct Chosen {
     signals_line: String,
     is_homepage: bool,
     existing: ExistingMarkup,
+    /// No `noindex` for Google or Bing and no canonical URL elsewhere: the kit builds markup for it.
+    indexable: bool,
 }
 
 /// The homepage as the site-wide kit markup needs it.
@@ -385,6 +387,8 @@ fn prepare(options: &CoreOptions, status: &Status, now: DateTime<Utc>, crawl_end
             signals.collapsed_share(),
         );
         breadcrumb_levels(&candidate.url, &mut levels);
+        let indexable =
+            !page_controls.google.noindex && !page_controls.bing.noindex && page_controls.canonical_elsewhere.is_none();
         chosen.push(Chosen {
             page: analyzed_page(&candidate.url, &html),
             blocks,
@@ -392,6 +396,7 @@ fn prepare(options: &CoreOptions, status: &Status, now: DateTime<Utc>, crawl_end
             signals_line,
             is_homepage,
             existing,
+            indexable,
         });
     }
 
@@ -586,6 +591,7 @@ pub async fn run(
                     url: &page.page.url,
                     analysis: analyses.get(page.page.url.as_str()).copied(),
                     existing: &page.existing,
+                    indexable: page.indexable,
                 })
                 .collect();
             (

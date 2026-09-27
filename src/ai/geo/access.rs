@@ -15,6 +15,8 @@ use scraper::{Html, Selector};
 
 use crate::ai::blocks::blocks_from_html;
 use crate::ai::geo::keys::{KeyPage, redirect_chain, visits_by_url};
+use crate::ai::geo::signals::main_text_chars;
+use crate::result::basic_stats::percentile;
 use crate::result::status::Status;
 use crate::result::visited_url::VisitedUrl;
 use crate::types::ContentTypeId;
@@ -96,6 +98,9 @@ pub const CHALLENGE_HTML_MARKERS: &[&str] = &["_cf_chl_opt", "checking your brow
 pub const CHALLENGE_MAX_TEXT_CHARS: usize = 1_000;
 /// Title or H1 fragments (lowercase) of "not found" pages; "404" counts as a number of its own.
 pub const SOFT_404_MARKERS: &[&str] = &["not found", "nenalezena", "nebyla nalezena"];
+/// A page is suspected of being a soft 404 only with less text of its own (Main region) than
+/// this: a "not found" page is short whatever its site navigation, a page about 404 errors is not.
+pub const SOFT_404_MAX_TEXT_CHARS: usize = 1_000;
 /// A key page slower than the crawl's p90 is reported only above this many seconds.
 pub const SLOW_SECONDS: f64 = 3.0;
 
@@ -103,14 +108,43 @@ static TITLE_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse("title").un
 static H1_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse("h1").unwrap());
 static NUMBER_404: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b404\b").unwrap());
 
+/// The response time of a visit without the browser rendering that `--browser` adds to a rendered
+/// page (a failed render adds none).
+fn retrieval_time(status: &Status, visit: &VisitedUrl) -> f64 {
+    match status.get_browser_diagnostics(&visit.uq_id) {
+        Some(diagnostics) if diagnostics.render_error.is_none() => {
+            (visit.request_time - diagnostics.render_total_ms as f64 / 1000.0).max(0.0)
+        }
+        _ => visit.request_time,
+    }
+}
+
 /// The access issues of the key pages, in key-page order, and the counts of the other internal
 /// URLs. Challenge and soft-404 checks need the stored bodies of the key pages.
 pub fn observed_access(status: &Status, key: &[KeyPage]) -> (Vec<AccessIssue>, AccessStats) {
     let visited = status.get_visited_urls();
     let by_url = visits_by_url(&visited);
     let by_uq_id: HashMap<&str, &VisitedUrl> = visited.iter().map(|visit| (visit.uq_id.as_str(), visit)).collect();
+    // With --browser a response time includes the rendering, which crawlers without a browser do
+    // not wait for: they are compared by the HTTP time alone.
+    let rendered = visited
+        .iter()
+        .any(|visit| status.get_browser_diagnostics(&visit.uq_id).is_some());
+    let p90 = if rendered {
+        let mut html_times: Vec<f64> = visited
+            .iter()
+            .filter(|visit| visit.content_type == ContentTypeId::Html && visit.status_code == 200)
+            .map(|visit| retrieval_time(status, visit))
+            .collect();
+        if html_times.is_empty() {
+            html_times = visited.iter().map(|visit| retrieval_time(status, visit)).collect();
+        }
+        percentile(&mut html_times, 90)
+    } else {
+        status.get_basic_stats().total_requests_times_p90
+    };
     let mut stats = AccessStats {
-        p90_seconds: (!visited.is_empty()).then(|| status.get_basic_stats().total_requests_times_p90),
+        p90_seconds: (!visited.is_empty()).then_some(p90),
         ..AccessStats::default()
     };
 
@@ -132,14 +166,19 @@ pub fn observed_access(status: &Status, key: &[KeyPage]) -> (Vec<AccessIssue>, A
         {
             issues.push(issue);
         }
+        let seconds = if rendered {
+            retrieval_time(status, visit)
+        } else {
+            visit.request_time
+        };
         if let Some(p90) = stats.p90_seconds
-            && visit.request_time > p90
-            && visit.request_time > SLOW_SECONDS
+            && seconds > p90
+            && seconds > SLOW_SECONDS
         {
             issues.push(AccessIssue {
                 url: visit.url.clone(),
-                kind: AccessKind::Slow(visit.request_time),
-                detail: format!("{:.1} s (p90 of the crawl {:.1} s)", visit.request_time, p90),
+                kind: AccessKind::Slow(seconds),
+                detail: format!("{:.1} s (p90 of the crawl {:.1} s)", seconds, p90),
             });
         }
     }
@@ -228,7 +267,8 @@ fn page_issue(url: &str, body: &str) -> Option<AccessIssue> {
     } else if [&title, &h1].iter().any(|text| {
         let lower = text.to_lowercase();
         SOFT_404_MARKERS.iter().any(|marker| lower.contains(marker)) || NUMBER_404.is_match(&lower)
-    }) {
+    }) && main_text_chars(&blocks_from_html(body)).0 < SOFT_404_MAX_TEXT_CHARS
+    {
         AccessKind::SuspectedSoft404
     } else {
         return None;
@@ -463,6 +503,14 @@ mod tests {
     #[test]
     fn soft_404_pages_are_suspected_by_their_title_or_h1() {
         let mut status = new_status();
+        let article = "<p>Broken links and redirect chains waste crawl budget and frustrate visitors.</p>".repeat(20);
+        let topic =
+            format!("<title>Broken Link Checker</title><main><h1>Redirect and 404 Analysis</h1>{article}</main>");
+        let guide = format!("<title>How to fix a page not found error</title><main><h1>Guide</h1>{article}</main>");
+        let menu = format!(
+            "<title>Page not found</title><nav>{}</nav><main><h1>Oops</h1><p>Sorry.</p></main>",
+            "<a href=\"/x\">A long menu item of the site</a> ".repeat(60)
+        );
         let bodies = [
             ("t", "<title>Page not found | Example</title><h1>Oops</h1>", true),
             ("h", "<title>Example</title><h1>Stránka nenalezena</h1>", true),
@@ -474,6 +522,11 @@ mod tests {
                 "<title>Blog</title><h1>Blog</h1><p>We fixed the 404 page not found error.</p>",
                 false,
             ),
+            // A page about 404 errors has text of its own; a real "not found" page does not,
+            // whatever the size of its site navigation.
+            ("topic", topic.as_str(), false),
+            ("guide", guide.as_str(), false),
+            ("menu", menu.as_str(), true),
         ];
         for (uq_id, body, _) in bodies {
             add(
@@ -502,7 +555,8 @@ mod tests {
                 "https://example.com/t",
                 "https://example.com/h",
                 "https://example.com/n",
-                "https://example.com/code"
+                "https://example.com/code",
+                "https://example.com/menu"
             ]
         );
     }
@@ -562,6 +616,48 @@ mod tests {
         let (issues, stats) = observed_access(&slow_site, &key(&slow_site, &["p0", "p8", "p9"]));
         assert_eq!(stats.p90_seconds, Some(4.0));
         assert_eq!(kinds(&issues), [("https://example.com/p9", &AccessKind::Slow(6.0))]);
+    }
+
+    #[test]
+    fn in_browser_mode_the_rendering_time_is_no_retrieval_time() {
+        use crate::browser::diagnostics::BrowserDiagnostics;
+        let mut status = new_status();
+        // Ten rendered pages: 50 ms over HTTP plus 3–4.5 s in the browser.
+        for i in 0..10 {
+            let attr = if i == 0 { SOURCE_INIT_URL } else { SOURCE_A_HREF };
+            let render = 3.0 + i as f64 * 0.15;
+            let mut visit = page(
+                &format!("p{i}"),
+                "p0",
+                attr,
+                &format!("https://example.com/p{i}"),
+                200,
+                None,
+            );
+            visit.request_time = 0.05 + render;
+            add(&mut status, visit, None);
+            status.add_browser_diagnostics(
+                &format!("p{i}"),
+                BrowserDiagnostics {
+                    render_total_ms: (render * 1000.0) as u64,
+                    ..Default::default()
+                },
+            );
+        }
+        // A failed render keeps the HTTP time alone, which is really slow.
+        let mut failed = page("failed", "p0", SOURCE_A_HREF, "https://example.com/failed", 200, None);
+        failed.request_time = 6.0;
+        add(&mut status, failed, None);
+        status.add_browser_diagnostics(
+            "failed",
+            BrowserDiagnostics {
+                render_error: Some("navigation failed".to_string()),
+                ..Default::default()
+            },
+        );
+        let (issues, stats) = observed_access(&status, &key(&status, &["p0", "p8", "p9", "failed"]));
+        assert_eq!(stats.p90_seconds, Some(0.05), "the p90 of the HTTP times");
+        assert_eq!(kinds(&issues), [("https://example.com/failed", &AccessKind::Slow(6.0))]);
     }
 
     #[test]
