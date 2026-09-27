@@ -81,8 +81,8 @@ const INLINE: &[&str] = &[
 /// templates, `noscript`, SVG, iframes and the `head` are skipped. Every text node is counted
 /// once: text belongs to its innermost block, and a container's text before and after a nested
 /// block becomes blocks of its own. A cell of a data table keeps its whole content (including
-/// nested paragraphs) in its row, but for content the page hides (`hides`), which becomes a block
-/// of its own; a table that contains headings or other tables is a layout table and is read as
+/// nested paragraphs) in its row, but for content the page hides for good (`hides_for_good`),
+/// which becomes a block of its own; a table that contains headings or other tables is a layout table and is read as
 /// ordinary content. The walk is iterative, so deeply nested markup cannot overflow the stack.
 pub fn blocks_from_html(html: &str) -> Vec<Block> {
     let document = Html::parse_document(html);
@@ -145,8 +145,8 @@ struct Frame {
     cell: bool,
     /// A block element inside a data cell: its text is set apart by spaces.
     spaced: bool,
-    /// Content of a data cell that the page hides (a hidden cell, or a hidden element inside one):
-    /// a block of its own, never part of its row.
+    /// Content of a data cell that the page hides for good (a hidden cell, or a hidden element
+    /// inside one): a block of its own, never part of its row.
     aside: bool,
 }
 
@@ -219,7 +219,7 @@ struct Walker {
     hidden: usize,
     /// Open cells of data tables; text inside goes to the current cell.
     cells: usize,
-    /// Open hidden content inside data cells; its text goes to its own block.
+    /// Open content hidden for good inside data cells; its text goes to its own block.
     asides: usize,
     main_headings: Vec<(usize, String)>,
     chrome_headings: Vec<(usize, String)>,
@@ -237,12 +237,12 @@ impl Walker {
             return;
         }
         if self.cells > 0 {
-            // Inside a data cell everything stays in the cell's text, but for what the page hides.
-            if hides(element) {
+            // Inside a data cell everything stays in the cell's text, but for what no visitor sees.
+            if hides_for_good(element) {
                 if !INLINE.contains(&tag) {
                     self.cell_text(" ");
                 }
-                self.aside(element, &mut frame);
+                self.aside(&mut frame);
             } else if tag == "br" || !INLINE.contains(&tag) {
                 self.cell_text(" ");
                 frame.spaced = true;
@@ -294,8 +294,8 @@ impl Walker {
                         self.cells += 1;
                         frame.cell = true;
                         // A hidden cell keeps its column; its text becomes a block of its own.
-                        if hides(element) {
-                            self.aside(element, &mut frame);
+                        if hides_for_good(element) {
+                            self.aside(&mut frame);
                         }
                         self.frames.push(frame);
                         return;
@@ -455,13 +455,14 @@ impl Walker {
         }
     }
 
-    /// Content of a data cell that the page hides (`hides`): its text goes to a collapsed block of
-    /// its own, as a hidden inline element's does outside tables, instead of into its row.
-    fn aside(&mut self, element: ElementRef, frame: &mut Frame) {
+    /// Content of a data cell that the page hides for good (`hides_for_good`): its text goes to a
+    /// hidden block of its own, as a hidden inline element's does outside tables, instead of into
+    /// its row. Content a visitor can see or open (`aria-hidden`, a collapse) stays in the row.
+    fn aside(&mut self, frame: &mut Frame) {
         frame.aside = true;
         frame.buffer = true;
         frame.collapsed = true;
-        frame.hidden = hides_for_good(element);
+        frame.hidden = true;
         self.buffers.push(Buffer {
             kind: BlockKind::Other,
             level: None,
@@ -469,7 +470,7 @@ impl Walker {
         });
         self.asides += 1;
         self.collapsed += 1;
-        self.hidden += usize::from(frame.hidden);
+        self.hidden += 1;
     }
 
     /// A row or a row group of a data table: what it hides, it hides for its rows.
@@ -1089,6 +1090,7 @@ mod tests {
               <tr><td>Pro <b style="display:none">internal <i>code</i></b></td><td>40 EUR</td></tr>
               <tr><td rowspan="2" style="visibility: collapse">Spanned</td><td>50 EUR</td></tr>
               <tr><td>60 EUR</td></tr>
+              <tr><td>Team</td><td><span aria-hidden="true">✓</span> <span class="collapse">70</span> EUR</td></tr>
             </table>
             <table><tbody style="display:none"><tr><td>Whole body</td></tr></tbody></table>
             <table><thead hidden><tr><th>Secret column</th></tr></thead><tr><td>Shown row</td></tr></table>
@@ -1103,6 +1105,7 @@ mod tests {
             "Plan: Pro | Price: 40 EUR",
             "Price: 50 EUR",
             "Price: 60 EUR",
+            "Plan: Team | Price: ✓ 70 EUR",
             "Shown row",
             "2 EUR",
         ] {
