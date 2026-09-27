@@ -21,7 +21,7 @@ use serde_json::{Map, Value};
 
 use crate::ai::blocks::{Block, BlockKind, Region, hidden_for_good, is_inline, render_block, style_hides};
 use crate::ai::geo::controls::{EnginePolicy, in_site_chrome};
-use crate::ai::geo::jsonld::{ExistingMarkup, without_author_label};
+use crate::ai::geo::jsonld::{ExistingMarkup, byline_name, person_name};
 use crate::ai::geo::prompts;
 use crate::ai::grounding::{date_mentions, fact_signals, find_token_bounded, numbers_in};
 use crate::ai::normalize::{normalize_json_response, repair_json_with_status};
@@ -65,7 +65,7 @@ static TITLE_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse("title").un
 static HTML_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse("html[lang]").unwrap());
 static H1_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse("h1").unwrap());
 static META_SELECTOR: Lazy<Selector> = Lazy::new(|| Selector::parse("meta[name][content]").unwrap());
-/// The candidates of `authorship_marks` (a class is checked there).
+/// The candidates of `author_names` (a class is checked there).
 static AUTHOR_SELECTOR: Lazy<Selector> = Lazy::new(|| {
     Selector::parse(
         "[rel~=author], [itemprop~=author], a[href*=\"/author/\"], a[href*=\"/authors/\"], \
@@ -88,7 +88,7 @@ pub struct AnalyzedPage {
     /// The page's own `<meta name="description">`, whitespace collapsed (at most
     /// `MAX_DESCRIPTION_CHARS` characters); empty without one.
     pub description: String,
-    /// What the page marks as its author (`authorship_marks`): the evidence a byline needs.
+    /// The names the page marks as its author's (`author_names`): the evidence a byline needs.
     #[serde(skip_serializing)]
     pub authors: Vec<String>,
 }
@@ -360,8 +360,10 @@ pub struct FaqPair {
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Byline {
-    /// A byline block the page marks as its author (a label or markup, see `verify_byline`).
+    /// A byline block that names an author the page confirms (see `verify_byline`).
     pub author: Option<Block>,
+    /// The confirmed author's name in `author`: what the kit publishes.
+    pub author_name: Option<String>,
     /// A block the model named as the author that passes every other check but that nothing on
     /// the page marks as the author: shown for review, never used as markup.
     pub unconfirmed_author: Option<Block>,
@@ -534,18 +536,18 @@ pub fn analyzed_page(url: &str, html: &str) -> AnalyzedPage {
             .and_then(|meta| meta.value().attr("content"))
             .map(|content| clip(&collapse(content.to_string()), MAX_DESCRIPTION_CHARS))
             .unwrap_or_default(),
-        authors: authorship_marks(&document),
+        authors: author_names(&document),
     }
 }
 
-/// The texts a page marks as its author, whitespace collapsed, at most `MAX_AUTHOR_CHARS`
-/// characters each (a longer one is an author box or a whole post, no byline): `<meta
-/// name="author">`, and the shown text of the page's own content (not the site chrome, nothing
-/// hidden for good) in `rel=author`, `itemprop=author`, a link to an author page (`/author/`,
-/// `/autor/`, …), or an element whose class names an author or a byline (`author`, `byline`,
-/// `autor`, case-insensitive).
-fn authorship_marks(document: &Html) -> Vec<String> {
-    let collapse = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+/// The names a page marks as its author's, each a person's name (`jsonld::person_name`), from
+/// nodes that hold a name and nothing else: `<meta name="author">`, and in the page's own shown
+/// content (not the site chrome, nothing hidden for good) a `rel=author` link, a link to an author
+/// page (`/author/`, `/autor/`, …), an `itemprop=author` node (its `itemprop=name` when it has
+/// one), or an element whose class names an author or a byline (`author`, `byline`, `autor`) —
+/// each only when one text node holds all its text (`single_run`), so a box with a name and a
+/// role names no one.
+fn author_names(document: &Html) -> Vec<String> {
     let meta = document
         .select(&META_SELECTOR)
         .filter(|meta| {
@@ -553,38 +555,55 @@ fn authorship_marks(document: &Html) -> Vec<String> {
                 .attr("name")
                 .is_some_and(|name| name.trim().eq_ignore_ascii_case("author"))
         })
-        .filter_map(|meta| meta.value().attr("content").map(collapse));
+        .filter_map(|meta| meta.value().attr("content").map(str::to_string));
+    let names_author = |value: &str| {
+        value
+            .split_whitespace()
+            .any(|value| value.eq_ignore_ascii_case("author"))
+    };
     let marked = document
         .select(&AUTHOR_SELECTOR)
-        .filter(|element| {
+        .filter(|element| !in_site_chrome(*element) && !hidden_for_good(*element))
+        .flat_map(|element| {
             let el = element.value();
-            let names_author = |value: &str| {
-                value
-                    .split_whitespace()
-                    .any(|value| value.eq_ignore_ascii_case("author"))
-            };
             let class = el.attr("class").unwrap_or_default().to_lowercase();
-            el.attr("rel").is_some_and(names_author)
-                || el.attr("itemprop").is_some_and(names_author)
-                || (el.name() == "a"
-                    && el.attr("href").is_some_and(|href| {
+            let author_link = el.name() == "a"
+                && (el.attr("rel").is_some_and(names_author)
+                    || el.attr("href").is_some_and(|href| {
                         ["/author/", "/authors/", "/autor/", "/autori/"]
                             .iter()
                             .any(|path| href.contains(path))
-                    }))
+                    }));
+            let nodes: Vec<ElementRef> = if el.attr("itemprop").is_some_and(names_author) {
+                let names: Vec<ElementRef> = element
+                    .descendants()
+                    .filter_map(ElementRef::wrap)
+                    .filter(|child| {
+                        child
+                            .value()
+                            .attr("itemprop")
+                            .is_some_and(|prop| prop.split_whitespace().any(|prop| prop.eq_ignore_ascii_case("name")))
+                    })
+                    .collect();
+                if names.is_empty() { vec![element] } else { names }
+            } else if author_link
+                || el.attr("rel").is_some_and(names_author)
                 || ["author", "byline", "autor"].iter().any(|name| class.contains(name))
-        })
-        .filter(|element| !in_site_chrome(*element) && !hidden_for_good(*element))
-        .map(|element| collapse(&shown_text(element)));
-    meta.chain(marked)
-        .filter(|text| !text.is_empty() && text.chars().count() <= MAX_AUTHOR_CHARS)
-        .collect()
+            {
+                vec![element]
+            } else {
+                Vec::new()
+            };
+            nodes.into_iter().filter_map(single_run)
+        });
+    meta.chain(marked).filter_map(|text| person_name(&text)).collect()
 }
 
-/// The text of an element as its blocks show it: without the text of scripts, styles, SVG and
-/// other non-text elements, and of hidden inline elements (a block of their own), with a `<br>`
-/// and the edges of a nested block element (`<div>`, `<p>`, …) as a space. The walk is iterative.
-pub(crate) fn shown_text(element: ElementRef) -> String {
+/// Walks the text of an element as its blocks show it: `visit(Some(text))` for each text node,
+/// `visit(None)` where a `<br>` or the edge of a nested block element (`<div>`, `<p>`, …) sets
+/// text apart. Scripts, styles, SVG and other non-text elements are left out, and so are hidden
+/// inline elements (a block of their own). The walk is iterative.
+fn walk_shown(element: ElementRef, mut visit: impl FnMut(Option<&str>)) {
     const NOT_TEXT: &[&str] = &["script", "style", "template", "noscript", "svg", "iframe"];
     let hidden = |node: ego_tree::NodeRef<Node>| {
         node.value().as_element().is_some_and(|element| {
@@ -601,7 +620,6 @@ pub(crate) fn shown_text(element: ElementRef) -> String {
             .as_element()
             .is_some_and(|child| child.name() == "br" || !is_inline(child.name()))
     };
-    let mut text = String::new();
     // The depth inside a hidden element whose text is left out.
     let mut skipped = 0usize;
     for edge in element.traverse() {
@@ -612,8 +630,8 @@ pub(crate) fn shown_text(element: ElementRef) -> String {
                     continue;
                 }
                 match node.value() {
-                    Node::Text(part) => text.push_str(part),
-                    _ if sets_apart(node) => text.push(' '),
+                    Node::Text(part) => visit(Some(part)),
+                    _ if sets_apart(node) => visit(None),
                     _ => {}
                 }
             }
@@ -621,13 +639,33 @@ pub(crate) fn shown_text(element: ElementRef) -> String {
                 if skipped > 0 {
                     skipped -= usize::from(node.value().is_element());
                 } else if sets_apart(node) {
-                    text.push(' ');
+                    visit(None);
                 }
             }
             _ => {}
         }
     }
+}
+
+/// The text of an element as its blocks show it (`walk_shown`), with a `<br>` and the edges of a
+/// nested block element as a space.
+pub(crate) fn shown_text(element: ElementRef) -> String {
+    let mut text = String::new();
+    walk_shown(element, |part| text.push_str(part.unwrap_or(" ")));
     text
+}
+
+/// The shown text of an element when a single text node holds all of it (`<a>Jane Smith</a>`,
+/// `<p><span>Jane Smith</span></p>`); `None` for text split over several nodes (`Jane Smith
+/// <span>Editor</span>`) or none.
+fn single_run(element: ElementRef) -> Option<String> {
+    let mut runs: Vec<String> = Vec::new();
+    walk_shown(element, |part| {
+        if let Some(part) = part.map(str::trim).filter(|part| !part.is_empty()) {
+            runs.push(part.to_string());
+        }
+    });
+    (runs.len() == 1).then(|| runs.remove(0))
 }
 
 /// Whether a text is a question: it ends with a question mark, before any closing quotes or
@@ -1379,10 +1417,10 @@ fn section_path(heading: &Block, blocks: &[Block]) -> Option<Vec<String>> {
 /// block (exactly one date, labeled as a publication or a change but not both, see `date_role`) are
 /// kept when they are among the first `BYLINE_WINDOW` blocks of the page's own content after the H1
 /// and the page shows them (not hidden for good). Capital letters do not make a name: the author
-/// block is the author only when the page says so — it starts with an author label (`By`,
-/// `Autor:`, see `jsonld::without_author_label`), or it and one of the page's `authors` (its
-/// authorship markup) contain each other on token boundaries. Otherwise it is kept as an
-/// unconfirmed author, for review only.
+/// block names the author only when it holds, on token boundaries, a name the page marks as its
+/// author's (`authors`, the longest), or states one after a byline label (`jsonld::byline_name`:
+/// `By Jane Smith, Editorial Director`); that name, never the whole block, is the author's name.
+/// Otherwise the block is kept as an unconfirmed author, for review only.
 fn verify_byline(
     raw: &RawByline,
     shown: &Shown,
@@ -1423,13 +1461,18 @@ fn verify_byline(
             && block.text.chars().count() <= MAX_AUTHOR_CHARS
             && (2..=6).contains(&words)
         {
-            let marked = authors.iter().any(|author| {
-                find_token_bounded(&block.text, author).is_some() || find_token_bounded(author, &block.text).is_some()
-            });
-            if without_author_label(&block.text).is_some() || marked {
-                byline.author = Some(block.clone());
-            } else {
-                byline.unconfirmed_author = Some(block.clone());
+            let name = authors
+                .iter()
+                .filter(|name| find_token_bounded(&block.text, name).is_some())
+                .max_by_key(|name| name.chars().count())
+                .cloned()
+                .or_else(|| byline_name(&block.text));
+            match name {
+                Some(name) => {
+                    byline.author = Some(block.clone());
+                    byline.author_name = Some(name);
+                }
+                None => byline.unconfirmed_author = Some(block.clone()),
             }
         } else {
             rejected.byline += 1;
@@ -2127,25 +2170,69 @@ mod tests {
             )
             .byline
         };
-        for (head, byline_html, author) in [
-            ("", "<p>By Jane Smith</p>", "By Jane Smith"),
-            ("", "<p>Autor: Jan Novák</p>", "Autor: Jan Novák"),
+        // (the <head>, the byline, the author block the model cited, the name the kit publishes)
+        for (head, byline_html, author, name) in [
+            ("", "<p>By Jane Smith</p>", "By Jane Smith", "Jane Smith"),
+            ("", "<p>Autor: Jan Novák</p>", "Autor: Jan Novák", "Jan Novák"),
+            (
+                "",
+                "<p>By Jane Smith, Editorial Director</p>",
+                "By Jane Smith, Editorial Director",
+                "Jane Smith",
+            ),
             (
                 "",
                 "<p><a rel=\"author\" href=\"/team/jane\">Jane Smith</a></p>",
                 "Jane Smith",
+                "Jane Smith",
             ),
-            ("", "<p><span itemprop=\"author\">Jane Smith</span></p>", "Jane Smith"),
-            ("", "<div class=\"post-byline\"><p>Jane Smith</p></div>", "Jane Smith"),
-            ("", "<p class=\"entry-Author\">Jane Smith</p>", "Jane Smith"),
+            (
+                "",
+                "<p>Words by <a rel=\"author\" href=\"/author/jane\">Jane Smith</a></p>",
+                "Words by Jane Smith",
+                "Jane Smith",
+            ),
+            (
+                "",
+                "<p><span itemprop=\"author\">Jane Smith</span></p>",
+                "Jane Smith",
+                "Jane Smith",
+            ),
+            (
+                "",
+                "<p itemprop=\"author\" itemscope><span itemprop=\"name\">Jane Smith</span>, \
+                 <span itemprop=\"jobTitle\">Editorial Director</span></p>",
+                "Jane Smith, Editorial Director",
+                "Jane Smith",
+            ),
+            (
+                "",
+                "<div class=\"post-byline\"><p>Jane Smith</p></div>",
+                "Jane Smith",
+                "Jane Smith",
+            ),
+            (
+                "",
+                "<p class=\"entry-Author\">Jane Smith</p>",
+                "Jane Smith",
+                "Jane Smith",
+            ),
+            (
+                "",
+                "<p><span class=\"author-name\">Jane Smith</span> · Editorial Director</p>",
+                "Jane Smith · Editorial Director",
+                "Jane Smith",
+            ),
             (
                 "",
                 "<p><a href=\"/author/jane-smith/\">Jane Smith</a></p>",
+                "Jane Smith",
                 "Jane Smith",
             ),
             (
                 "<meta name=\"author\" content=\"Jane Smith\">",
                 "<p>Jane Smith</p>",
+                "Jane Smith",
                 "Jane Smith",
             ),
         ] {
@@ -2155,6 +2242,7 @@ mod tests {
                 Some(author.to_string()),
                 "{byline_html}"
             );
+            assert_eq!(found.author_name.as_deref(), Some(name), "{byline_html}");
         }
         for (head, chrome, byline_html, author) in [
             (
@@ -2189,6 +2277,32 @@ mod tests {
                 "<div class=\"author-box\"><p>Essential Safety Precautions</p><p>Jane Smith writes about garden \
                  tools for Acme and has sharpened spades, hoes and axes for twenty years in her workshop.</p></div>",
                 "Essential Safety Precautions",
+            ),
+            // A short author box or byline with a name and a role: only a node that holds
+            // nothing but the name names the author.
+            (
+                "",
+                "",
+                "<div class=\"author-box\"><p>Jane Smith</p> <p>Editorial Director</p></div>",
+                "Editorial Director",
+            ),
+            (
+                "",
+                "",
+                "<div class=\"author-box\"><p>Jane Smith</p> <p>Editorial Director</p></div>",
+                "Jane Smith",
+            ),
+            (
+                "",
+                "",
+                "<div class=\"post-author\"><p>Jane Smith</p> <p>Essential Safety Precautions</p></div>",
+                "Essential Safety Precautions",
+            ),
+            (
+                "",
+                "",
+                "<p class=\"author\">Jane Smith <span>Editorial Director</span></p>",
+                "Jane Smith Editorial Director",
             ),
         ] {
             let found = byline(head, chrome, byline_html, author);

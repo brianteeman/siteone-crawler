@@ -46,22 +46,26 @@ const KEY_PROPERTIES: &[&str] = &[
     "sku",
 ];
 
-/// Leading labels of a byline before the author's name.
+/// Leading labels of a byline before the author's name (a longer label before its start).
 const AUTHOR_LABELS: &[&str] = &[
     "written by",
     "posted by",
     "by",
     "author",
-    "autor",
+    "autor článku",
+    "autorka článku",
     "autorka",
-    "napsal",
+    "autor",
     "napsala",
+    "napsal",
 ];
 
-/// Separators after which a byline continues with a date or a reading time.
-const BYLINE_SEPARATORS: &[&str] = &[",", "|", "·", "•", " – ", " — ", " - "];
+/// Where the name after a byline label ends: the delimiters before a role, a date or a reading
+/// time (a digit ends it too, and the words `on` and `dne`).
+const BYLINE_DELIMITERS: &[&str] = &[",", "|", "·", "•", ";", "(", "/", " – ", " — ", " - "];
+const BYLINE_DATE_WORDS: &[&str] = &["on", "dne"];
 
-/// A cleaned byline with more words than this is no bare name.
+/// A person's name has at most this many words.
 const MAX_AUTHOR_WORDS: usize = 5;
 
 /// Separators of a title's site suffix (`Pricing | Example`).
@@ -799,13 +803,13 @@ pub fn faq(page_url: &str, pairs: &[(Block, Vec<Block>)]) -> Option<Value> {
     })
 }
 
-/// An Article (a BlogPosting for a blog) with the H1 as its headline, the author of a verified
-/// byline block and its date: `datePublished`, or `dateModified` for a date the page labels as the
-/// last change.
+/// An Article (a BlogPosting for a blog) with the H1 as its headline, the verified author's name
+/// (`Byline::author_name`) and the byline's date: `datePublished`, or `dateModified` for a date the
+/// page labels as the last change.
 pub fn article(
     page_url: &str,
     h1: &Block,
-    author: Option<&Block>,
+    author: Option<&str>,
     date: Option<(NaiveDate, DateRole)>,
     is_blog: bool,
 ) -> Value {
@@ -817,7 +821,7 @@ pub fn article(
     );
     entity.insert("@id".to_string(), json!(format!("{page_url}#article")));
     entity.insert("headline".to_string(), json!(h1.text.trim()));
-    if let Some(name) = author.and_then(|block| author_name(&block.text)) {
+    if let Some(name) = author {
         entity.insert("author".to_string(), json!({"@type": "Person", "name": name}));
     }
     if let Some((date, role)) = date {
@@ -831,26 +835,44 @@ pub fn article(
     Value::Object(entity)
 }
 
-/// The author's name in a byline block: without a leading label (`By`, `Autor:`, `Napsala`, …)
-/// and without a date or reading time after a separator (`Jan Novák, 25. 9. 2026`). `None` when
-/// what is left is no bare name — it has a digit or a colon, more than `MAX_AUTHOR_WORDS` words
-/// (`Posted on September 25, 2026 by …`) or is not written like a name (`is_person_name`): a
-/// missing author is better than a wrong one.
-fn author_name(text: &str) -> Option<String> {
-    let name = text.trim();
-    let name = without_author_label(name).unwrap_or(name);
-    let cut = BYLINE_SEPARATORS
+/// The author's name a byline states after its leading label (`By`, `Autor článku:`, `Napsala`,
+/// …): the text up to the first delimiter (`BYLINE_DELIMITERS`, a digit, or the word `on` or
+/// `dne`), when it is a person's name (`person_name`) — `By Jane Smith, Editorial Director` names
+/// Jane Smith. `None` without a label: a missing author is better than a wrong one.
+pub(crate) fn byline_name(text: &str) -> Option<String> {
+    let rest = without_author_label(text)?;
+    // Where the first word `on` or `dne` starts.
+    let mut date_word = None;
+    let mut start = None;
+    for (at, c) in rest.char_indices().chain(std::iter::once((rest.len(), ' '))) {
+        if !c.is_whitespace() {
+            start.get_or_insert(at);
+        } else if let Some(from) = start.take()
+            && BYLINE_DATE_WORDS
+                .iter()
+                .any(|word| rest[from..at].eq_ignore_ascii_case(word))
+        {
+            date_word = Some(from);
+            break;
+        }
+    }
+    let end = BYLINE_DELIMITERS
         .iter()
-        .filter_map(|separator| name.find(separator))
-        .filter(|at| {
-            name.get(*at..)
-                .is_some_and(|rest| rest.chars().any(|c| c.is_ascii_digit()))
-        })
-        .min();
-    let name = cut.and_then(|at| name.get(..at)).unwrap_or(name).trim();
+        .filter_map(|delimiter| rest.find(delimiter))
+        .chain(rest.find(|c: char| c.is_ascii_digit()))
+        .chain(date_word)
+        .min()
+        .unwrap_or(rest.len());
+    person_name(&rest[..end])
+}
+
+/// The text, whitespace collapsed, when it is a bare person's name: 1–`MAX_AUTHOR_WORDS` words,
+/// no digit or colon, written like a name (`is_person_name`).
+pub(crate) fn person_name(text: &str) -> Option<String> {
+    let name = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let words = name.split_whitespace().count();
     let bare = (1..=MAX_AUTHOR_WORDS).contains(&words) && !name.chars().any(|c| c.is_ascii_digit() || c == ':');
-    (bare && is_person_name(name)).then(|| name.to_string())
+    (bare && is_person_name(&name)).then_some(name)
 }
 
 /// The rest of a byline after its leading author label (`By`, `Autor:`, `Napsala`, …, followed
@@ -1535,10 +1557,9 @@ mod tests {
     fn article_uses_the_h1_and_the_verified_byline() {
         let url = "https://example.com/blog/hypoteky";
         let h1 = block(0, BlockKind::Heading, "Jak vybrat hypotéku");
-        let author = block(1, BlockKind::Paragraph, "Autor: Jan Novák");
         let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 25).map(|date| (date, DateRole::Published));
         assert_eq!(
-            article(url, &h1, Some(&author), date, false),
+            article(url, &h1, Some("Jan Novák"), date, false),
             json!({
                 "@context": "https://schema.org",
                 "@type": "Article",
@@ -1563,40 +1584,61 @@ mod tests {
         let entity = article(url, &h1, None, changed, false);
         assert_eq!(entity["dateModified"], "2026-09-25");
         assert!(entity.get("datePublished").is_none(), "{entity}");
-        // A byline block may carry the date or the reading time after the name.
+    }
+
+    #[test]
+    fn a_byline_label_names_the_author_up_to_the_first_delimiter() {
         for (text, name) in [
-            ("Jan Novák, 25. 9. 2026", "Jan Novák"),
             ("By Jane Doe | 5 min read", "Jane Doe"),
             ("Written by: Jane Doe", "Jane Doe"),
             ("Napsala Eva Malá · 25. září 2026", "Eva Malá"),
-            ("Jane Doe-Smith", "Jane Doe-Smith"),
-            ("Ludwig van Beethoven", "Ludwig van Beethoven"),
-            ("J. R. R. Tolkien", "J. R. R. Tolkien"),
             ("Autorka: Věra O'Neill", "Věra O'Neill"),
+            ("By Jane Smith, Editorial Director", "Jane Smith"),
+            ("By Jan Novák on September 25, 2026", "Jan Novák"),
+            ("Napsal Jan Novák dne 1. 9. 2026", "Jan Novák"),
+            ("Autor článku: Jan Novák", "Jan Novák"),
+            ("By Jane Doe 25 September 2026", "Jane Doe"),
+            ("By Jane Doe (Editor)", "Jane Doe"),
+            ("By Ludwig van Beethoven – composer", "Ludwig van Beethoven"),
         ] {
-            let author = block(1, BlockKind::Paragraph, text);
-            assert_eq!(
-                article(url, &h1, Some(&author), None, false)["author"]["name"],
-                name,
-                "{text}"
-            );
+            assert_eq!(byline_name(text).as_deref(), Some(name), "{text}");
         }
-        // A byline the rules cannot reduce to a bare name leaves the author out rather than
-        // publishing a wrong one.
+        // Without a label, or when what the label introduces is no bare name, no author is named:
+        // a missing author is better than a wrong one.
         for text in [
+            "Jan Novák, 25. 9. 2026",
+            "Jane Smith",
             "Posted on September 25, 2026 by Jan Novák",
-            "By Jan Novák on September 25, 2026",
-            "Autor článku: Jan Novák",
             "25. 9. 2026 | Jan Novák",
-            "Jan Novák and the whole editorial team of Example",
-            // No person's name: words a name would capitalize.
-            "Wear gloves",
             "By the editorial team",
-            "Safety first, always",
+            "By Jan Novák and the whole editorial team of Example",
+            "Essential Safety Precautions",
         ] {
-            let author = block(1, BlockKind::Paragraph, text);
-            let entity = article(url, &h1, Some(&author), None, false);
-            assert!(entity.get("author").is_none(), "{text} gave {entity}");
+            assert_eq!(byline_name(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn person_names_are_bare_words_written_like_a_name() {
+        for name in [
+            "Jane Doe-Smith",
+            "Ludwig van Beethoven",
+            "J. R. R. Tolkien",
+            "Věra O'Neill",
+            "  Jan   Novák ",
+        ] {
+            assert!(person_name(name).is_some(), "{name}");
+        }
+        assert_eq!(person_name("  Jan   Novák ").as_deref(), Some("Jan Novák"));
+        for text in [
+            "Wear gloves",
+            "the editorial team",
+            "Jane Smith 2",
+            "Autor: Jan",
+            "",
+            "A B C D E F",
+        ] {
+            assert_eq!(person_name(text), None, "{text:?}");
         }
     }
 

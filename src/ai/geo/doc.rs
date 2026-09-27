@@ -1317,7 +1317,7 @@ impl GeoDoc {
             if page.page_type == crate::ai::geo::analyze::PageType::Article {
                 let missing = text(locale, "label.byline_missing").to_string();
                 let author = match (&page.byline.author, &page.byline.unconfirmed_author) {
-                    (Some(author), _) => author.text.clone(),
+                    (Some(author), _) => page.byline.author_name.clone().unwrap_or_else(|| author.text.clone()),
                     // Named by the model, but not marked as the author by the page: review only.
                     (None, Some(named)) => fill(
                         text(locale, "label.byline_unconfirmed"),
@@ -2062,6 +2062,7 @@ fn page_json(page: &PageAnalysis) -> Value {
         })).collect::<Vec<_>>(),
         "byline": {
             "author": page.byline.author.as_ref().map(block_json),
+            "authorName": page.byline.author_name,
             "unconfirmedAuthor": page.byline.unconfirmed_author.as_ref().map(block_json),
             "dateBlock": page.byline.date_block.as_ref().map(block_json),
             "date": page.byline.date.map(|date| date.format("%Y-%m-%d").to_string()),

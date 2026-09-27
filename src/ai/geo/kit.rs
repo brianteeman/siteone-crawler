@@ -553,7 +553,7 @@ pub fn markup_entries(
             });
             let byline = &analysis.byline;
             let date = byline.date.zip(byline.date_role);
-            let json = jsonld::article(page.url, h1, byline.author.as_ref(), date, is_blog);
+            let json = jsonld::article(page.url, h1, byline.author_name.as_deref(), date, is_blog);
             let mut evidence = vec![block_evidence(h1)];
             if json.get("author").is_some()
                 && let Some(author) = &byline.author
@@ -1733,6 +1733,18 @@ mod tests {
         for (byline, author) in [
             ("<p>Essential Safety Precautions</p>", "Essential Safety Precautions"),
             ("<p>Jane Smith</p>", "Jane Smith"),
+            (
+                "<div class=\"author-box\"><p>Jane Smith</p> <p>Editorial Director</p></div>",
+                "Editorial Director",
+            ),
+            (
+                "<div class=\"author-box\"><p>Jane Smith</p> <p>Editorial Director</p></div>",
+                "Jane Smith",
+            ),
+            (
+                "<p class=\"author\">Jane Smith <span>Editorial Director</span></p>",
+                "Jane Smith Editorial Director",
+            ),
         ] {
             let article = entry(byline, author);
             assert_eq!(article.json.get("author"), None, "{byline}");
@@ -1748,6 +1760,14 @@ mod tests {
             (
                 "<p><a rel=\"author\" href=\"/team/jane\">Jane Smith</a></p>",
                 "Jane Smith",
+            ),
+            (
+                "<p>Words by <a rel=\"author\" href=\"/author/jane\">Jane Smith</a></p>",
+                "Words by Jane Smith",
+            ),
+            (
+                "<p>By Jane Smith, Editorial Director</p>",
+                "By Jane Smith, Editorial Director",
             ),
         ] {
             assert_eq!(entry(byline, author).json["author"]["name"], "Jane Smith", "{byline}");
