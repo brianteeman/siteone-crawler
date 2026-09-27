@@ -40,6 +40,9 @@ pub enum AccessKind {
     ServerError(i32),
     /// A failed request: connection error, timeout, reset or send error (negative codes).
     Transport(i32),
+    /// Any other 4xx: the homepage (or where its redirects lead) not found or gone, or a key page
+    /// refused as a bad request, unavailable for legal reasons, …
+    ClientError(i32),
     /// More than 2 redirects in a row.
     RedirectChain(usize),
     RedirectLoop,
@@ -59,6 +62,7 @@ impl AccessKind {
             AccessKind::RateLimited => "rate_limited",
             AccessKind::ServerError(_) => "server_error",
             AccessKind::Transport(_) => "transport",
+            AccessKind::ClientError(_) => "client_error",
             AccessKind::RedirectChain(_) => "redirect_chain",
             AccessKind::RedirectLoop => "redirect_loop",
             AccessKind::SuspectedChallenge => "suspected_challenge",
@@ -189,7 +193,10 @@ pub fn observed_access(status: &Status, key: &[KeyPage]) -> (Vec<AccessIssue>, A
         .filter(|visit| !visit.is_external && !key_ids.contains(visit.uq_id.as_str()))
     {
         stats.other_urls += 1;
-        if let Some(issue) = response_issue(visit, &by_url) {
+        // A broken link (4xx) is no access issue of a page that exists.
+        if let Some(issue) = response_issue(visit, &by_url)
+            && !matches!(issue.kind, AccessKind::ClientError(_))
+        {
             *stats.other_issues.entry(issue.kind.key()).or_insert(0) += 1;
         }
     }
@@ -202,6 +209,8 @@ fn response_issue(visit: &VisitedUrl, by_url: &HashMap<String, &VisitedUrl>) -> 
     let (kind, detail) = match code {
         401 | 403 => (AccessKind::Denied(code), format!("HTTP {}", code)),
         429 => (AccessKind::RateLimited, format!("HTTP {}", code)),
+        // Only the homepage keeps a 404 or 410 among the key pages (see `key_pages`).
+        400..=499 => (AccessKind::ClientError(code), format!("HTTP {}", code)),
         500..=599 => (AccessKind::ServerError(code), format!("HTTP {}", code)),
         -4..=-1 => (
             AccessKind::Transport(code),
@@ -336,6 +345,8 @@ mod tests {
             ("send", -4),
             ("skipped", -6),
             ("u404", 404),
+            ("u400", 400),
+            ("u451", 451),
         ];
         for (uq_id, code) in cases {
             add(
@@ -367,10 +378,57 @@ mod tests {
                 ("https://example.com/timeout", &AccessKind::Transport(-2)),
                 ("https://example.com/reset", &AccessKind::Transport(-3)),
                 ("https://example.com/send", &AccessKind::Transport(-4)),
+                ("https://example.com/u404", &AccessKind::ClientError(404)),
+                ("https://example.com/u400", &AccessKind::ClientError(400)),
+                ("https://example.com/u451", &AccessKind::ClientError(451)),
             ]
         );
         assert!(issues[6].detail.contains("TIMEOUT"), "{}", issues[6].detail);
         assert_eq!(stats.key_pages, all.len());
+    }
+
+    #[test]
+    fn a_homepage_that_is_not_found_is_an_access_issue() {
+        // The initial URL answers 404.
+        let mut status = new_status();
+        add(
+            &mut status,
+            page("home", "", SOURCE_INIT_URL, "https://example.com/", 404, None),
+            Some("<title>Page not found</title><h1>Not found</h1>"),
+        );
+        let key = crate::ai::geo::keys::key_pages(&status, &[], &[]);
+        let (issues, _) = observed_access(&status, &key);
+        assert_eq!(
+            kinds(&issues),
+            [("https://example.com/", &AccessKind::ClientError(404))]
+        );
+        assert_eq!(issues[0].detail, "HTTP 404");
+
+        // The initial URL redirects to a page that is gone.
+        let mut status = new_status();
+        add(
+            &mut status,
+            page(
+                "init",
+                "",
+                SOURCE_INIT_URL,
+                "https://example.com/",
+                301,
+                Some("https://example.com/en/"),
+            ),
+            None,
+        );
+        add(
+            &mut status,
+            page("home", "init", SOURCE_REDIRECT, "https://example.com/en/", 410, None),
+            None,
+        );
+        let key = crate::ai::geo::keys::key_pages(&status, &[], &[]);
+        let (issues, _) = observed_access(&status, &key);
+        assert_eq!(
+            kinds(&issues),
+            [("https://example.com/en/", &AccessKind::ClientError(410))]
+        );
     }
 
     #[test]
@@ -690,6 +748,12 @@ mod tests {
             page("deep2", "home", SOURCE_A_HREF, "https://example.com/deep2", -2, None),
             None,
         );
+        // A broken link is no access issue.
+        add(
+            &mut status,
+            page("gone", "deep", SOURCE_A_HREF, "https://example.com/gone", 404, None),
+            None,
+        );
         let mut external = page("ext", "home", SOURCE_A_HREF, "https://other.example/", 500, None);
         external.is_external = true;
         add(&mut status, external, None);
@@ -697,7 +761,7 @@ mod tests {
         let (issues, stats) = observed_access(&status, &key(&status, &["home"]));
         assert!(issues.is_empty(), "{issues:?}");
         assert_eq!(stats.key_pages, 1);
-        assert_eq!(stats.other_urls, 3, "external URLs are not the site's");
+        assert_eq!(stats.other_urls, 4, "external URLs are not the site's");
         assert_eq!(
             stats.other_issues,
             BTreeMap::from([("denied", 1), ("server_error", 1), ("transport", 1)])

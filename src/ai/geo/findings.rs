@@ -766,6 +766,7 @@ fn observed_access(checks: &Checks, found: &mut Found) -> Counts {
             AccessKind::RateLimited => ("access_rate_limited", CheckStatus::Attention),
             AccessKind::ServerError(_) => ("access_server_error", CheckStatus::Problem),
             AccessKind::Transport(_) => ("access_failed", CheckStatus::Problem),
+            AccessKind::ClientError(_) => ("access_client_error", CheckStatus::Problem),
             AccessKind::RedirectChain(_) => ("access_redirect_chain", CheckStatus::Attention),
             AccessKind::RedirectLoop => ("access_redirect_loop", CheckStatus::Problem),
             AccessKind::SuspectedChallenge => ("access_suspected_challenge", CheckStatus::Attention),
@@ -1734,6 +1735,11 @@ mod tests {
                 CheckStatus::Problem,
             ),
             (AccessKind::Transport(-2), "access_failed", CheckStatus::Problem),
+            (
+                AccessKind::ClientError(404),
+                "access_client_error",
+                CheckStatus::Problem,
+            ),
             (
                 AccessKind::RedirectChain(3),
                 "access_redirect_chain",

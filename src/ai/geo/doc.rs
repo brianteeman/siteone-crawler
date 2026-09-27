@@ -2373,6 +2373,7 @@ const EN: &[(&str, &str)] = &[
     ("kind.rate_limited", "Rate limited"),
     ("kind.server_error", "Server error"),
     ("kind.transport", "Not fetched"),
+    ("kind.client_error", "Client error"),
     ("kind.redirect_chain", "Redirect chain"),
     ("kind.redirect_loop", "Redirect loop"),
     ("kind.suspected_challenge", "Suspected challenge page"),
@@ -2649,6 +2650,14 @@ const EN: &[(&str, &str)] = &[
     (
         "fix.access_failed",
         "Check the availability and response times of these URLs.",
+    ),
+    (
+        "issue.access_client_error",
+        "{n} key page(s) answered with a client error (4xx, such as 404 not found)",
+    ),
+    (
+        "fix.access_client_error",
+        "Key pages must answer 200: restore the page or redirect it to its replacement.",
     ),
     (
         "issue.access_redirect_chain",
@@ -3206,6 +3215,7 @@ const CS: &[(&str, &str)] = &[
     ("kind.rate_limited", "Omezeno počtem požadavků"),
     ("kind.server_error", "Chyba serveru"),
     ("kind.transport", "Nenačteno"),
+    ("kind.client_error", "Chyba klienta"),
     ("kind.redirect_chain", "Řetěz přesměrování"),
     ("kind.redirect_loop", "Smyčka přesměrování"),
     ("kind.suspected_challenge", "Podezření na ochranu proti botům"),
@@ -3471,6 +3481,14 @@ const CS: &[(&str, &str)] = &[
         "Klíčové stránky, které nešlo načíst (chyba spojení nebo vypršení času): {n}",
     ),
     ("fix.access_failed", "Zkontrolujte dostupnost a dobu odezvy těchto URL."),
+    (
+        "issue.access_client_error",
+        "Klíčové stránky s chybou klienta (4xx, například 404 nenalezeno): {n}",
+    ),
+    (
+        "fix.access_client_error",
+        "Klíčové stránky musí odpovídat 200: obnovte stránku, nebo ji přesměrujte na její náhradu.",
+    ),
     (
         "issue.access_redirect_chain",
         "Klíčové stránky přesměrované přes více než 2 kroky: {n}",
