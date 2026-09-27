@@ -25,6 +25,10 @@ pub const MAX_CHROME_LINES: usize = 300;
 /// a common line — can yield its fact.
 pub const MAX_LINES_PER_CHROME_SOURCE: usize = 5;
 
+/// Labels one header/footer text keeps as lines of their own at most, when it has more than this
+/// many (see `ChromeLines`).
+pub const MAX_LABELS_PER_LINE: usize = 5;
+
 /// A header/footer line is fact-bearing only within these lengths (in characters).
 const MIN_LINE_CHARS: usize = 4;
 const MAX_LINE_CHARS: usize = 300;
@@ -37,11 +41,13 @@ const MAX_TITLE_CHARS: usize = 200;
 const MIN_BLOCK_BYTES: usize = 1024;
 
 /// The unique fact-bearing header/footer lines: `(text, label, pages)`, where the label is the
-/// nearest preceding line without a fact (the most common one across the line's pages) and
-/// `pages` is the exact, sorted set of page indexes that show the line. A text a page repeats
-/// under another label (one number for Sales and for Support) is a line of its own, so each label
-/// keeps its page set. Ordered by the number of pages (descending), then by text and label.
-/// `excluded` counts the lines left out by the cap.
+/// nearest preceding line without a fact and `pages` is the exact, sorted set of page indexes
+/// that show the text under that label. A line is its text and its label, so one number for Sales
+/// and for Support is two lines, each with its own pages, whatever the order of the sections. A
+/// text with more than `MAX_LABELS_PER_LINE` labels keeps at most that many labels of two or more
+/// pages; the others (a breadcrumb or a title before the line, another on every page) become one
+/// line without a label, with their pages. Ordered by the number of pages (descending), then by
+/// text and label. `excluded` counts the lines left out by the cap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChromeLines {
     pub lines: Vec<(String, String, Vec<usize>)>,
@@ -210,29 +216,19 @@ fn h1_index(blocks: &[&Block]) -> Option<usize> {
 /// from a kept line only in at most two digits or letters (a changed or transposed digit — the
 /// variants most worth checking); the rest is counted in `excluded`.
 pub fn chrome_lines(pages_blocks: &[(usize, Vec<Block>)]) -> ChromeLines {
-    #[derive(Default)]
-    struct Entry {
-        pages: BTreeSet<usize>,
-        labels: HashMap<String, usize>,
-    }
-    // A line is its text and, when a page repeats the text under another label (the same number
-    // for Sales and for Support), the rank of that label among the page's labels of the text.
-    let mut entries: HashMap<(String, usize), Entry> = HashMap::new();
+    // Per text, per label, the pages that show the text under that label.
+    let mut entries: HashMap<String, HashMap<String, BTreeSet<usize>>> = HashMap::new();
     for (page, blocks) in pages_blocks {
         let mut label = String::new();
-        let mut labels_of: HashMap<&str, Vec<String>> = HashMap::new();
         for block in blocks.iter().filter(|b| b.region == Region::Chrome) {
             let text = block.text.trim();
             if is_fact_line(text) {
-                let labels = labels_of.entry(text).or_default();
-                if labels.contains(&label) {
-                    continue;
-                }
-                labels.push(label.clone());
-                let entry = entries.entry((text.to_string(), labels.len() - 1)).or_default();
-                if entry.pages.insert(*page) {
-                    *entry.labels.entry(label.clone()).or_default() += 1;
-                }
+                entries
+                    .entry(text.to_string())
+                    .or_default()
+                    .entry(label.clone())
+                    .or_default()
+                    .insert(*page);
             } else if !text.is_empty() {
                 label = cap_chars(text, MAX_LABEL_CHARS);
             }
@@ -241,14 +237,10 @@ pub fn chrome_lines(pages_blocks: &[(usize, Vec<Block>)]) -> ChromeLines {
 
     let mut lines: Vec<(String, String, Vec<usize>)> = entries
         .into_iter()
-        .map(|((text, _), entry)| {
-            let label = entry
-                .labels
+        .flat_map(|(text, labels)| {
+            label_lines(labels)
                 .into_iter()
-                .min_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)))
-                .map(|(label, _)| label)
-                .unwrap_or_default();
-            (text, label, entry.pages.into_iter().collect())
+                .map(move |(label, pages)| (text.clone(), label, pages.into_iter().collect()))
         })
         .collect();
     lines.sort_by(|a, b| {
@@ -284,6 +276,28 @@ pub fn chrome_lines(pages_blocks: &[(usize, Vec<Block>)]) -> ChromeLines {
         excluded: total - lines.len(),
         lines,
     }
+}
+
+/// The labels of one header/footer text with their pages, as its lines (see `ChromeLines`): each
+/// label on its own; with more than `MAX_LABELS_PER_LINE` labels, the labels of two or more pages
+/// with the most pages (at most that many), and one line without a label for the rest.
+fn label_lines(labels: HashMap<String, BTreeSet<usize>>) -> Vec<(String, BTreeSet<usize>)> {
+    let mut labels: Vec<(String, BTreeSet<usize>)> = labels.into_iter().collect();
+    if labels.len() <= MAX_LABELS_PER_LINE {
+        return labels;
+    }
+    labels.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+    let mut unlabeled: BTreeSet<usize> = BTreeSet::new();
+    let mut kept: Vec<(String, BTreeSet<usize>)> = Vec::new();
+    for (label, pages) in labels {
+        if label.is_empty() || pages.len() < 2 || kept.len() >= MAX_LABELS_PER_LINE {
+            unlabeled.extend(pages);
+        } else {
+            kept.push((label, pages));
+        }
+    }
+    kept.push((String::new(), unlabeled));
+    kept
 }
 
 fn is_fact_line(text: &str) -> bool {
@@ -741,6 +755,79 @@ mod tests {
             ],
             "the Support line keeps its own page set"
         );
+    }
+
+    fn department_footer(sections: &[(&str, &str)]) -> Vec<Block> {
+        let html: String = sections
+            .iter()
+            .map(|(label, phone)| format!("<h2>{label}</h2><p>{phone}</p>"))
+            .collect();
+        blocks_from_html(&format!("<body><footer>{html}</footer></body>"))
+    }
+
+    #[test]
+    fn a_line_keeps_its_label_and_page_set_whatever_the_order_of_the_sections() {
+        let (a, b) = ("800 123 456", "800 123 465");
+        let pages = vec![
+            (0, department_footer(&[("Sales", a), ("Support", a)])),
+            // The sections in another order.
+            (1, department_footer(&[("Support", a), ("Sales", a)])),
+            (2, department_footer(&[("Sales", a), ("Support", b)])),
+            // Sales left out.
+            (3, department_footer(&[("Support", a)])),
+            // A department repeated, and a third one.
+            (
+                4,
+                department_footer(&[("Sales", a), ("Complaints", a), ("Support", a), ("Sales", a)]),
+            ),
+        ];
+        let lines = chrome_lines(&pages);
+        let expected = |text: &str, label: &str, pages: &[usize]| (text.to_string(), label.to_string(), pages.to_vec());
+        assert_eq!(
+            lines.lines,
+            vec![
+                expected(a, "Sales", &[0, 1, 2, 4]),
+                expected(a, "Support", &[0, 1, 3, 4]),
+                expected(a, "Complaints", &[4]),
+                expected(b, "Support", &[2]),
+            ],
+            "each label keeps exactly the pages that show the text under it"
+        );
+        // Whatever the order of the pages.
+        let mut reversed = pages.clone();
+        reversed.reverse();
+        assert_eq!(chrome_lines(&reversed), lines);
+    }
+
+    #[test]
+    fn a_label_of_every_single_page_does_not_split_a_line_per_page() {
+        // A breadcrumb right before the footer's first line: another label on every page.
+        let pages: Vec<(usize, Vec<Block>)> = (0..40)
+            .map(|i| {
+                (
+                    i,
+                    blocks_from_html(&format!(
+                        "<body><nav><p>Home / Article {i}</p></nav><footer><p>Tel. 800 123 456</p>\
+                         <h2>Support</h2><p>Tel. 800 123 456</p></footer></body>"
+                    )),
+                )
+            })
+            .collect();
+        let lines = chrome_lines(&pages);
+        let all: Vec<usize> = (0..40).collect();
+        assert_eq!(
+            lines.lines,
+            vec![
+                ("Tel. 800 123 456".to_string(), String::new(), all.clone()),
+                ("Tel. 800 123 456".to_string(), "Support".to_string(), all),
+            ],
+            "the labels of single pages become one line without a label; Support keeps its own"
+        );
+        // A few labels of single pages stay labels.
+        let few: Vec<(usize, Vec<Block>)> = pages.into_iter().take(MAX_LABELS_PER_LINE - 1).collect();
+        let lines = chrome_lines(&few);
+        assert_eq!(lines.lines.len(), MAX_LABELS_PER_LINE);
+        assert!(lines.lines.iter().all(|(_, label, _)| !label.is_empty()));
     }
 
     #[test]
