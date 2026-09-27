@@ -715,8 +715,8 @@ pub fn has_offered_blocks(blocks: &[Block], is_homepage: bool) -> bool {
 /// (and the site chrome of the homepage) as numbered lines inside `<page_data>`; every value is
 /// escaped. When the whole message would exceed `input_bytes`, blocks are chosen by score — the H1
 /// and the header row of every table with a chosen row always — within the budget, no block taking
-/// more than a quarter of it, never a heading without the first block of its section, and listed
-/// in document order.
+/// more than a quarter of it, never a heading without the first block of its section nor a table
+/// header row without one of its rows, and listed in document order.
 #[allow(clippy::too_many_arguments)]
 pub fn build_page_request(
     page: &AnalyzedPage,
@@ -850,6 +850,26 @@ fn choose_blocks(
         if used + cost <= room {
             used += cost;
             chosen.extend(lines);
+        }
+    }
+    // A table's header row shown without any of its rows reads as an empty table: it is left out
+    // (a header row is the first row of a run whose next row names its first column).
+    let mut runs: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (row, start) in &header_of {
+        runs.entry(*start).or_default().push(*row);
+    }
+    for (start, mut rows) in runs {
+        rows.sort_unstable();
+        let first_cell = blocks
+            .get(start)
+            .and_then(|header| header.text.split(" | ").next())
+            .unwrap_or_default();
+        let is_header = rows
+            .get(1)
+            .and_then(|row| blocks.get(*row))
+            .is_some_and(|row| row.text.starts_with(&format!("{first_cell}: ")));
+        if is_header && !rows[1..].iter().any(|row| chosen.contains_key(row)) {
+            chosen.remove(&start);
         }
     }
     // A heading shown without the first block of its section reads as an empty section: it is
@@ -1644,6 +1664,48 @@ mod tests {
         }
         assert!(reduced > 50, "{reduced} reduced selections");
         assert!(orphans.is_empty(), "{orphans:#?}");
+    }
+
+    #[test]
+    fn a_table_header_row_is_never_shown_without_one_of_its_rows() {
+        let mut html = String::from("<html lang=\"cs\"><body><main><h1>Parametry</h1>");
+        for table in 0..3 {
+            html.push_str(&format!(
+                "<h2>Skupina {}</h2><table><thead><tr><th>Parametr</th><th>Popis</th></tr></thead><tbody>",
+                ["A", "B", "C"][table]
+            ));
+            for row in 0..3 {
+                html.push_str(&format!(
+                    "<tr><td>--volba-{table}-{row}</td><td>{}</td></tr>",
+                    "Dlouhý popis volby bez čísel. ".repeat(12)
+                ));
+            }
+            html.push_str("</tbody></table>");
+        }
+        html.push_str("</main></body></html>");
+        let (page, blocks) = page_of(&html);
+        let mut lonely = Vec::new();
+        let mut reduced = 0;
+        for budget in (600..4_000).step_by(20) {
+            let (_, coverage) = request(&page, &blocks, false, budget);
+            if coverage.is_complete() {
+                continue;
+            }
+            reduced += 1;
+            let included: HashSet<usize> = coverage.included.iter().copied().collect();
+            for header in blocks.iter().filter(|block| block.text == "Parametr | Popis") {
+                let rows = blocks
+                    .iter()
+                    .skip(header.id + 1)
+                    .take_while(|block| block.kind == BlockKind::TableRow);
+                let rows_shown = rows.filter(|row| included.contains(&row.id)).count();
+                if included.contains(&header.id) && rows_shown == 0 {
+                    lonely.push(format!("{budget}: B{}", header.id + 1));
+                }
+            }
+        }
+        assert!(reduced > 50, "{reduced} reduced selections");
+        assert!(lonely.is_empty(), "{lonely:?}");
     }
 
     #[test]
