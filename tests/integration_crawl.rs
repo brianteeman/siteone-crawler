@@ -8030,6 +8030,15 @@ fn ai_geo_proposes_a_sitemap_only_after_a_complete_crawl() {
         readme.contains("sitemap.proposed.xml was not generated: the crawl stopped at --max-visited-urls"),
         "{readme}"
     );
+
+    // A queue that refused URLs also leaves pages out.
+    let (_tmp, kit) = crawl("ai-geo-sitemap-queue", &["--max-queue-length=1"]);
+    assert!(!kit.join("sitemap").exists(), "no proposal after dropped URLs");
+    let readme = std::fs::read_to_string(kit.join("README.md")).expect("README.md");
+    assert!(
+        readme.contains("sitemap.proposed.xml was not generated: the crawl dropped URLs at --max-queue-length"),
+        "{readme}"
+    );
 }
 
 /// With `--ai-consistency` too, the GEO report links the fact-consistency report of the same run

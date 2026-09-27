@@ -306,9 +306,11 @@ impl Fetcher for BrowserRenderer {
                 // diagnostics/screenshot — replacing it with the viewer DOM would corrupt exports.
                 if is_html(&resp) {
                     // Record how much text the HTML as fetched had before it is replaced, so the
-                    // AI search readiness check can compare it with the rendered page.
-                    diagnostics.raw_text_chars =
-                        resp.body_text().map(|raw| crate::ai::geo::render::own_text_chars(&raw));
+                    // AI search readiness check (--ai-geo) can compare it with the rendered page.
+                    if self.options.ai_geo {
+                        diagnostics.raw_text_chars =
+                            resp.body_text().map(|raw| crate::ai::geo::render::own_text_chars(&raw));
+                    }
                     resp.body = Some(rendered_html.into_bytes());
                 }
                 // Reflect the real wall time the user waited (HTTP preflight + browser render),

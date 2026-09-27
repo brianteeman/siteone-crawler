@@ -78,10 +78,74 @@ pub struct RenderCheck {
     pub not_comparable: Vec<String>,
 }
 
-/// The visible text of a page's own content (Main region, collapsed blocks included, since they
-/// are in the HTML), in characters: the measure both rendering checks use.
+/// Overlays whose text is not the page's own content although it sits outside the site chrome:
+/// dialogs, and the containers of common cookie-consent tools (as hidden before screenshots, see
+/// `browser::cookie_consent`). A script adds them to the rendered page; they may be in the HTML too.
+const OVERLAYS: &[&str] = &[
+    "dialog",
+    "[role=dialog]",
+    "[role=alertdialog]",
+    "[aria-modal=true]",
+    "#onetrust-consent-sdk",
+    "#onetrust-banner-sdk",
+    "#CookieConsent",
+    "#CybotCookiebotDialog",
+    "#cookiescript_injected",
+    "#didomi-host",
+    "#usercentrics-root",
+    "#qc-cmp2-container",
+    "#truste-consent-track",
+    "[id^=sp_message_container]",
+    "#cmplz-cookiebanner-container",
+    "#cookie-law-info-bar",
+    "#cookie-notice",
+    ".cc-window",
+    ".iubenda-cs-container",
+    ".osano-cm-window",
+];
+
+static OVERLAY_SELECTORS: Lazy<Vec<Selector>> = Lazy::new(|| {
+    OVERLAYS
+        .iter()
+        .map(|selector| Selector::parse(selector).unwrap())
+        .collect()
+});
+
+/// The text of a page's own content (Main region) without overlays, in characters: all of it, and
+/// the part in collapsed blocks.
+fn own_text(html: &str) -> (usize, usize) {
+    let mut document = Html::parse_document(html);
+    let overlays: Vec<_> = OVERLAY_SELECTORS
+        .iter()
+        .flat_map(|selector| {
+            document
+                .select(selector)
+                .map(|element| element.id())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    if overlays.is_empty() {
+        return main_text_chars(&blocks_from_html(html));
+    }
+    for id in overlays {
+        if let Some(mut node) = document.tree.get_mut(id) {
+            node.detach();
+        }
+    }
+    main_text_chars(&blocks_from_html(&document.html()))
+}
+
+/// The text of a page's own content (Main region, collapsed blocks included, since they are in
+/// the HTML, overlays left out), in characters: the measure of the HTML as fetched.
 pub fn own_text_chars(html: &str) -> usize {
-    main_text_chars(&blocks_from_html(html)).0
+    own_text(html).0
+}
+
+/// The text a rendered page shows as its own content: `own_text_chars` without collapsed blocks
+/// (closed tabs, `aria-hidden` carousel clones), in characters.
+pub fn visible_own_text_chars(html: &str) -> usize {
+    let (all, collapsed) = own_text(html);
+    all - collapsed
 }
 
 /// The raw HTML of a page is an app shell when its own content (Main region, collapsed blocks
@@ -131,26 +195,29 @@ pub fn plain_render_risks(status: &Status, key: &[KeyPage]) -> RenderCheck {
 }
 
 /// Browser mode: compares each rendered HTML 200 key page with the text size of its HTML as
-/// fetched, recorded by the renderer. A page without that record (the rendering failed, or the
-/// page was added after the crawl without rendering) is not comparable.
+/// fetched, recorded by the renderer. A page whose rendering failed keeps the HTML as fetched and
+/// gets the plain check; a page without a record (added after the crawl without rendering) is not
+/// comparable.
 pub fn browser_render_risks(status: &Status, key: &[KeyPage]) -> RenderCheck {
     let mut check = RenderCheck {
         browser: true,
         ..RenderCheck::default()
     };
     for (visit, body) in html_key_pages(status, key) {
-        let raw = status
-            .get_browser_diagnostics(&visit.uq_id)
-            .filter(|diagnostics: &BrowserDiagnostics| diagnostics.render_error.is_none())
-            .and_then(|diagnostics| diagnostics.raw_text_chars);
-        let Some(raw) = raw else {
-            check.not_comparable.push(visit.url.clone());
-            continue;
+        let diagnostics: Option<BrowserDiagnostics> = status.get_browser_diagnostics(&visit.uq_id);
+        let risk = match diagnostics {
+            Some(diagnostics) if diagnostics.render_error.is_some() => plain_render_risk(&visit.url, &body),
+            Some(BrowserDiagnostics {
+                raw_text_chars: Some(raw),
+                ..
+            }) => browser_render_risk(&visit.url, raw, visible_own_text_chars(&body)),
+            _ => {
+                check.not_comparable.push(visit.url.clone());
+                continue;
+            }
         };
         check.checked += 1;
-        if let Some(risk) = browser_render_risk(&visit.url, raw, own_text_chars(&body)) {
-            check.risks.push(risk);
-        }
+        check.risks.extend(risk);
     }
     check
 }
@@ -300,6 +367,32 @@ mod tests {
     }
 
     #[test]
+    fn dialogs_consent_banners_and_hidden_clones_are_no_rendered_text_of_the_page() {
+        let own = "<p>Our plans cover hosting, backups and support for every size of business.</p>".repeat(15);
+        let raw = format!("<html><body><main><h1>Pricing</h1>{own}</main></body></html>");
+        let raw_chars = own_text_chars(&raw);
+        let dialog =
+            "<p>We use cookies to measure traffic and to personalise content and ads. Details below.</p>".repeat(30);
+        let rendered = format!(
+            "<html><body><main><h1>Pricing</h1>{own}\
+             <div class=\"slick-slide slick-cloned\" aria-hidden=\"true\">{own}</div></main>\
+             <div id=\"CybotCookiebotDialog\">{dialog}</div>\
+             <div role=\"dialog\" aria-modal=\"true\"><p>Subscribe to our newsletter for news and offers every week.</p></div>\
+             </body></html>"
+        );
+        assert_eq!(visible_own_text_chars(&rendered), raw_chars);
+        assert_eq!(
+            browser_render_risk(URL, raw_chars, visible_own_text_chars(&rendered)),
+            None
+        );
+        // A consent dialog in the HTML as fetched is no text of the page either.
+        let with_banner =
+            format!("<html><body><div id=\"onetrust-consent-sdk\">{dialog}</div><div id=\"root\"></div></body></html>");
+        assert_eq!(own_text_chars(&with_banner), 0);
+        assert!(plain_render_risk(URL, &with_banner).is_some(), "still an app shell");
+    }
+
+    #[test]
     fn rendered_key_pages_are_compared_with_their_html_and_the_others_are_not_comparable() {
         let mut status = new_status();
         let long = long_text();
@@ -320,7 +413,7 @@ mod tests {
             ),
             // A single-page app: next to no text in the HTML as fetched.
             ("spa", "https://example.com/app", Some(diagnostics(Some(9), None))),
-            // The render failed; the stored body is the HTML as fetched.
+            // The render failed; the stored body is the HTML as fetched, checked as in a plain crawl.
             (
                 "failed",
                 "https://example.com/failed",
@@ -329,14 +422,16 @@ mod tests {
             // Inserted after the crawl (gap-fill) without rendering.
             ("bare", "https://example.com/bare", None),
         ];
+        let shell = "<html><body><div id=\"root\"></div></body></html>";
         for (uq_id, url, diagnostics) in pages {
+            let body = if uq_id == "failed" { shell } else { rendered.as_str() };
             let source = if uq_id == "home" { "" } else { "home" };
             let attr = if uq_id == "home" {
                 SOURCE_INIT_URL
             } else {
                 SOURCE_A_HREF
             };
-            add(&mut status, page(uq_id, source, attr, url, 200, None), Some(&rendered));
+            add(&mut status, page(uq_id, source, attr, url, 200, None), Some(body));
             if let Some(diagnostics) = diagnostics {
                 status.add_browser_diagnostics(uq_id, diagnostics);
             }
@@ -366,20 +461,28 @@ mod tests {
 
         let check = browser_render_risks(&status, &key);
         assert!(check.browser);
-        assert_eq!(check.checked, 2, "the rendered HTML 200 pages with a known raw size");
+        assert_eq!(
+            check.checked, 3,
+            "the rendered HTML 200 pages with a known raw size, and the failed render"
+        );
         assert_eq!(
             check.risks,
-            [RenderRisk {
-                url: "https://example.com/app".to_string(),
-                main_text_chars: 9,
-                rendered_text_chars: Some(rendered_chars),
-                markers: Vec::new(),
-            }]
+            [
+                RenderRisk {
+                    url: "https://example.com/app".to_string(),
+                    main_text_chars: 9,
+                    rendered_text_chars: Some(rendered_chars),
+                    markers: Vec::new(),
+                },
+                RenderRisk {
+                    url: "https://example.com/failed".to_string(),
+                    main_text_chars: 0,
+                    rendered_text_chars: None,
+                    markers: vec!["div#root"],
+                },
+            ]
         );
-        assert_eq!(
-            check.not_comparable,
-            ["https://example.com/failed", "https://example.com/bare"]
-        );
+        assert_eq!(check.not_comparable, ["https://example.com/bare"]);
         // The plain check never marks its result as a browser comparison.
         assert!(!plain_render_risks(&status, &key).browser);
     }

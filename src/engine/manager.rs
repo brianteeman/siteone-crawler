@@ -320,6 +320,8 @@ impl Manager {
                 crate::ai::geo::discovery::CrawlEnd::Interrupted
             } else if crawler.reached_max_visited_urls() {
                 crate::ai::geo::discovery::CrawlEnd::UrlLimit
+            } else if crawler.dropped_urls_at_queue_limit() {
+                crate::ai::geo::discovery::CrawlEnd::QueueLimit
             } else {
                 crate::ai::geo::discovery::CrawlEnd::Complete
             };

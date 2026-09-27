@@ -15,7 +15,7 @@ use scraper::{Html, Selector};
 
 use crate::ai::blocks::blocks_from_html;
 use crate::ai::geo::keys::{KeyPage, redirect_chain, visits_by_url};
-use crate::ai::geo::signals::main_text_chars;
+use crate::ai::geo::render::own_text_chars;
 use crate::result::basic_stats::percentile;
 use crate::result::status::Status;
 use crate::result::visited_url::VisitedUrl;
@@ -267,7 +267,7 @@ fn page_issue(url: &str, body: &str) -> Option<AccessIssue> {
     } else if [&title, &h1].iter().any(|text| {
         let lower = text.to_lowercase();
         SOFT_404_MARKERS.iter().any(|marker| lower.contains(marker)) || NUMBER_404.is_match(&lower)
-    }) && main_text_chars(&blocks_from_html(body)).0 < SOFT_404_MAX_TEXT_CHARS
+    }) && own_text_chars(body) < SOFT_404_MAX_TEXT_CHARS
     {
         AccessKind::SuspectedSoft404
     } else {
@@ -511,6 +511,11 @@ mod tests {
             "<title>Page not found</title><nav>{}</nav><main><h1>Oops</h1><p>Sorry.</p></main>",
             "<a href=\"/x\">A long menu item of the site</a> ".repeat(60)
         );
+        // In browser mode the rendered page holds the cookie dialog too.
+        let consent = format!(
+            "<title>Page not found</title><main><h1>Oops</h1></main><div role=\"dialog\">{}</div>",
+            "<p>We use cookies to measure traffic and to personalise content and ads.</p>".repeat(30)
+        );
         let bodies = [
             ("t", "<title>Page not found | Example</title><h1>Oops</h1>", true),
             ("h", "<title>Example</title><h1>Stránka nenalezena</h1>", true),
@@ -527,6 +532,7 @@ mod tests {
             ("topic", topic.as_str(), false),
             ("guide", guide.as_str(), false),
             ("menu", menu.as_str(), true),
+            ("consent", consent.as_str(), true),
         ];
         for (uq_id, body, _) in bodies {
             add(
@@ -556,7 +562,8 @@ mod tests {
                 "https://example.com/h",
                 "https://example.com/n",
                 "https://example.com/code",
-                "https://example.com/menu"
+                "https://example.com/menu",
+                "https://example.com/consent"
             ]
         );
     }

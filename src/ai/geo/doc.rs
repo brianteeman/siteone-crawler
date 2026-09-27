@@ -2226,7 +2226,7 @@ const EN: &[(&str, &str)] = &[
     ("reason.no_pages_checked", "no key page could be checked"),
     (
         "label.sitemap_proposed",
-        "The site has no sitemap and the crawl covered all of it: the kit proposes one with its {0} canonical, indexable page(s) (sitemap/sitemap.proposed.xml).",
+        "No sitemap was declared in robots.txt or found by the crawl (the crawler does not request /sitemap.xml by itself), and the crawl followed every link it found: the kit proposes one with the site's {0} canonical, indexable page(s) (sitemap/sitemap.proposed.xml). If you have a sitemap elsewhere, compare it with this file instead of replacing it.",
     ),
     ("label.sitemap_withheld", "No sitemap is proposed: {0}."),
     (
@@ -2236,7 +2236,19 @@ const EN: &[(&str, &str)] = &[
     ("label.consistency_partial", "(the check is partial)"),
     (
         "sitemap_withheld.robots_unknown",
-        "robots.txt, which may declare a sitemap, could not be read",
+        "robots.txt, which may declare a sitemap, was not read",
+    ),
+    (
+        "sitemap_withheld.robots_not_utf8",
+        "robots.txt is not valid UTF-8, so its rules cannot be matched exactly",
+    ),
+    (
+        "sitemap_withheld.queue_limit",
+        "the crawl dropped URLs at --max-queue-length",
+    ),
+    (
+        "sitemap_withheld.failed_urls",
+        "some linked URLs of the site could not be fetched (errors, timeouts or rate limiting), so pages behind them may be missing",
     ),
     (
         "sitemap_withheld.single_page",
@@ -3035,7 +3047,7 @@ const CS: &[(&str, &str)] = &[
     ("reason.no_pages_checked", "žádnou klíčovou stránku nešlo zkontrolovat"),
     (
         "label.sitemap_proposed",
-        "Web nemá sitemapu a procházení pokrylo celý web: sada navrhuje sitemapu s jeho kanonickými indexovatelnými stránkami ({0}) v sitemap/sitemap.proposed.xml.",
+        "V robots.txt není uvedena a při procházení nebyla nalezena žádná sitemapa (crawler sám /sitemap.xml nežádá) a procházení prošlo každý nalezený odkaz: sada navrhuje sitemapu s kanonickými indexovatelnými stránkami webu ({0}) v sitemap/sitemap.proposed.xml. Pokud sitemapu máte jinde, porovnejte ji s tímto souborem místo nahrazení.",
     ),
     ("label.sitemap_withheld", "Sitemapa se nenavrhuje: {0}."),
     (
@@ -3045,7 +3057,19 @@ const CS: &[(&str, &str)] = &[
     ("label.consistency_partial", "(kontrola je neúplná)"),
     (
         "sitemap_withheld.robots_unknown",
-        "robots.txt, který může sitemapu uvádět, se nepodařilo přečíst",
+        "robots.txt, který může sitemapu uvádět, nebyl přečten",
+    ),
+    (
+        "sitemap_withheld.robots_not_utf8",
+        "robots.txt není platné UTF-8, takže jeho pravidla nelze přesně vyhodnotit",
+    ),
+    (
+        "sitemap_withheld.queue_limit",
+        "procházení zahodilo URL na limitu --max-queue-length",
+    ),
+    (
+        "sitemap_withheld.failed_urls",
+        "některé odkazované URL webu nešlo načíst (chyby, vypršení času nebo omezení počtu požadavků), takže stránky za nimi mohou chybět",
     ),
     (
         "sitemap_withheld.single_page",
@@ -4131,10 +4155,13 @@ mod tests {
         }
         for why in [
             "robots_unknown",
+            "robots_not_utf8",
             "single_page",
             "interrupted",
             "url_limit",
+            "queue_limit",
             "limited_scope",
+            "failed_urls",
             "no_pages",
             "too_many_urls",
         ] {

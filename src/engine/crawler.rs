@@ -20,6 +20,10 @@ use regex::Regex;
 /// the reports be written.
 static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Set when the queue refused a new URL at `--max-queue-length` (reset when a crawl starts): the
+/// crawl then does not cover every URL it found.
+static QUEUE_FULL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Asks the running crawl to wind down, as Ctrl+C would.
 pub fn request_stop() {
     STOP_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -234,6 +238,7 @@ impl Crawler {
 
     /// Main crawl loop. Processes URLs concurrently with rate limiting.
     pub async fn run(&mut self) -> CrawlerResult<()> {
+        QUEUE_FULL.store(false, Ordering::SeqCst);
         // Add initial URL to queue
         self.add_url_to_queue(&self.initial_parsed_url.clone(), None, UrlSource::InitUrl as i32);
 
@@ -391,6 +396,11 @@ impl Crawler {
     /// once queued + visited reach the limit, and every queued URL is visited).
     pub fn reached_max_visited_urls(&self) -> bool {
         self.visited.len() as i64 >= self.options.max_visited_urls
+    }
+
+    /// Whether the queue refused a new URL at `--max-queue-length` during this crawl.
+    pub fn dropped_urls_at_queue_limit(&self) -> bool {
+        QUEUE_FULL.load(Ordering::SeqCst)
     }
 
     /// Take the next URL from the queue (breadth-first order)
@@ -1264,6 +1274,7 @@ impl Crawler {
         let uq_id = Self::compute_url_uq_id(url);
 
         if (queue.len() as i64) >= options.max_queue_length {
+            QUEUE_FULL.store(true, Ordering::SeqCst);
             return;
         }
 
