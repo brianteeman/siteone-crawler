@@ -18,7 +18,7 @@ use scraper::{ElementRef, Html, Node, Selector};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use crate::ai::blocks::{Block, BlockKind, Region, render_block};
+use crate::ai::blocks::{Block, BlockKind, Region, render_block, style_hides};
 use crate::ai::geo::controls::{EnginePolicy, in_site_chrome};
 use crate::ai::geo::jsonld::ExistingMarkup;
 use crate::ai::geo::prompts;
@@ -524,14 +524,7 @@ pub(crate) fn shown_text(element: ElementRef) -> String {
                 || element
                     .attr("aria-hidden")
                     .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
-                || element.attr("style").is_some_and(|style| {
-                    style
-                        .chars()
-                        .filter(|c| !c.is_whitespace())
-                        .collect::<String>()
-                        .to_ascii_lowercase()
-                        .contains("display:none")
-                })
+                || element.attr("style").is_some_and(style_hides)
         })
     };
     let mut text = String::new();
@@ -2240,6 +2233,7 @@ mod tests {
             "Jak na<br>hypotéku",
             "<svg><title>ikona</title></svg>Jak na hypotéku",
             "Jak na hypotéku<span hidden>SEO text</span>",
+            "Jak na hypotéku<span style=\"visibility: hidden\">SEO text</span>",
             "Jak na <script>var x = 1;</script>hypotéku",
         ] {
             let html = format!(

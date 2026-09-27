@@ -56,8 +56,9 @@ pub struct Block {
     /// zero-width spaces removed.
     pub text: String,
     /// Inside `details:not([open])` (except its `summary`), `[hidden]`, `[aria-hidden=true]`, an
-    /// inline `display:none`, `.tab-pane:not(.active)`, `.accordion-collapse:not(.show)` or
-    /// `.collapse:not(.show)`.
+    /// inline `display:none` or `visibility:hidden`, `.tab-pane:not(.active)`,
+    /// `.accordion-collapse:not(.show)` or `.collapse:not(.show)` — table rows, row groups and cells
+    /// included.
     pub collapsed: bool,
     /// Collapsed with no control a visitor could open it by (see `hides_for_good`): the page does
     /// not show this text until a script does.
@@ -80,9 +81,9 @@ const INLINE: &[&str] = &[
 /// templates, `noscript`, SVG, iframes and the `head` are skipped. Every text node is counted
 /// once: text belongs to its innermost block, and a container's text before and after a nested
 /// block becomes blocks of its own. A cell of a data table keeps its whole content (including
-/// nested paragraphs) in its row; a table that contains headings or other tables is a layout
-/// table and is read as ordinary content. The walk is iterative, so deeply nested markup cannot
-/// overflow the stack.
+/// nested paragraphs) in its row, but for content the page hides (`hides`), which becomes a block
+/// of its own; a table that contains headings or other tables is a layout table and is read as
+/// ordinary content. The walk is iterative, so deeply nested markup cannot overflow the stack.
 pub fn blocks_from_html(html: &str) -> Vec<Block> {
     let document = Html::parse_document(html);
     let mut walker = Walker::default();
@@ -144,6 +145,9 @@ struct Frame {
     cell: bool,
     /// A block element inside a data cell: its text is set apart by spaces.
     spaced: bool,
+    /// Content of a data cell that the page hides (a hidden cell, or a hidden element inside one):
+    /// a block of its own, never part of its row.
+    aside: bool,
 }
 
 /// Text collected for one block.
@@ -159,6 +163,8 @@ struct Table {
     data: bool,
     /// The column headers, one per column (a header cell spanning columns repeats).
     header: Option<Vec<String>>,
+    /// The header row is hidden for good: its names are no text of a shown row.
+    header_hidden: bool,
     thead: usize,
     rows: usize,
     row: Option<Row>,
@@ -176,6 +182,8 @@ struct Spanning {
     first: bool,
     /// The later rows it still covers.
     rows_left: usize,
+    /// Its row is hidden for good: it is no text of a shown row.
+    hidden: bool,
 }
 
 /// A column of a row: a cell of the row itself (its index; whether this is its first column),
@@ -211,6 +219,8 @@ struct Walker {
     hidden: usize,
     /// Open cells of data tables; text inside goes to the current cell.
     cells: usize,
+    /// Open hidden content inside data cells; its text goes to its own block.
+    asides: usize,
     main_headings: Vec<(usize, String)>,
     chrome_headings: Vec<(usize, String)>,
 }
@@ -227,8 +237,13 @@ impl Walker {
             return;
         }
         if self.cells > 0 {
-            // Inside a data cell everything stays in the cell's text.
-            if tag == "br" || !INLINE.contains(&tag) {
+            // Inside a data cell everything stays in the cell's text, but for what the page hides.
+            if hides(element) {
+                if !INLINE.contains(&tag) {
+                    self.cell_text(" ");
+                }
+                self.aside(element, &mut frame);
+            } else if tag == "br" || !INLINE.contains(&tag) {
                 self.cell_text(" ");
                 frame.spaced = true;
             }
@@ -245,11 +260,11 @@ impl Walker {
                 "thead" => {
                     table.thead += 1;
                     frame.thead = true;
-                    self.frames.push(frame);
+                    self.hide_group(element, frame);
                     return;
                 }
                 "tbody" | "tfoot" | "colgroup" | "col" => {
-                    self.frames.push(frame);
+                    self.hide_group(element, frame);
                     return;
                 }
                 "tr" => {
@@ -258,7 +273,7 @@ impl Walker {
                         cells: Vec::new(),
                     });
                     frame.row = true;
-                    self.frames.push(frame);
+                    self.hide_group(element, frame);
                     return;
                 }
                 "td" | "th" => {
@@ -278,6 +293,10 @@ impl Walker {
                         });
                         self.cells += 1;
                         frame.cell = true;
+                        // A hidden cell keeps its column; its text becomes a block of its own.
+                        if hides(element) {
+                            self.aside(element, &mut frame);
+                        }
                         self.frames.push(frame);
                         return;
                     }
@@ -336,6 +355,7 @@ impl Walker {
                 self.tables.push(Table {
                     data: !is_layout_table(element),
                     header: None,
+                    header_hidden: false,
                     thead: 0,
                     rows: 0,
                     row: None,
@@ -366,7 +386,6 @@ impl Walker {
         }
         if frame.cell {
             self.cells = self.cells.saturating_sub(1);
-            return;
         }
         if frame.row {
             self.finish_row();
@@ -378,6 +397,9 @@ impl Walker {
         }
         if frame.buffer {
             self.close_buffer();
+        }
+        if frame.aside {
+            self.asides = self.asides.saturating_sub(1);
         }
         if frame.table {
             self.tables.pop();
@@ -400,7 +422,7 @@ impl Walker {
         if self.skip > 0 {
             return;
         }
-        if self.cells > 0 {
+        if self.cells > 0 && self.asides == 0 {
             self.cell_text(text);
         } else {
             self.push_text(text);
@@ -419,6 +441,10 @@ impl Walker {
     }
 
     fn cell_text(&mut self, text: &str) {
+        if self.asides > 0 {
+            self.push_text(text);
+            return;
+        }
         if let Some(cell) = self
             .tables
             .last_mut()
@@ -427,6 +453,32 @@ impl Walker {
         {
             cell.text.push_str(text);
         }
+    }
+
+    /// Content of a data cell that the page hides (`hides`): its text goes to a collapsed block of
+    /// its own, as a hidden inline element's does outside tables, instead of into its row.
+    fn aside(&mut self, element: ElementRef, frame: &mut Frame) {
+        frame.aside = true;
+        frame.buffer = true;
+        frame.collapsed = true;
+        frame.hidden = hides_for_good(element);
+        self.buffers.push(Buffer {
+            kind: BlockKind::Other,
+            level: None,
+            text: String::new(),
+        });
+        self.asides += 1;
+        self.collapsed += 1;
+        self.hidden += usize::from(frame.hidden);
+    }
+
+    /// A row or a row group of a data table: what it hides, it hides for its rows.
+    fn hide_group(&mut self, element: ElementRef, mut frame: Frame) {
+        frame.collapsed = hides(element);
+        frame.hidden = hides_for_good(element);
+        self.collapsed += usize::from(frame.collapsed);
+        self.hidden += usize::from(frame.hidden);
+        self.frames.push(frame);
     }
 
     /// Emit the text collected so far by the innermost buffer, before a nested block starts.
@@ -459,6 +511,9 @@ impl Walker {
     }
 
     fn finish_row(&mut self) {
+        // A row the page hides for good lends no text to a shown row: not its column names, nor
+        // its cells spanning into later rows.
+        let hidden = self.hidden > 0;
         let Some(table) = self.tables.last_mut() else { return };
         let Some(row) = table.row.take() else { return };
         let cells: Vec<(String, bool, usize, usize)> = row
@@ -504,6 +559,7 @@ impl Walker {
                     header_row: is_header,
                     first: *first,
                     rows_left: cell.3 - 1,
+                    hidden,
                 }),
                 _ => None,
             })
@@ -518,11 +574,12 @@ impl Walker {
                 grid.iter()
                     .map(|slot| match slot {
                         Slot::Own(i, _) => cells.get(*i).map(|cell| cell.0.clone()).unwrap_or_default(),
-                        Slot::Carried(spanning) => spanning.text.clone(),
-                        Slot::Empty => String::new(),
+                        Slot::Carried(spanning) if !spanning.hidden || hidden => spanning.text.clone(),
+                        Slot::Carried(_) | Slot::Empty => String::new(),
                     })
                     .collect(),
             );
+            table.header_hidden = hidden;
             cells
                 .iter()
                 .filter(|(text, _, _, _)| !text.is_empty())
@@ -535,12 +592,17 @@ impl Walker {
                 let text = match slot {
                     Slot::Own(i, true) => cells.get(*i).map_or("", |cell| cell.0.as_str()),
                     // A data cell spanning into this row is data of this row too.
-                    Slot::Carried(spanning) if spanning.first && !spanning.header_row => spanning.text.as_str(),
+                    Slot::Carried(spanning)
+                        if spanning.first && !spanning.header_row && (!spanning.hidden || hidden) =>
+                    {
+                        spanning.text.as_str()
+                    }
                     _ => continue,
                 };
                 let header = table
                     .header
                     .as_ref()
+                    .filter(|_| !table.header_hidden || hidden)
                     .and_then(|header| header.get(column))
                     .filter(|header| !header.is_empty());
                 match (text.is_empty(), header) {
@@ -593,10 +655,7 @@ fn hides(element: ElementRef) -> bool {
         || el
             .attr("aria-hidden")
             .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
-        || el.attr("style").is_some_and(|style| {
-            let style: String = style.chars().filter(|c| !c.is_whitespace()).collect();
-            style.to_ascii_lowercase().contains("display:none")
-        })
+        || el.attr("style").is_some_and(style_hides)
         || (class("tab-pane") && !class("active"))
         || (class("accordion-collapse") && !class("show"))
         || (class("collapse") && !class("show"))
@@ -604,7 +663,8 @@ fn hides(element: ElementRef) -> bool {
 
 /// True when the element hides its content from every visitor until a script shows it: `[hidden]`
 /// (but `hidden="until-found"`, which the browser opens for a search or a link) or an inline
-/// `display:none`, on anything but a tab panel (`[role=tabpanel]`, opened by its tab). A closed
+/// `display:none` or `visibility:hidden` (`style_hides`), on anything but a tab panel
+/// (`[role=tabpanel]`, opened by its tab). A closed
 /// `details`, a Bootstrap tab pane or collapse, and `aria-hidden` (hidden from assistive technology
 /// only) do not hide their content for good.
 pub fn hides_for_good(element: ElementRef) -> bool {
@@ -617,10 +677,20 @@ pub fn hides_for_good(element: ElementRef) -> bool {
     }
     el.attr("hidden")
         .is_some_and(|value| !value.trim().eq_ignore_ascii_case("until-found"))
-        || el.attr("style").is_some_and(|style| {
-            let style: String = style.chars().filter(|c| !c.is_whitespace()).collect();
-            style.to_ascii_lowercase().contains("display:none")
-        })
+        || el.attr("style").is_some_and(style_hides)
+}
+
+/// True when an inline style hides the element: `display:none`, `visibility:hidden` or
+/// `visibility:collapse` (whitespace and case ignored).
+pub(crate) fn style_hides(style: &str) -> bool {
+    let style: String = style
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    ["display:none", "visibility:hidden", "visibility:collapse"]
+        .iter()
+        .any(|hiding| style.contains(hiding))
 }
 
 /// True when the element or one of its ancestors `hides_for_good`.
@@ -923,6 +993,91 @@ mod tests {
             );
         }
         assert!(!find(&blocks, "Shown").hidden);
+    }
+
+    #[test]
+    fn hidden_rows_cells_and_cell_content_of_a_data_table_are_flagged() {
+        let blocks = blocks_from_html(
+            r#"<body><main>
+            <table><tr><th>Plan</th><th>Price</th></tr>
+              <tr><td>Basic</td><td>10 EUR</td></tr>
+              <tr hidden><td>Retired</td><td>0 EUR</td></tr>
+              <tr style="display: none"><td>Legacy</td><td>1 EUR</td></tr>
+              <tr style="visibility:hidden"><td>Ghost</td><td>2 EUR</td></tr>
+              <tr class="collapse"><td>More</td><td>3 EUR</td></tr>
+              <tr aria-hidden="true"><td>Aria</td><td>4 EUR</td></tr>
+              <tr><td>Premium</td><td>20 EUR <span hidden>was 30 EUR</span></td></tr>
+              <tr><td>Business</td><td hidden>99 EUR</td></tr>
+              <tr><td>Pro <b style="display:none">internal <i>code</i></b></td><td>40 EUR</td></tr>
+              <tr><td rowspan="2" style="visibility: collapse">Spanned</td><td>50 EUR</td></tr>
+              <tr><td>60 EUR</td></tr>
+            </table>
+            <table><tbody style="display:none"><tr><td>Whole body</td></tr></tbody></table>
+            <table><thead hidden><tr><th>Secret column</th></tr></thead><tr><td>Shown row</td></tr></table>
+            <table><tr hidden><th rowspan="2">Old plan</th><td>1 EUR</td></tr><tr><td>2 EUR</td></tr></table>
+            </main></body>"#,
+        );
+        for shown in [
+            "Plan | Price",
+            "Plan: Basic | Price: 10 EUR",
+            "Plan: Premium | Price: 20 EUR",
+            "Plan: Business",
+            "Plan: Pro | Price: 40 EUR",
+            "Price: 50 EUR",
+            "Price: 60 EUR",
+            "Shown row",
+            "2 EUR",
+        ] {
+            let block = find(&blocks, shown);
+            assert!(!block.hidden && !block.collapsed, "{shown} is shown: {block:?}");
+            assert_eq!(block.kind, BlockKind::TableRow, "{shown}");
+        }
+        for hidden in [
+            "Plan: Retired | Price: 0 EUR",
+            "Plan: Legacy | Price: 1 EUR",
+            "Plan: Ghost | Price: 2 EUR",
+            "was 30 EUR",
+            "99 EUR",
+            "internal code",
+            "Spanned",
+            "Whole body",
+            "Secret column",
+        ] {
+            let block = find(&blocks, hidden);
+            assert!(
+                block.hidden && block.collapsed,
+                "{hidden} is hidden for good: {block:?}"
+            );
+        }
+        for openable in ["Plan: More | Price: 3 EUR", "Plan: Aria | Price: 4 EUR"] {
+            let block = find(&blocks, openable);
+            assert!(block.collapsed && !block.hidden, "{openable} can be opened: {block:?}");
+        }
+        // Hidden text never becomes part of a shown block: no hidden cell, descendant, column
+        // header or spanning cell.
+        let shown = blocks
+            .iter()
+            .filter(|block| !block.hidden)
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for leaked in ["30 EUR", "99", "internal", "Spanned", "Secret", "Old plan"] {
+            assert!(!shown.contains(leaked), "{leaked} leaked into {shown}");
+        }
+    }
+
+    #[test]
+    fn content_hidden_by_visibility_is_hidden_for_good() {
+        let blocks = blocks_from_html(
+            r#"<body><main><div style="visibility: hidden"><p>Invisible</p></div>
+            <p>Cena <span style="VISIBILITY:hidden">stará 300</span>290 Kč</p><p>Shown</p></main></body>"#,
+        );
+        for hidden in ["Invisible", "stará 300"] {
+            assert!(find(&blocks, hidden).hidden, "{hidden}");
+        }
+        for shown in ["Cena 290 Kč", "Shown"] {
+            assert!(!find(&blocks, shown).collapsed, "{shown}");
+        }
     }
 
     #[test]

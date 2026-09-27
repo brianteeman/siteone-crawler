@@ -1560,12 +1560,29 @@ mod tests {
         };
         let pairs = "<h2>Is every product free?</h2><p>Every product is free of charge.</p>\
                      <h2>Is shipping always free?</h2><p>All shipping is free.</p>";
+        // Answers in table rows or cells the page hides, whatever element hides them.
+        let table = |row: &str, cell: &str| {
+            format!(
+                "<h2>Is every product free?</h2><table><tr{row}><td{cell}>Every product is free of charge.</td></tr></table>\
+                 <h2>Is shipping always free?</h2><table><tr{row}><td{cell}>All shipping is free.</td></tr></table>"
+            )
+        };
         for hidden in [
             format!("<div hidden>{pairs}</div>"),
             format!("<div style=\"display: none\">{pairs}</div>"),
+            format!("<div style=\"visibility:hidden\">{pairs}</div>"),
+            table(" hidden", ""),
+            table(" style=\"display:none\"", ""),
+            table(" style=\"visibility: hidden\"", ""),
+            table("", " hidden"),
+            table("", " style=\"display:none\""),
+            "<h2>Is every product free?</h2><table><tr><td><span hidden>Every product is free of charge.</span></td></tr></table>\
+             <h2>Is shipping always free?</h2><table><tbody hidden><tr><td>All shipping is free.</td></tr></tbody></table>"
+                .to_string(),
         ] {
             assert_eq!(faq_of(&hidden), None, "{hidden}");
         }
+        assert!(faq_of(&table("", "")).is_some(), "shown table rows answer");
         // A visitor can open a disclosure, a tab panel or a `hidden="until-found"` section.
         for shown in [
             "<details><summary>Is every product free?</summary><p>Every product is free of charge.</p></details>\

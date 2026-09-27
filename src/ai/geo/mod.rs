@@ -976,6 +976,26 @@ mod tests {
             "{:?}",
             markup.invisible_values
         );
+        // Nor is a table row, a cell or text in a cell the page hides.
+        for hidden in [
+            "<table><tr><th>Product</th><th>Price</th></tr><tr hidden><td>Retired widget</td><td>0 USD</td></tr></table>",
+            "<table><tr style=\"visibility:hidden\"><td>Retired widget</td><td>0 USD</td></tr></table>",
+            "<table><tr><td>Rake</td><td hidden>Retired widget 0 USD</td></tr></table>",
+            "<table><tr><td>Rake <span style=\"display:none\">Retired widget 0 USD</span></td></tr></table>",
+        ] {
+            let html = format!(
+                r#"<html><head><script type="application/ld+json">
+                {{"@context":"https://schema.org","@type":"Product","name":"Retired widget","offers":{{"@type":"Offer","price":0}}}}
+                </script></head><body><main><h1>Garden tools</h1>{hidden}</main></body></html>"#
+            );
+            let (_, _, markup) = page_checks("https://example.com/", &html, None, Utc::now());
+            let invisible: Vec<&str> = markup
+                .invisible_values
+                .iter()
+                .map(|(_, value)| value.as_str())
+                .collect();
+            assert_eq!(invisible, ["Retired widget", "0"], "{hidden}");
+        }
     }
 
     #[test]
