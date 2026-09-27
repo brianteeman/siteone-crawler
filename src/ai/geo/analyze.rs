@@ -21,7 +21,7 @@ use serde_json::{Map, Value};
 
 use crate::ai::blocks::{Block, BlockKind, Region, hidden_for_good, is_inline, render_block, style_hides};
 use crate::ai::geo::controls::{EnginePolicy, in_site_chrome};
-use crate::ai::geo::jsonld::{ExistingMarkup, byline_name, person_name};
+use crate::ai::geo::jsonld::{ExistingMarkup, byline_name, person_name, without_author_label};
 use crate::ai::geo::prompts;
 use crate::ai::grounding::{date_mentions, fact_signals, find_token_bounded, numbers_in};
 use crate::ai::normalize::{normalize_json_response, repair_json_with_status};
@@ -546,7 +546,7 @@ pub fn analyzed_page(url: &str, html: &str) -> AnalyzedPage {
 /// page (`/author/`, `/autor/`, …), an `itemprop=author` node (its `itemprop=name` when it has
 /// one), or an element whose class names an author or a byline (`author`, `byline`, `autor`) —
 /// each only when one text node holds all its text (`single_run`), so a box with a name and a
-/// role names no one.
+/// role names no one; a node that starts with a byline label names the person after it.
 fn author_names(document: &Html) -> Vec<String> {
     let meta = document
         .select(&META_SELECTOR)
@@ -575,6 +575,7 @@ fn author_names(document: &Html) -> Vec<String> {
                             .any(|path| href.contains(path))
                     }));
             let nodes: Vec<ElementRef> = if el.attr("itemprop").is_some_and(names_author) {
+                // Its name nodes, when it has any: only the ones a visitor sees name someone.
                 let names: Vec<ElementRef> = element
                     .descendants()
                     .filter_map(ElementRef::wrap)
@@ -585,7 +586,11 @@ fn author_names(document: &Html) -> Vec<String> {
                             .is_some_and(|prop| prop.split_whitespace().any(|prop| prop.eq_ignore_ascii_case("name")))
                     })
                     .collect();
-                if names.is_empty() { vec![element] } else { names }
+                if names.is_empty() {
+                    vec![element]
+                } else {
+                    names.into_iter().filter(|name| !hidden_for_good(*name)).collect()
+                }
             } else if author_link
                 || el.attr("rel").is_some_and(names_author)
                 || ["author", "byline", "autor"].iter().any(|name| class.contains(name))
@@ -596,7 +601,13 @@ fn author_names(document: &Html) -> Vec<String> {
             };
             nodes.into_iter().filter_map(single_run)
         });
-    meta.chain(marked).filter_map(|text| person_name(&text)).collect()
+    // A marked byline may start with its label: the name is what follows it.
+    meta.chain(marked)
+        .filter_map(|text| match without_author_label(&text) {
+            Some(_) => byline_name(&text),
+            None => person_name(&text),
+        })
+        .collect()
 }
 
 /// Walks the text of an element as its blocks show it: `visit(Some(text))` for each text node,
@@ -2217,6 +2228,19 @@ mod tests {
                 "Jane Smith",
                 "Jane Smith",
             ),
+            // A marked byline that starts with a label names the person after it.
+            (
+                "",
+                "<p class=\"byline\">By Jane Smith</p>",
+                "By Jane Smith",
+                "Jane Smith",
+            ),
+            (
+                "",
+                "<p><a rel=\"author\" href=\"/team/jan\">Autor: Jan Novák</a></p>",
+                "Autor: Jan Novák",
+                "Jan Novák",
+            ),
             (
                 "",
                 "<p><span class=\"author-name\">Jane Smith</span> · Editorial Director</p>",
@@ -2303,6 +2327,14 @@ mod tests {
                 "",
                 "<p class=\"author\">Jane Smith <span>Editorial Director</span></p>",
                 "Jane Smith Editorial Director",
+            ),
+            // A name node the page hides names no one.
+            (
+                "",
+                "",
+                "<p itemprop=\"author\" itemscope>Jane Smith, Editorial Director<span itemprop=\"name\" hidden>Jane \
+                 Smith</span></p>",
+                "Jane Smith, Editorial Director",
             ),
         ] {
             let found = byline(head, chrome, byline_html, author);
